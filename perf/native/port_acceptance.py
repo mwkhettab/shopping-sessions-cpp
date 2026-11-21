@@ -304,6 +304,8 @@ def main():
                    help="compare four input policies in fresh processes on the exact candidate executable")
     p.add_argument("--parser-probe", type=Path,
                    help="compare separately instrumented parser telemetry against the shipping executable")
+    p.add_argument("--previous-release", type=Path,
+                   help="measure a historical binary on each large input after comparing its complete outputs")
     p.add_argument("--cpus", type=int, default=8)
     p.add_argument("--memory-mib", type=int, default=12288)
     p.add_argument("--skip-kernel-test", action="store_true", help="for exercising the harness with existing binaries")
@@ -352,6 +354,9 @@ def main():
         print(phase, state["disks"][phase], flush=True)
 
     bins, images = {}, {}
+    previous = args.previous_release.resolve() if args.previous_release else None
+    if previous:
+        state["previous_release"] = {"sha256": sha(previous), "timings": {}}
     try:
         mark("build")
         for tag in ("baseline", "candidate", "peer"):
@@ -457,6 +462,11 @@ def main():
                 golden = [sys.executable, NATIVE/"acceptance_reference.py", ref, "--scale", scale,
                           "--expected", NATIVE/"acceptance-references.json"]
                 exec_logged(golden, log, env)
+                if previous:
+                    with tempfile.TemporaryDirectory(dir=area) as out:
+                        exec_logged([previous, data, out], log, env)
+                        exec_logged([sys.executable, NATIVE/"compare_large.py", ref, out], log, env)
+                    state["verified"][scale + "/previous-release"] = "both full tables match on this input"
                 for tag, exe in list(bins.items()):
                     if tag != "baseline":
                         try:
@@ -483,6 +493,13 @@ def main():
             mark(scale + " profiles and pairs")
             state["timings"][scale] = paired(scale, data, bins, area, results, env,
                                                args.warm_20 if scale == "20M" else args.warm_60, args.cold_runs)
+            if previous:
+                mark(scale + " paired against previous official release")
+                history = results / "previous-release"
+                history.mkdir(exist_ok=True)
+                state["previous_release"]["timings"][scale] = paired(scale, data,
+                    {"baseline": previous, "candidate": bins["candidate"]}, area, history, env,
+                    7 if scale == "20M" else 5, 1)
             if args.container_lifetime_pairs:
                 from port_lifetime import paired_lifetime
                 mark(scale + " fresh container lifetimes")

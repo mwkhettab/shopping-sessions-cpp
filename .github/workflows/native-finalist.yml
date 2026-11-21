@@ -38,11 +38,30 @@ jobs:
           ref: 4db76beed31640ddf4b414ed19deba5ebc660b81
           path: .acceptance/baseline
           persist-credentials: false
+      - name: Check out the official 0.33-second release
+        uses: actions/checkout@v4
+        with:
+          ref: dc216ac44dcaeb30ace2af3f2d2ff1d782ef78f0
+          path: .acceptance/previous
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - name: Prepare generator, fixtures and references
         run: bash perf/native/prepare-port-runner.sh
+      - name: Record the previous build on the long identity link
+        shell: bash
+        run: |
+          old="$RUNNER_TEMP/shopping-trials/previous"
+          docker buildx build --platform linux/amd64 --output "type=local,dest=$old" .acceptance/previous
+          python="$RUNNER_TEMP/shopping-python/bin/python"
+          if "$python" .acceptance/candidate/tests/pipeline/long_link.py "$old/app/shopping" >"$old/long-link.log" 2>&1; then
+            echo '::notice title=Previous release identity check::This build produced the expected 43 user-day rows.'
+          else
+            grep -q AssertionError "$old/long-link.log"
+            grep -q Merged "$old/long-link.log"
+            echo '::notice title=Previous release identity check::The old binary joined the two purchases. The corrected release must pass this test.'
+          fi
       - name: Verify the release images and time fresh containers
         id: qualify
         env:
@@ -50,6 +69,7 @@ jobs:
         run: |
           "$RUNNER_TEMP/shopping-python/bin/python" perf/native/port_acceptance.py \
             --candidate-source "$GITHUB_WORKSPACE/.acceptance/candidate" \
+            --previous-release "$RUNNER_TEMP/shopping-trials/previous/app/shopping" \
             --release-generated-practice --release-generated-final \
             --warm-20 3 --warm-60 3 --cold-runs 1 --container-lifetime-pairs 5 --input-policy-rounds 5
       - name: Publish native measurements and qualification
@@ -67,6 +87,20 @@ jobs:
           path = Path(os.environ['RUNNER_TEMP'])/'shopping-trials/results/port-acceptance/status.json'
           for scale, trial in json.loads(path.read_text())['input_policies'].items():
               print(f'::notice file=BENCHMARKS.md,line=1,title={scale} input policies::{json.dumps(trial, sort_keys=True)}')
+          PY
+      - name: Publish paired changes against the 0.33-second executable
+        if: steps.qualify.outcome == 'success'
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          report = Path(os.environ["RUNNER_TEMP"]) / "shopping-trials/results/port-acceptance/status.json"
+          state = json.loads(report.read_text())
+          for size, timings in state["previous_release"]["timings"].items():
+              for cache in ("warm", "cold"):
+                  before, after = (timings[cache + "/" + tag] for tag in ("baseline", "candidate"))
+                  msg = f"previous {before['median_s']:.4f}s, corrected {after['median_s']:.4f}s, paired {after['paired_change_median']:+.3%}, {after['faster_pairs']}/{len(after['seconds'])} wins, {after['peak_mib']:.1f} MiB RSS"
+                  print(f"::notice file=BENCHMARKS.md,line=1,title={size} {cache} previous release::" + msg.replace("%", "%25"))
           PY
       - name: Check held-out seed 733 with eight application workers
         if: steps.qualify.outcome == 'success'
