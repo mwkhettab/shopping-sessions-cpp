@@ -14,6 +14,9 @@
 | `25a940f0d0a8f4a38ab8c5c96a47bb8927b3e4e3` | **0.88 s** | Verified tile-wide CSV structure and marked field boundaries on supporting x86-64 CPUs |
 | `dc216ac44dcaeb30ace2af3f2d2ff1d782ef78f0` | **0.33 s** | Partitioned event decoding, compact click index, session reconciliation and direct Parquet output |
 | `d6f4a028fbee7a350a1b77a22dc02c40670d279e` | **0.32 s** | Corrected long-ID parsing and Clang 16 full link-time optimization |
+| `7f59c0b8c268d735ebc3e3ecbd68c7a17302e4b1` | **0.30 s** | Paired event and click decoding, bounded timestamp repair, and sparse user Parquet output |
+
+The entrant reported **0.30 s** for `7f59c0b8c268`. Its production files match the qualified `a983782f7be8` image. This reduced the official time by 0.02 s (6.25%) from 0.32 s.
 
 The entrant reported **0.32 s** for the published Clang release. The executable is identical to the qualified `29ee0cc5c26291c511cad44aec18c6531f050f79` build. The official practice improvement was 0.01 s, or about 3.0% of the prior 0.33 s score. A 0.28 s run would require another 0.04 s reduction.
 
@@ -22,6 +25,33 @@ The entrant reported **0.33 s** after submitting the `dc216ac44dca` release from
 The entrant reported **0.88 s** for `BB-1F2F9464` at `25a940f0d0a8`. The entered best at that point was **0.87 s** at `4db76beed316`. The two Xeons that won every paired release-image comparison both support VBMI2. The hidden result does not report the selected CPU path. A 0.01 s difference between two official runs cannot distinguish ISA, training, input composition or run variation.
 
 The scorer entered `BB-3FCA75FD` in the final at **0.87 s**. Queue wait was 220 ms. This improved the prior official 0.99 s time by 12.1%. The entrant supplied these scores. The 0.99 s run reduced the previous best by 12.4%. The scorer marked the earlier `BB-BE7C95B8` as entered in the final with 3 ms queue wait. Its 1.13 s runtime was 32.7% lower than the previous 1.68 s best. Entries `BB-065C223B` and `BB-E8D93ABE` listed 41 ms and 105 ms of queue wait separately. Relative to `61e9ba6`, the 512-shard release decodes each field as its delimiter is encountered, raises the event and person shard count from 128 to 512, reserves identity storage from input size, and compares inline canonical IDs bytewise without a separate display-name vector. It also reserves Arrow builder capacity and uses unchecked numeric appends within that reservation. Its compiler flags, Dockerfile, global deduplication rules, session boundaries and attribution algorithm match the official baseline. Its official run was 0.03 s slower. Two submissions of the identical baseline pipeline differed by 0.02 s.
+
+## C++ output, session traversal and compact click storage
+
+The official 0.30 s release and three comparison executables ran on four pinned vCPUs of a Xeon 6975P-C. Each timed process read the input and wrote both output tables in a fresh directory. The warm-file measurements used nine alternating 20M rounds and five 60M rounds. Paired changes use per-round ratios. The two C++ changes were committed separately so each could be compared to the scored release. [Native output and session checks](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44960982671/job/137019501668)
+
+| Implementation | 20M median | 20M paired change | 60M median | 60M paired change |
+| --- | ---: | ---: | ---: | ---: |
+| Official 0.30 s release | 0.3006 s | — | 0.9311 s | — |
+| Vectorized user Parquet encoder, `7cddc342fa5c` | 0.2989 s | −0.79% | 0.9198 s | −1.21% |
+| Encoder and batched session traversal, `665950e89cee` | 0.2982 s | −1.16% | 0.9270 s | −0.21% |
+| Comparison executable | 0.2810 s | −6.53% | 0.8961 s | −3.31% |
+
+The combined version won 9/9 practice pairs and 4/5 final-size pairs against the scored build. The 20M output stage fell from 14.9 ms to 12.3 ms in a separate instrumented run. The comparison executable used 9.6 ms. Docker engine start-to-exit medians over three launches were 0.3560 s versus 0.3512 s at 20M and 0.9691 s versus 0.9781 s at 60M for the combined and scored versions. The combined release passed all fixtures, both published 1M tables, 54 patterned cases, full 20M and 60M comparisons, and a separate 60M seed 733 with 15M clicks. On that input its peak process RSS was 1,705.9 MiB. Its static executable SHA-256 was `e30d79f0b6f2796731cddcbc37bfbb365a92fbc6a79805791f5334e7dbe59341` in both Docker builds. [Process, container and held-out results](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44960982671/job/137019501668)
+
+A second Xeon 6975P-C run compared the same shipping executable to two C++ storage alternatives. Each cell is a warm-file median over nine fresh 20M processes or five fresh 60M processes. All five executables ran in the same rotation on the same four pinned CPUs. [Native layout measurements](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44962944610/job/137025552682)
+
+| Implementation | 20M | 60M | Peak RSS at 60M |
+| --- | ---: | ---: | ---: |
+| Official 0.30 s release | 0.2977 s | 0.9200 s | 1,658.4 MiB |
+| Encoder and batched session traversal, `665950e89cee` | **0.2959 s** | **0.9137 s** | 1,660.7 MiB |
+| Store ordinary sorted click keys in eight bytes, `d15e54c5dcf2` | 0.2960 s | 0.9153 s | 1,674.7 MiB |
+| Eight-byte click keys and 12-byte ordinary events, `24c3b7369cd6` | 0.3020 s | 0.9707 s | 1,440.8 MiB |
+| Comparison executable | 0.2792 s | 0.8918 s | 1,266.4 MiB |
+
+The selected production revision is `665950e89ceefa8606400a2090f08964b9e16928`. Its median paired improvement over the scored build was 0.79% at 20M and 1.71% at 60M in the second run. Across both jobs it won 17 of 18 practice pairs and seven of ten final-size pairs. A separate run with cold input files took 3.9054 s at 20M and 11.6092 s at 60M. At 20M the instrumented selected build spent 213.0 ms parsing and routing input, 48.4 ms in the primary event pass and 11.9 ms writing tables. The comparison executable spent 204.4, 44.6 and 9.2 ms in those stages. The four-vCPU results leave the eight-vCPU hidden score open. [Process timings and stage profiles](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44962944610/job/137025552682)
+
+Both storage alternatives matched the 36 fixtures, 54 patterned cases, both published reference tables, the independently checked 20M and 60M outputs, and the separate seed-733 60M reference hashes. The 12-byte layout saved 220 MiB at 60M against the selected version, but lost all 14 warm pairs against it. Its 60M primary event pass took 170.3 ms versus 143.9 ms. An additional native instruction-path qualification step also failed for that experimental build. The selected version passed that step in its own release qualification. The eight-byte click-only variant won four of nine practice and two of five final-size pairs against the selected version. Both experiments remain on the benchmark branch. [Storage qualification](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44962944610/job/137025552682) · [Selected release qualification](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44960982671/job/137019501668)
 
 ## Intel comparisons after the 0.32 s release
 
@@ -61,7 +91,7 @@ The release built from `a983782f7be87572e0b062aadcda96c4272e6d76` produced the s
 | 20M | 0.3236 s | 0.3054 s | −5.52% | 8/9 | 592.6 MiB |
 | 60M | 0.9993 s | 0.9523 s | −4.64% | 5/5 | 1,658.5 MiB |
 
-Docker engine start-to-exit medians over five launches were 0.3552 s at 20M and 0.9879 s at 60M. One verified cold-file run per size took 2.3376 s and 11.3063 s. The candidate's separately instrumented parse and route stage took 232.3 ms out of 328.7 ms wall time at 20M and 649.1 ms out of 911.6 ms at 60M. These measurements use four pinned vCPUs. A hidden eight-vCPU score is still pending. [Timing breakdown and cache conditions](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44956572298/job/137005895087)
+Docker engine start-to-exit medians over five launches were 0.3552 s at 20M and 0.9879 s at 60M. One verified cold-file run per size took 2.3376 s and 11.3063 s. The candidate's separately instrumented parse and route stage took 232.3 ms out of 328.7 ms wall time at 20M and 649.1 ms out of 911.6 ms at 60M. These measurements use four pinned vCPUs. The entrant subsequently reported 0.30 s for this image on the hidden eight-vCPU scorer. [Timing breakdown and cache conditions](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44956572298/job/137005895087)
 
 The image passed all 36 fixtures, both published 1M tables, the identity and catalog regressions, and 54 additional cases. Both output tables and their unique keys matched the validated control at 20M and 60M. On a separate 60M-event input with 15M clicks and seed 733, both complete tables matched again, including all 6,621,736 user rows and 28,014 campaign rows. This run took 0.858 s, peaked at 1,730.6 MiB process RSS and used 1,731.1 MiB at the cgroup peak. The compact and generic parsers each reproduced both published reference tables under an emulated Nehalem CPU. The native validator exercised guarded row boundaries against the objects used in the shipping executable. [Held-out, portability and Docker checks](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44956572298/job/137005895087)
 
