@@ -1,0 +1,217 @@
+#pragma once
+#include "model_types.hpp"
+
+#include <array>
+#include <bit>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <new>
+#include <span>
+#include <string_view>
+#include <vector>
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
+#ifdef __linux__
+#include <sys/mman.h>
+#endif
+
+namespace pipeline::parse {
+inline constexpr std::size_t CHUNK = 4096;
+inline constexpr std::size_t LINK_OFF = 4032;
+inline constexpr std::size_t BLOCK = 2u << 20;
+inline bool NT = true, RELEASE = true, PREFETCH = false;
+
+inline bool popw() {
+    static const bool value = [] {
+        const char* setting = std::getenv("XL_POPW");
+        return !setting || std::string_view(setting) != "0";
+    }();
+    return value;
+}
+
+struct alignas(64) Line { std::array<Rec, 4> rows; };
+
+class Part {
+    struct alignas(64) Page {
+        Rec rows[LINK_OFF / sizeof(Rec)];
+        Page* next;
+    };
+    static_assert(sizeof(Line) == 64 && sizeof(Page) == CHUNK);
+    static_assert(offsetof(Page, next) == LINK_OFF);
+    std::vector<Line> lines_;
+    std::vector<u8> fill_;
+    std::vector<std::uintptr_t> cur_;
+    std::vector<u32> nch_, n_;
+    std::vector<Page*> head_;
+    void* arena_{};
+    u8* (*allocate_)(void*, std::size_t){};
+    u8* block_{};
+    u8* block_end_{};
+    bool populate_{};
+    std::vector<u64> pend_;
+
+    explicit Part(std::size_t nb)
+        : lines_(nb), fill_(nb + 64), cur_(nb, LINK_OFF),
+          nch_(nb), n_(nb), head_(nb), populate_(popw()),
+          pend_(72 * sizeof(Line) / sizeof(u64)) {}
+
+    [[gnu::noinline]] std::uintptr_t new_chunk(std::size_t bucket, std::uintptr_t old) {
+        if (block_ == block_end_) {
+            block_ = allocate_(arena_, BLOCK);
+            block_end_ = block_ + BLOCK;
+#ifdef __linux__
+            if (populate_) {
+                // MADV_POPULATE_WRITE is 23 on Linux; older kernels return EINVAL.
+                ::madvise(block_, BLOCK, 23);
+            }
+#endif
+        }
+        auto* page = ::new (block_) Page;
+        block_ += CHUNK;
+        if (old == LINK_OFF) {
+            head_[bucket] = page;
+        } else {
+            auto* previous = reinterpret_cast<Page*>(old - LINK_OFF);
+            previous->next = page;
+        }
+        ++nch_[bucket];
+        return reinterpret_cast<std::uintptr_t>(page);
+    }
+
+    template<bool Stream>
+    static inline void line_out(std::uintptr_t destination, const Line& line) {
+#if defined(__AVX512F__)
+        auto* out = reinterpret_cast<__m512i*>(destination);
+        auto value = _mm512_load_si512(&line);
+        if constexpr (Stream) _mm512_stream_si512(out, value);
+        else _mm512_storeu_si512(out, value);
+#else
+        std::memcpy(reinterpret_cast<void*>(destination), &line, sizeof(Line));
+#endif
+    }
+
+    template<bool Stream>
+    inline void flush_line(std::size_t bucket) {
+        auto dest = cur_[bucket];
+        if ((dest & (CHUNK - 1)) == LINK_OFF) dest = new_chunk(bucket, dest);
+        line_out<Stream>(dest, lines_[bucket]);
+        cur_[bucket] = dest + sizeof(Line);
+        fill_[bucket] = 0;
+    }
+
+    inline void flush_lines(std::size_t k) {
+        if (NT) {
+            for (std::size_t i = 0; i < k; ++i) flush_line<true>(pend_[i]);
+        } else {
+            for (std::size_t i = 0; i < k; ++i) flush_line<false>(pend_[i]);
+        }
+    }
+
+    [[gnu::cold,gnu::noinline]] void flush_full(std::size_t k) { flush_lines(k); }
+
+public:
+    Part() = default;
+    Part(const Part&) = delete;
+    Part& operator=(const Part&) = delete;
+    Part(Part&&) = default;
+    Part& operator=(Part&&) = default;
+    static Part empty() { return {}; }
+    static Part new_unbound(std::size_t nb) { return Part(nb); }
+
+    template<class Arena> void set_arena(Arena& arena) {
+        arena_ = &arena;
+        allocate_ = [](void* a, std::size_t n) -> u8* {
+            return static_cast<Arena*>(a)->alloc(n);
+        };
+    }
+    template<class Arena> Part(Arena& arena, std::size_t nb) : Part(nb) { set_arena(arena); }
+
+    inline const u8* lines_ptr() const { return reinterpret_cast<const u8*>(lines_.data()); }
+
+    inline void push(std::size_t bucket, u64 w0, u64 w1) {
+        const auto offset = fill_[bucket];
+        lines_[bucket].rows[offset / sizeof(Rec)] = {w0, w1};
+        if (offset == 48) {
+            if (NT) flush_line<true>(bucket);
+            else flush_line<false>(bucket);
+        } else {
+            fill_[bucket] = u8(offset + sizeof(Rec));
+        }
+    }
+
+    inline void push_many(u64 mask, std::size_t n, const u64* buckets, const u64* line_pointers,
+                          const std::array<u64, 2>* records) {
+        std::size_t pending = 0;
+        auto row = [&](std::size_t i) {
+            const auto b = std::size_t(buckets[i]);
+            unsigned offset = fill_[b];
+            if (offset == 64) {
+                flush_full(pending);
+                pending = 0;
+                offset = 0;
+            }
+            auto* destination = reinterpret_cast<u8*>(std::uintptr_t(line_pointers[i])) + offset;
+            std::memcpy(std::assume_aligned<16>(destination),
+                        std::assume_aligned<16>(records + i), sizeof(Rec));
+            const auto next = unsigned(offset + sizeof(Rec));
+            fill_[b] = u8(next);
+            pend_[pending] = b;
+            pending += next >> 6;
+        };
+        if (mask == (n >= 64 ? UINT64_MAX : (u64{1} << n) - 1)) {
+            for (std::size_t i = 0; i < n; ++i) row(i);
+        } else {
+            while (mask) {
+                auto i = std::countr_zero(mask);
+                mask &= mask - 1;
+                row(i);
+            }
+        }
+        flush_lines(pending);
+    }
+
+    void finish() {
+        for (std::size_t b = 0; b < head_.size(); ++b) {
+            const auto bytes = fill_[b];
+            if (bytes) {
+                auto destination = cur_[b];
+                if ((destination & (CHUNK - 1)) == LINK_OFF)
+                    destination = new_chunk(b, destination);
+                std::memcpy(reinterpret_cast<void*>(destination), &lines_[b], bytes);
+                cur_[b] = destination + bytes;
+                fill_[b] = 0;
+            }
+            if (head_[b]) {
+                const auto last = (cur_[b] - 1) & ~std::uintptr_t(CHUNK - 1);
+                n_[b] = (nch_[b] - 1) * u32(LINK_OFF / sizeof(Rec))
+                      + u32((cur_[b] - last) / sizeof(Rec));
+            }
+        }
+#if defined(__x86_64__) || defined(_M_X64)
+        if (NT) _mm_sfence();
+#endif
+    }
+
+    template<class F> inline void for_each(std::size_t b, F&& f) const {
+        if (b >= head_.size() || !head_[b]) return;
+        const auto head_of_last = (cur_[b] - 1) & ~std::uintptr_t(CHUNK - 1);
+        auto* page = head_[b];
+        while (reinterpret_cast<std::uintptr_t>(page) != head_of_last) {
+            auto* next = page->next;
+#if defined(__GNUC__) || defined(__clang__)
+            if (PREFETCH) {
+                __builtin_prefetch(next);
+                __builtin_prefetch(reinterpret_cast<const u8*>(next) + 64);
+                __builtin_prefetch(&next->next);
+            }
+#endif
+            f(std::span<const Rec>(page->rows));
+            page = next;
+        }
+        f(std::span<const Rec>(page->rows, (cur_[b] - head_of_last) / sizeof(Rec)));
+    }
+    inline std::size_t count(std::size_t b) const { return n_[b]; }
+};
+}
