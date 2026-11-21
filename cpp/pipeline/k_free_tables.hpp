@@ -321,6 +321,9 @@ inline constexpr auto CAMP5R K_FREE_ASM_NAME("shopping_kernel_camp")=[]{
     }
     return rows;
 }();
+#if defined(__ELF__) && defined(__x86_64__) && defined(SHOP_KERNEL_ABSOLUTE_TABLES)
+#include "k_free_click_tables.hpp"
+#endif
 #undef K_FREE_ASM_NAME
 static_assert(offsetof(Tables,kid1)==937472 && offsetof(Tables,uid1)-64==941504);
 static_assert(offsetof(CkBatch,camp)==512 && offsetof(CkBatch,cid)==1024 && offsetof(CkBatch,uid)==1536);

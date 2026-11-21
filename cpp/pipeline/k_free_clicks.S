@@ -1,6 +1,8 @@
 // Two staged rows share the decoder registers. The exit reports the first row
 // needing repair, or the next row after filling the 64-slot output batch.
-#if defined(__ELF__) && defined(__x86_64__)
+#if defined(__ELF__) && defined(__x86_64__) && defined(SHOP_KERNEL_ABSOLUTE_TABLES)
+#include "k_free_click_pairs.inc"
+#elif defined(__ELF__) && defined(__x86_64__)
 .intel_syntax noprefix
 .text
 .equ KID1,937472

@@ -65,6 +65,10 @@ struct alignas(BATCH_ALIGN) CkBatch {
     CkBatch() {
         scratch.fill(SCRATCH_INIT);
         scratch[2] = scratch[3] = 0;
+#if defined(__ELF__) && defined(__x86_64__) && defined(SHOP_KERNEL_ABSOLUTE_TABLES)
+        // Keep an uninitialized day-cache entry from matching an all-comma input.
+        scratch[48*4+1] ^= u64{','^'-'}<<8;
+#endif
     }
     ClRow row(std::size_t i) const { return {cid[i], uid[i], u32(camp[i]), ts[i]}; }
 };
