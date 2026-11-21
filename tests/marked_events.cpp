@@ -85,7 +85,7 @@ int main() {
       input[pos] = ",\"\n\r\0"[i % 5];
     marked += check(input);
   }
-#ifdef SHOPPING_X86_CSV
+#if defined(SHOPPING_X86_CSV) && defined(__x86_64__)
   if (wide_csv_supported() && __builtin_cpu_supports("bmi2") &&
       __builtin_cpu_supports("pclmul") &&
       __builtin_cpu_supports("avx512vbmi2") &&

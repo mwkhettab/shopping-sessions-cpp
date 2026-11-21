@@ -1,5 +1,5 @@
 #pragma once
-#ifdef SHOPPING_X86_CSV
+#if defined(SHOPPING_X86_CSV) && defined(__x86_64__)
 // A certified tile has seven fields per row and quotes only in matching
 // pairs at field boundaries. Reject the complete tile before emitting rows
 // when either check fails. The scalar grammar handles long or irregular input.

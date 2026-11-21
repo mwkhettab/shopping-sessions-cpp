@@ -151,6 +151,7 @@ inline std::pair<unsigned, unsigned> delimiters(const char *p) {
 #include "marked_events.hpp"
 template <size_t N, class F> void parse_rows(Str data, F &&callback) {
 #ifdef SHOPPING_X86_CSV
+#ifdef __x86_64__
   if constexpr (N == 7) {
     if (wide_csv_supported() && __builtin_cpu_supports("bmi2") &&
         __builtin_cpu_supports("pclmul")) {
@@ -162,6 +163,7 @@ template <size_t N, class F> void parse_rows(Str data, F &&callback) {
       }
     }
   }
+#endif
   if (N == 7 && wide_csv_supported()) {
     tiled_lines<N, 16>(data, callback);
     return;
