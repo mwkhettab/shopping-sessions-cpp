@@ -23,6 +23,48 @@ The entrant reported **0.88 s** for `BB-1F2F9464` at `25a940f0d0a8`. The entered
 
 The scorer entered `BB-3FCA75FD` in the final at **0.87 s**. Queue wait was 220 ms. This improved the prior official 0.99 s time by 12.1%. The entrant supplied these scores. The 0.99 s run reduced the previous best by 12.4%. The scorer marked the earlier `BB-BE7C95B8` as entered in the final with 3 ms queue wait. Its 1.13 s runtime was 32.7% lower than the previous 1.68 s best. Entries `BB-065C223B` and `BB-E8D93ABE` listed 41 ms and 105 ms of queue wait separately. Relative to `61e9ba6`, the 512-shard release decodes each field as its delimiter is encountered, raises the event and person shard count from 128 to 512, reserves identity storage from input size, and compares inline canonical IDs bytewise without a separate display-name vector. It also reserves Arrow builder capacity and uses unchecked numeric appends within that reservation. Its compiler flags, Dockerfile, global deduplication rules, session boundaries and attribution algorithm match the official baseline. Its official run was 0.03 s slower. Two submissions of the identical baseline pipeline differed by 0.02 s.
 
+## Intel comparisons after the 0.32 s release
+
+One Xeon 6975P-C and one Xeon Platinum 8573C ran each executable on the same four pinned CPUs. Each warm measurement starts a fresh process, reads events, clicks and identity links, and writes both Parquet tables. Each host ran nine practice and five final-size pairs per variant in rotated order. The control is the production ELF scored at 0.32 s. The cells below give the median per-round change in elapsed time relative to that control. [Xeon 6975P-C](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44954948957/job/137000871383) · [Xeon Platinum 8573C](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44954948957/job/137000871784)
+
+| Change | 6975P-C 20M | 8573C 20M | 6975P-C 60M | 8573C 60M |
+| --- | ---: | ---: | ---: | ---: |
+| Joint click-ID decoding and direct campaign lookup | −0.51% | −0.45% | −1.35% | −0.54% |
+| Separate zero-revenue rows in the user Parquet writer | −0.31% | +0.58% | −0.68% | +0.54% |
+| Enlarge each partition's staging buffer from 64 to 192 bytes with 16-byte events | +0.61% | +0.54% | +7.51% | +3.91% |
+
+All three variants passed the 36 fixtures, identity and catalog regressions, the two published 1M tables, 54 additional cases, and full comparisons at 20M and 60M. A separate timed process on the 6975P-C attributed 228.3 ms of its 300.2 ms wall time to the input and routing stage at 20M. At 60M this stage took 674.7 ms of 931.9 ms. Those instrumented processes ran separately from the rotated pairs. [Native timings and row checks](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44954948957/job/137000871383)
+
+The first two-row event reader failed its independent row oracle on both Intel CPUs. A single-row retry wrote 16 bytes into the ingest column and changed the already decoded timestamp in the following row. Guarded row 2,987 expected 2024-05-03 at 00:01:02 UTC and received January 1 at midnight. The corrected retry writes the eight bytes belonging to its row. A regression places different ingest dates across pair and batch boundaries.
+
+Two Xeon 6975P-C hosts compared the release with a second static x86-64 executable. The executable SHA-256 was `6f6779cb7ec58760b69325369b5ac6657405230b0c3c2231214c6680038a86ce`. It matched both complete tables and took 0.2802 s against 0.3181 s and 0.2912 s against 0.3288 s at 20M. At 60M the medians were 0.9032 s against 0.9806 s and 0.9277 s against 1.0074 s. All 28 warm pairs favored this comparison executable. [First direct comparison](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44955813988/job/137003543743) · [Independent repeat](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44955813988/job/137003543940)
+
+The C++ trial packing ordinary events into 12 bytes retained a separate 16-byte path for purchases and exceptional records. A 32,768-slot bucket brought peak RSS down from 1,657.9–1,661.9 MiB to 1,408.1 MiB on the two hosts. This layout increased median paired elapsed time by 1.48–2.41% at 20M and 2.19–4.40% at 60M. Keeping 16,384 slots raised 60M time by 6.90–7.31%. Grouping release of mapped input pages changed 20M time by −0.51% to −0.43% and 60M by −1.30% to +0.36%. Each alternative passed the large table comparisons. [Packed event and input results](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44955813988)
+
+A separate Xeon 6975P-C then tested the corrected event reader. Every variant below passed the scalar reference and guarded native row checks, all fixtures, both published 1M tables, 54 additional cases, and complete 20M and 60M comparisons. The control medians on this host were 0.3301 s and 1.0221 s. Each 20M candidate won nine of nine warm pairs. [Corrected event reader, session traversal and output](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44956135473/job/137004571242)
+
+| C++ configuration | 20M process median | 20M paired change | 60M process median | 60M paired change |
+| --- | ---: | ---: | ---: | ---: |
+| Paired events with bounded repair | 0.3142 s | −4.86% | 0.9826 s | −3.81% |
+| Paired events and clicks, sparse user output | 0.3116 s | −5.24% | 0.9665 s | −4.53% |
+| Above with separate simple-user and click-bearing runs | 0.3106 s | −5.51% | 0.9568 s | −4.91% |
+| Paired events and clicks, sparse output, deferred page population | 0.3127 s | −5.22% | 0.9728 s | −4.34% |
+
+A further Xeon 6975P-C run combined the bounded event reader and the compact click reader. With ordinary 16-byte event partitions, `6c1ea9115f79` took 0.3155 s against 0.3315 s at 20M and 0.9522 s against 1.0068 s at 60M. The paired changes were −4.86% and −6.32%, with all 14 pairs faster. Adding 12-byte event records and 32,768-slot buckets changed the medians to 0.3199 s and 1.0139 s on that host. Including grouped input release and sparse output gave 0.3175 s and 1.0351 s. The three configurations matched both tables at both sizes. The separate compact click-column experiment did not reach timing because its stand-alone test model omitted the click time-range field. [Combined storage and reader comparison](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44956572357/job/137005895618)
+
+### Shipping image qualification
+
+The release built from `a983782f7be87572e0b062aadcda96c4272e6d76` produced the same static executable on the native runner and in the local linux/amd64 Docker build. Its SHA-256 was `09e438e77f35f2b8a9ede683975f52d6a9d1b5576af95ae58a81d626bdd08175`. A second Xeon 6975P-C ran that executable and the 0.32 s release on four pinned vCPUs. The values below are medians of fresh processes with warm file caches. Paired changes use the ratio within each round. [Shipping image and native measurements](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44956572298/job/137005895087)
+
+| Events | 0.32 s release | Shipping candidate | Paired elapsed change | Faster rounds | Peak candidate RSS |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 20M | 0.3236 s | 0.3054 s | −5.52% | 8/9 | 592.6 MiB |
+| 60M | 0.9993 s | 0.9523 s | −4.64% | 5/5 | 1,658.5 MiB |
+
+Docker engine start-to-exit medians over five launches were 0.3552 s at 20M and 0.9879 s at 60M. One verified cold-file run per size took 2.3376 s and 11.3063 s. The candidate's separately instrumented parse and route stage took 232.3 ms out of 328.7 ms wall time at 20M and 649.1 ms out of 911.6 ms at 60M. These measurements use four pinned vCPUs. A hidden eight-vCPU score is still pending. [Timing breakdown and cache conditions](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44956572298/job/137005895087)
+
+The image passed all 36 fixtures, both published 1M tables, the identity and catalog regressions, and 54 additional cases. Both output tables and their unique keys matched the validated control at 20M and 60M. On a separate 60M-event input with 15M clicks and seed 733, both complete tables matched again, including all 6,621,736 user rows and 28,014 campaign rows. This run took 0.858 s, peaked at 1,730.6 MiB process RSS and used 1,731.1 MiB at the cgroup peak. The compact and generic parsers each reproduced both published reference tables under an emulated Nehalem CPU. The native validator exercised guarded row boundaries against the objects used in the shipping executable. [Held-out, portability and Docker checks](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44956572298/job/137005895087)
+
 ## Experiments after the 0.33 s official score
 
 A 74-event regression exposed an error in the scored GCC image. The input contains two buyers named `Truncated` and `Merged`. Its only link joins `Merged` to a longer ID consisting of 33 `Q` characters followed by `Truncated`. The executable treated the suffix as an additional linked ID. It emitted 42 user-day rows and credited one purchasing session with 34 cents. The rules give 43 user-day rows and two purchasing sessions, one worth 11 cents and one worth 23 cents. The independent 0.87 s executable reproduced both expected tables. Commit `5230d4835e1b2f9f6b48d1dc53319a3e2b658077` selects the general link parser whenever the lookup table gives a zero digit count. Each supported short ID has at least one digit. The regression checks both tables through the normal executable.
