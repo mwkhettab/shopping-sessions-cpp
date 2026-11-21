@@ -1,0 +1,111 @@
+name: Native paired event clocks and LLVM training
+on:
+  push:
+    branches: [bench/native-x64-trials]
+    paths:
+      - .github/workflows/native-clock-training.yml
+      - perf/native/clock_training/**
+permissions:
+  contents: read
+jobs:
+  compare:
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [first, second, third]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 115
+    env:
+      CXX: g++-12
+      RELEASE_REVISION: 29ee0cc5c26291c511cad44aec18c6531f050f79
+      BUILDKIT_PROGRESS: plain
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Identify a compatible native Intel runner
+        id: cpu
+        run: python3 perf/native/intel-wide-runner.py
+      - name: Check out the Clang release
+        if: steps.cpu.outputs.wide == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_REVISION }}
+          path: .acceptance/candidate
+          persist-credentials: false
+      - name: Check out the GCC release
+        if: steps.cpu.outputs.wide == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: 5230d4835e1b2f9f6b48d1dc53319a3e2b658077
+          path: .acceptance/gcc
+          persist-credentials: false
+      - name: Check out the independent reference implementation
+        if: steps.cpu.outputs.wide == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: 4db76beed31640ddf4b414ed19deba5ebc660b81
+          path: .acceptance/baseline
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        if: steps.cpu.outputs.wide == 'true'
+        with:
+          python-version: '3.12'
+      - name: Prepare inputs and reference tables
+        if: steps.cpu.outputs.wide == 'true'
+        run: bash perf/native/prepare-port-runner.sh
+      - name: Build and verify the checked calendar lookup
+        if: steps.cpu.outputs.wide == 'true'
+        run: |
+          out="$RUNNER_TEMP/shopping-trials/clock-binaries"
+          bash perf/native/clock_training/build_date.sh .acceptance/candidate .acceptance/gcc "$out"
+      - name: Train LLVM on the unmodified Clang release
+        id: stock
+        if: steps.cpu.outputs.wide == 'true'
+        continue-on-error: true
+        run: bash perf/native/clock_training/run_pgo.sh llvm-pgo "$RELEASE_REVISION" "$RUNNER_TEMP/shopping-trials/clock-binaries"
+      - name: Train LLVM on the checked calendar lookup
+        id: date
+        if: steps.cpu.outputs.wide == 'true'
+        continue-on-error: true
+        run: bash perf/native/clock_training/run_pgo.sh llvm-pgo-date "$RELEASE_REVISION" "$RUNNER_TEMP/shopping-trials/clock-binaries"
+      - name: Check both tables and rotate fresh processes at 20M and 60M
+        if: steps.cpu.outputs.wide == 'true'
+        env:
+          STOCK: ${{ steps.stock.outcome }}
+          DATE: ${{ steps.date.outcome }}
+        run: |
+          area="$RUNNER_TEMP/shopping-trials"
+          out="$area/clock-binaries"
+          options=()
+          for tag in clang-date gcc-date; do options+=(--comparison-binary "$tag=$out/$tag/app/shopping"); done
+          if test "$STOCK" = success; then options+=(--comparison-binary "llvm-pgo=$out/llvm-pgo/release/app/shopping"); fi
+          if test "$DATE" = success; then options+=(--comparison-binary "llvm-pgo-date=$out/llvm-pgo-date/release/app/shopping"); fi
+          "$RUNNER_TEMP/shopping-python/bin/python" perf/native/port_acceptance.py \
+            --candidate-source "$GITHUB_WORKSPACE/.acceptance/candidate" "${options[@]}" \
+            --release-generated-practice --warm-20 9 --warm-60 5 --cold-runs 1
+          python3 - "$area/results/port-acceptance/status.json" <<'PY'
+          import json, os, sys
+          state=json.load(open(sys.argv[1]))
+          assert state["verified"]["kernel"] == "wide SIMD"
+          variants=["clang-date","gcc-date"]
+          if os.environ["STOCK"]=="success": variants.append("llvm-pgo")
+          if os.environ["DATE"]=="success": variants.append("llvm-pgo-date")
+          for name in variants:
+              for size in ("1M","20M","60M"):
+                  assert f"{size}/{name}" in state["verified"], (name,size,state["implementations"][name])
+          PY
+      - name: Publish whole-process and stage measurements
+        if: always() && steps.cpu.outputs.wide == 'true'
+        run: |
+          area="$RUNNER_TEMP/shopping-trials/results"
+          if test -f "$area/port-acceptance/status.json"; then python3 perf/native/publish_profile.py "$area"; fi
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.cpu.outputs.wide == 'true'
+        with:
+          name: paired-clock-training-${{ matrix.lane }}
+          path: |
+            ${{ runner.temp }}/shopping-trials/results/
+            ${{ runner.temp }}/shopping-trials/clock-binaries/*.log
+            ${{ runner.temp }}/shopping-trials/clock-binaries/*/proof/
+          retention-days: 7

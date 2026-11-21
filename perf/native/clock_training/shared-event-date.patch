@@ -1,0 +1,57 @@
+--- a/build.sh
++++ b/build.sh
+@@ -11,5 +11,8 @@
+         set -- "$@" -fno-pie -no-pie -DSHOP_KERNEL_ABSOLUTE_TABLES cpp/pipeline/k_free_clicks.S
+         ;;
+ esac
++if [ "${SHARED_EVENT_DATE:-0}" = 1 ]; then
++    set -- "$@" -DSHOP_SHARED_EVENT_DATE
++fi
+ "$compiler" "$@" cpp/pipeline/main.cpp cpp/pipeline/k_free.cpp cpp/pipeline/k_free_x86.cpp \
+     cpp/pipeline/sys_global_alloc.cpp -o build/shopping
+--- a/cpp/pipeline/k_free_x86.cpp
++++ b/cpp/pipeline/k_free_x86.cpp
+@@ -323,8 +323,21 @@
+     auto q3=u3>>1;
+     auto &tj=T.tj[2*(c2-c1-1)+q3];auto &f=tj.f;
+     auto kp2=p+c1+f.koff1,kp3=p+c2+q3;
++#ifdef SHOP_SHARED_EVENT_DATE
++    auto date3=ld2(date_entry(cx.cache,kp3,DATE_PEXT));
++    auto date2=date3;
++    const auto key2=ld(kp2),mask2=ld(tj.d.kmask2.data());
++    auto k2=_mm_and_si128(_mm_xor_si128(key2,_mm256_castsi256_si128(date3)),mask2);
++    // Matching calendar keys include both day digits used by DATE_PEXT. A
++    // numeric event has an empty key mask and a zero calendar contribution.
++    if (nz(k2)) [[unlikely]] {
++        date2=ld2(date_entry(cx.cache,kp2,DATE_PEXT));
++        k2=_mm_and_si128(_mm_xor_si128(key2,_mm256_castsi256_si128(date2)),mask2);
++    }
++#else
+     auto date2=ld2(date_entry(cx.cache,kp2,f.pmask)),date3=ld2(date_entry(cx.cache,kp3,f.pmask3));
+     auto k2=_mm_and_si128(_mm_xor_si128(ld(kp2),_mm256_castsi256_si128(date2)),ld(tj.d.kmask2.data()));
++#endif
+     auto k3=_mm_and_si128(_mm_xor_si128(ld(kp3),_mm256_castsi256_si128(date3)),ld(tj.d.kmask3.data()));
+     auto bad=_mm256_or_si256(id_bad,_mm256_zextsi128_si256(_mm_or_si128(k3,bad_kind)));
+     st={&tj,join(ld(p+c2-16),ld(rs4-17)),_mm256_permute2x128_si256(date2,date3,0x31),
+@@ -352,9 +365,21 @@
+     auto m2=_mm256_madd_epi16(m1,ld2(j.c.w2.data()));
+     auto m3=_mm256_madd_epi16(_mm256_packus_epi32(m2,m2),ld2(j.c.w3.data()));
+     auto ba=_mm256_subs_epu8(d,ld2(j.b.lim.data())),bb=_mm256_cmpgt_epi32(m2,ld2(j.d.limv.data()));
++#ifdef SHOP_SHARED_EVENT_DATE
++    auto kme=ld2(j.e.kme.data());
++    auto t=_mm256_mul_epu32(m3,kme),f=_mm256_mul_epi32(_mm256_srli_epi64(m3,32),ld2(j.e.kmf.data()));
++#else
+     auto t=_mm256_mul_epu32(m3,ld2(j.e.kme.data())),f=_mm256_mul_epi32(_mm256_srli_epi64(m3,32),ld2(j.e.kmf.data()));
++#endif
+     auto ksub=_mm256_testn_epi64_mask(d,ld2(j.f.ksel.data()));
++#ifdef SHOP_SHARED_EVENT_DATE
++    auto delta=_mm256_mask_sub_epi64(_mm256_add_epi64(t,f),ksub,t,f);
++    // Only event shapes with a civil date use 1000 in their event multiplier.
++    auto dated=_mm256_cmpeq_epi64_mask(kme,_mm256_set_epi64x(0,1000,1000,0));
++    auto r=_mm256_mask_add_epi64(delta,dated,delta,st.days);
++#else
+     auto r=_mm256_add_epi64(_mm256_mask_sub_epi64(_mm256_add_epi64(t,f),ksub,t,f),st.days);
++#endif
+     cx.b->ts[w]=_mm_extract_epi64(_mm256_castsi256_si128(r),1);
+     auto dst=reinterpret_cast<u8 *>(cx.b)+offsetof(EvBatch,ing)+8*w;
+     _mm_storeu_si128(reinterpret_cast<V *>(dst),_mm256_extracti128_si256(r,1));
