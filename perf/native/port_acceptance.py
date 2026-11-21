@@ -302,6 +302,8 @@ def main():
                    help="measure the two unmodified release images from Docker start to exit")
     p.add_argument("--input-policy-rounds", type=int, default=0,
                    help="compare four input policies in fresh processes on the exact candidate executable")
+    p.add_argument("--parser-probe", type=Path,
+                   help="compare separately instrumented parser telemetry against the shipping executable")
     p.add_argument("--cpus", type=int, default=8)
     p.add_argument("--memory-mib", type=int, default=12288)
     p.add_argument("--skip-kernel-test", action="store_true", help="for exercising the harness with existing binaries")
@@ -493,6 +495,13 @@ def main():
                              "--input", data, "--tools", ROOT, "--output", folder, "--scale", scale, "--rounds", str(args.input_policy_rounds)],
                             results / (scale + "-input-settings.log"), env)
                 state.setdefault("input_policies", {})[scale] = json.loads((folder / "summary.json").read_text())
+            if args.parser_probe:
+                mark(scale + " parser sampling")
+                folder = results / (scale + "-parser")
+                exec_logged([sys.executable, NATIVE/"parser_trials/parse_sampling.py", "--tools", ROOT,
+                             "--shipping", bins["candidate"], "--probe", args.parser_probe.resolve(),
+                             "--input", data, "--scale", scale, "--output", folder],
+                            results / (scale + "-parser.log"), env)
             runner_temp = os.environ.get("RUNNER_TEMP")
             if (scale == "20M" and args.release_generated_practice and not args.practice and runner_temp
                     and area == (Path(runner_temp) / "shopping-trials").resolve()):

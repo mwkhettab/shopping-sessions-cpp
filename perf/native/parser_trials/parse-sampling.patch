@@ -1,0 +1,339 @@
+--- /dev/null
++++ b/cpp/pipeline/parse_probe.hpp
+@@ -0,0 +1,162 @@
++#pragma once
++#include "model_types.hpp"
++#include <algorithm>
++#include <array>
++#include <charconv>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <sstream>
++#include <string_view>
++#include <vector>
++
++namespace pipeline::parse_probe {
++using Clock = std::chrono::steady_clock;
++inline u64 now() {
++    return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
++}
++inline u64 setting(const char* key, u64 fallback) {
++    if (const char* s = std::getenv(key)) {
++        std::string_view text(s);
++        u64 value{};
++        const auto [end, ec] = std::from_chars(s, s + text.size(), value);
++        if (ec == std::errc{} && end == s + text.size()) return value;
++    }
++    return fallback;
++}
++inline u64 mix(u64 v) {
++    v = (v ^ (v >> 30)) * 0xbf58476d1ce4e5b9ULL;
++    v = (v ^ (v >> 27)) * 0x94d049bb133111ebULL;
++    return v ^ (v >> 31);
++}
++inline u64 stride() { static const u64 n = setting("SHOP_PARSE_STRIDE", 16); return n; }
++inline u64 phase() { static const u64 n = setting("SHOP_PARSE_PHASE", 0); return n; }
++
++// Pick one queue entry per contiguous group of each file kind. Rotating phase
++// covers every entry of each group; neither worker assignment nor run order enters the plan.
++template<class Files> const auto& plan(const std::vector<Chunk>& queue, const Files& files) {
++    static const auto selected = [&] {
++        std::vector<std::size_t> result(queue.size());
++        const auto step = stride();
++        if (!step) return result;
++        std::array<std::vector<std::size_t>, 3> kinds;
++        for (std::size_t i = 0; i < queue.size(); ++i)
++            kinds[std::size_t(files[queue[i].file].kind)].push_back(i);
++        for (std::size_t k = 0; k < kinds.size(); ++k) {
++            const auto& items = kinds[k];
++            for (std::size_t first = 0; first < items.size();) {
++                const auto width = std::min<u64>(step, items.size() - first);
++                const auto offset = (mix(first ^ ((k + 1) * 0x9e3779b97f4a7c15ULL)) % width + phase() % width) % width;
++                result[items[first + offset]] = width;
++                first += width;
++            }
++        }
++        return result;
++    }();
++    return selected;
++}
++struct KindStats {
++    u64 chunks{}, sample_chunks{}, sampled_id_xor{}, chunk_ns{}, bytes{}, rows{}, body_ns{};
++    u64 sample_bytes{}, sample_rows{}, sample_body_ns{}, packets{}, packet_rows{}, special_rows{};
++    u64 classify_ns{}, scatter_ns{}, fused_ns{}, special_ns{};
++    std::array<u64,5> weighted{};
++};
++struct alignas(128) Worker {
++    u64 begin{}, end{}, jobs_ns{}, handoff_ns{}, tail_ns{};
++    bool selected{};
++    std::array<KindStats, 3> kinds{};
++};
++inline std::array<Worker, 16> workers{};
++struct Scope {
++    u64& value;
++    u64 start = now();
++    ~Scope() { value += now() - start; }
++};
++struct ChunkScope {
++    KindStats& k;
++    u64 start, weight;
++    std::array<u64,5> before{};
++    std::array<u64,5> sampled_ns() const {
++        return {k.sample_body_ns,k.classify_ns,k.scatter_ns,k.fused_ns,k.special_ns};
++    }
++    ChunkScope(Worker& w, Kind kind, std::size_t id, std::size_t width)
++        : k(w.kinds[std::size_t(kind)]), start(now()), weight(width) {
++        w.selected = width!=0;
++        ++k.chunks;
++        if (weight) { ++k.sample_chunks; k.sampled_id_xor ^= mix(id + 1); before=sampled_ns(); }
++    }
++    ~ChunkScope() {
++        k.chunk_ns += now() - start;
++        if (weight) {
++            const auto end=sampled_ns();
++            for (std::size_t j=0;j<end.size();++j) k.weighted[j] += (end[j]-before[j])*weight;
++        }
++    }
++};
++struct Buffer {
++    KindStats& k;
++    const bool sampled;
++    const u64& counter;
++    u64 initial, start;
++    Buffer(Worker& w, Kind kind, std::size_t bytes, const u64& rows)
++        : k(w.kinds[std::size_t(kind)]), sampled(w.selected), counter(rows), initial(rows), start(now()) {
++        k.bytes += bytes;
++        if (sampled) k.sample_bytes += bytes;
++    }
++    ~Buffer() {
++        const auto spent = now() - start, rows = counter - initial;
++        k.body_ns += spent; k.rows += rows;
++        if (sampled) { k.sample_body_ns += spent; k.sample_rows += rows; }
++    }
++};
++template<bool Sample> struct Packet {
++    KindStats& k;
++    u64 last = 0;
++    Packet(KindStats& s, u64 rows) : k(s) {
++        if constexpr (Sample) { last = now(); ++k.packets; k.packet_rows += rows; }
++    }
++    void mark(u64 KindStats::* member) {
++        if constexpr (Sample) {
++            const auto at = now(); k.*member += at - last; last = at;
++        }
++    }
++    void finish(u64 special) {
++        if constexpr (Sample) { k.special_rows += std::popcount(special); mark(&KindStats::special_ns); }
++    }
++};
++template<class C> struct SampleSink {
++    C& c;
++    auto ev() { return c.ev(); }
++    auto ck() { return c.ck(); }
++    void ev_flush() { c.template ev_flush<true>(); }
++    void ck_flush() { c.template ck_flush<true>(); }
++};
++inline void emit(std::size_t nt) {
++    std::array<u64, 512> costs;
++    for (auto& cost : costs) { auto a = now(); cost = now() - a; }
++    std::sort(costs.begin(), costs.end());
++    std::ostringstream o;
++    o << "[parse-sample] meta stride=" << stride() << " phase=" << phase() << " workers=" << nt
++      << " clock_pair_median_ns=" << costs[costs.size()/2] << '\n';
++    constexpr std::array names{"event", "click", "link"};
++    for (std::size_t i = 0; i < nt; ++i) {
++        const auto& w = workers[i];
++        o << "[parse-sample] worker tid=" << i << " begin=" << w.begin << " end=" << w.end << " jobs_ns="
++          << w.jobs_ns << " handoff_ns=" << w.handoff_ns << " tail_ns=" << w.tail_ns << '\n';
++        for (std::size_t j = 0; j < names.size(); ++j) {
++            const auto& k = w.kinds[j];
++            o << "[parse-sample] " << names[j] << " tid=" << i << " chunks=" << k.chunks << " sample_chunks="
++              << k.sample_chunks << " sampled_id_xor=" << k.sampled_id_xor << " chunk_ns=" << k.chunk_ns
++              << " bytes=" << k.bytes << " rows=" << k.rows << " body_ns=" << k.body_ns << " sample_bytes="
++              << k.sample_bytes << " sample_rows=" << k.sample_rows << " sample_body_ns=" << k.sample_body_ns
++              << " packets=" << k.packets << " packet_rows=" << k.packet_rows << " special_rows=" << k.special_rows
++              << " classify_ns=" << k.classify_ns << " scatter_ns=" << k.scatter_ns << " fused_ns="
++              << k.fused_ns << " special_ns=" << k.special_ns;
++            constexpr std::array fields{"body_ns","classify_ns","scatter_ns","fused_ns","special_ns"};
++            for (std::size_t f=0;f<fields.size();++f) o << " weighted_" << fields[f] << '=' << k.weighted[f];
++            o << '\n';
++        }
++    }
++    const auto text = o.str(); (void)std::fwrite(text.data(), 1, text.size(), stderr);
++}
++}
+--- a/cpp/pipeline/parse_sink.hpp
++++ b/cpp/pipeline/parse_sink.hpp
+@@ -3,6 +3,9 @@
+ #include "parse_part.hpp"
+ #include "sys.hpp"
+ #include <mutex>
++#ifdef SHOP_PARSE_SAMPLING
++#include "parse_probe.hpp"
++#endif
+ 
+ namespace pipeline::parse {
+ struct Tabs {
+@@ -78,14 +81,29 @@
+         t.odd_events.push_back({token(r.eid),r.ingest,w0,user});
+     }
+     EvBatch* ev() {return &eb;}
++#ifdef SHOP_PARSE_SAMPLING
++    template<bool Sample=false>
++#endif
+     [[gnu::noinline]] void ev_flush() {
+         const auto n=std::exchange(eb.n,0); if(!n) return;
++#ifdef SHOP_PARSE_SAMPLING
++        parse_probe::Packet<Sample> probe(parse_probe::workers[tid].kinds[0],n);
++#endif
+         t.n_ev_rows+=n;
+         const EvP p{g.ing_base,g.ws,g.wlen,g.ukey,g.ekey,g.ucap,g.ecap,tb.prod.data(),t.ev.lines_ptr()};
+         const auto [regular,special,bad]=u64(TS_BAD)-u64(p.ing_base)>=ING_MAX*1000 ? ev_vec<false>(eb,out,n,p) : ev_vec<true>(eb,out,n,p);
+         if(bad) sys::fallback("ingest_ts bad or out of range");
++#ifdef SHOP_PARSE_SAMPLING
++        probe.mark(&parse_probe::KindStats::classify_ns);
++#endif
+         t.ev.push_many(regular,n,out.ob.data(),out.lp.data(),out.rec.data());
++#ifdef SHOP_PARSE_SAMPLING
++        probe.mark(&parse_probe::KindStats::scatter_ns);
++#endif
+         for(auto m=special;m;m&=m-1) ev_one(eb.row(std::countr_zero(m)));
++#ifdef SHOP_PARSE_SAMPLING
++        probe.finish(special);
++#endif
+     }
+     [[gnu::noinline]] void ck_one(const ClRow& r) {
+         const auto rel=u64(r.ts)-u64(g.cbase);
+@@ -106,22 +124,40 @@
+         t.odd_clicks.push_back({token(r.uid),key,cid});
+     }
+     CkBatch* ck() {return &cb;}
++#ifdef SHOP_PARSE_SAMPLING
++    template<bool Sample=false>
++#endif
+     [[gnu::noinline]] void ck_flush() {
+         const auto n=std::exchange(cb.n,0); if(!n) return;
++#ifdef SHOP_PARSE_SAMPLING
++        parse_probe::Packet<Sample> probe(parse_probe::workers[tid].kinds[1],n);
++#endif
+         t.n_ck_rows+=n;
+         u64 special;
+         if(g.ccap && !g.cpart) {
+             const ckix::CkxP p{g.cbase,g.clen,g.ukey,g.ucap,g.ckey,g.ccap,tb.camp.data(),tb.crange,g.csr};
+             special=ckix::ck_vec_ix(cb,out.pd,n,p);
++#ifdef SHOP_PARSE_SAMPLING
++            probe.mark(&parse_probe::KindStats::fused_ns);
++#endif
+         } else {
+             const CkP p{g.cbase,g.clen,g.ukey,g.ucap,g.ckey,g.ccap,tb.camp.data(),tb.crange,t.us.lines_ptr()};
+             const auto masks=tb.crange ? (g.ccap ? ck_vec<true,true>(cb,out,n,p) : ck_vec<true,false>(cb,out,n,p))
+                                        : (g.ccap ? ck_vec<false,true>(cb,out,n,p) : ck_vec<false,false>(cb,out,n,p));
++#ifdef SHOP_PARSE_SAMPLING
++            probe.mark(&parse_probe::KindStats::classify_ns);
++#endif
+             if(g.ccap)t.us.push_indexed_many(masks.regular,n,out.ob.data(),out.lp.data(),out.rec.data());
+             else t.us.push_many(masks.regular,n,out.ob.data(),out.lp.data(),out.rec.data());
++#ifdef SHOP_PARSE_SAMPLING
++            probe.mark(&parse_probe::KindStats::scatter_ns);
++#endif
+             special=masks.special;
+         }
+         for(auto m=special;m;m&=m-1) ck_one(cb.row(std::countr_zero(m)));
++#ifdef SHOP_PARSE_SAMPLING
++        probe.finish(special);
++#endif
+     }
+ };
+ }
+--- a/cpp/pipeline/parse.hpp
++++ b/cpp/pipeline/parse.hpp
+@@ -66,6 +66,16 @@
+ }
+ template<class G,class T> inline void parse_buf(G& g,T& t,EvBatch& eb,CkBatch& cb,Out& out,const Tabs& tb,std::size_t tid,const FileInfo& f,std::string_view buf,std::size_t s){
+     Ctx c{g,t,eb,cb,out,tb,u64(tid),u64(f.off+s),u64(f.off+f.len)};
++#ifdef SHOP_PARSE_SAMPLING
++    const auto& rows = f.kind==Kind::Ev ? t.n_ev_rows : (f.kind==Kind::Ck ? t.n_ck_rows : t.n_lk_rows);
++    parse_probe::Buffer probe(parse_probe::workers[tid],f.kind,buf.size(),rows);
++    if (probe.sampled && f.kind!=Kind::Lk) {
++        parse_probe::SampleSink<decltype(c)> sink{c};
++        if (f.kind==Kind::Ev) { k_free::Free::events(buf,sink); sink.ev_flush(); }
++        else { k_free::Free::clicks(buf,sink); sink.ck_flush(); }
++        return;
++    }
++#endif
+     switch(f.kind){case Kind::Ev:k_free::Free::events(buf,c);c.ev_flush();break;case Kind::Ck:k_free::Free::clicks(buf,c);c.ck_flush();break;case Kind::Lk:links_chunk(c,buf);break;}
+ }
+ template<class G,class T> void chunk_rd(G& g,T& t,EvBatch& eb,CkBatch& cb,Out& out,const Tabs& tb,std::size_t tid,const FileInfo& f,const Chunk& c,int fd,u8* rb,std::size_t rd){
+@@ -80,6 +90,9 @@
+     }
+ }
+ template<class G> void stage1(G& g,std::size_t tid){
++#ifdef SHOP_PARSE_SAMPLING
++    auto& worker = parse_probe::workers[tid]; worker.begin=parse_probe::now();
++#endif
+     const auto& d=drv();
+ #if defined(__linux__)
+     cpu_set_t saved;bool pinned=false;
+@@ -92,20 +105,47 @@
+     auto eb=std::make_unique<EvBatch>();auto cb=std::make_unique<CkBatch>();auto out=std::make_unique<Out>();const auto& tb=tabs(g);
+     const bool use_rd=d.rd && FDS.size()==g.files.size();auto* rb=use_rd?sys::anon(d.rd+8192)+4096:nullptr;
+     const auto& [q,nckl]=work_queue(g);bool us_open=true;links::Scratch sc;
+-    for(;;){if(d.st2q&&!us_open)while(links::job(g,t,sc)){}
++#ifdef SHOP_PARSE_SAMPLING
++    const auto& samples = parse_probe::plan(q,g.files);
++#endif
++    for(;;){
++#ifdef SHOP_PARSE_SAMPLING
++        if(d.st2q&&!us_open) {
++            parse_probe::Scope spent{worker.jobs_ns};
++            while(links::job(g,t,sc)){}
++        }
++#else
++        if(d.st2q&&!us_open)while(links::job(g,t,sc)){}
++#endif
+         const auto i=g.qnext.fetch_add(1,std::memory_order_relaxed);
+-        if(us_open&&i>=nckl){us_open=false;t.us.finish();if(g.ccap)ckix::flush(out->pd,g.csr);links::us_finished(g,out->pd.end,d.st2q);if(d.st2q)while(links::job(g,t,sc)){};}
++        if(us_open&&i>=nckl){
++#ifdef SHOP_PARSE_SAMPLING
++            parse_probe::Scope spent{worker.handoff_ns};
++#endif
++            us_open=false;t.us.finish();if(g.ccap)ckix::flush(out->pd,g.csr);links::us_finished(g,out->pd.end,d.st2q);if(d.st2q)while(links::job(g,t,sc)){};}
+         if(i>=q.size())break;const auto& c=q[i];const auto& f=g.files[c.file];
++#ifdef SHOP_PARSE_SAMPLING
++        parse_probe::ChunkScope chunk(worker,f.kind,i,samples[i]);
++#endif
+         if(use_rd&&FDS[c.file]>=0){chunk_rd(g,t,*eb,*cb,*out,tb,tid,f,c,FDS[c.file],rb,d.rd);continue;}
+         std::string_view data(reinterpret_cast<const char*>(g.region+f.off),f.len);
+         const auto s=c.a==f.hdr?c.a:next_line_start(data,c.a-1),e=c.b>=f.len?f.len:next_line_start(data,c.b-1);if(s>=e)continue;
+         parse_buf(g,t,*eb,*cb,*out,tb,tid,f,data.substr(s,e-s),s);
+         if(RELEASE)sys::release(g.region+f.off+s,e-s);
+     }
++#ifdef SHOP_PARSE_SAMPLING
++    const auto tail_start=parse_probe::now();
++#endif
+     t.ev.finish();if(d.st2q)for(;;){if(links::job(g,t,sc))continue;if(links::done(g))break;sys::spin_loop();}
++#ifdef SHOP_PARSE_SAMPLING
++    worker.tail_ns=parse_probe::now()-tail_start;
++#endif
+     if(rb)::madvise(rb-4096,d.rd+8192,MADV_DONTNEED);
+ #if defined(__linux__)
+     if(pinned && (d.pin==1||tid==0))::sched_setaffinity(0,sizeof(saved),&saved);
+ #endif
++#ifdef SHOP_PARSE_SAMPLING
++    worker.end=parse_probe::now();
++#endif
+ }
+ }
+--- a/cpp/pipeline/main.cpp
++++ b/cpp/pipeline/main.cpp
+@@ -113,6 +113,9 @@
+     const bool force=end && std::string_view(end)=="2";
+     if(force || (sys::SMALLPAGES.load() && toggle("XL_ENDREL",true))) release_final(g,force);
+     if(timing) std::fprintf(stderr,"[pipeline] exit %.1f ms\n",std::chrono::duration<double,std::milli>(sys::Instant::now()-start).count());
++#ifdef SHOP_PARSE_SAMPLING
++    parse_probe::emit(nt);
++#endif
+     ::_exit(0);
+ }
+ }

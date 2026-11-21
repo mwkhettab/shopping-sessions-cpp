@@ -1,0 +1,28 @@
+--- a/cpp/pipeline/k_free_event_blocks.hpp
++++ b/cpp/pipeline/k_free_event_blocks.hpp
+@@ -32,10 +32,23 @@
+     std::pair<Word,Word> windows(P p) const {
+         static_assert(std::endian::native==std::endian::little);
+         auto offset=unsigned(p-base);
++        const auto *bytes=reinterpret_cast<const std::uint8_t *>(commas.data())+(offset>>3);
++        const auto shift=offset&7;
++#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
++        Word lo,hi;
++        std::memcpy(&lo,bytes,sizeof(lo));
++        std::memcpy(&hi,bytes+sizeof(lo),sizeof(hi));
++        auto window=[](Word lower,Word upper,unsigned amount) {
++            asm("shrd{q %%cl,%[upper],%[lower]| %[lower],%[upper],cl}"
++                : [lower] "+r"(lower) : [upper] "r"(upper), "c"(amount) : "cc");
++            return lower;
++        };
++        return {window(lo,hi,shift),window(lo,hi,shift+32)};
++#else
+         unsigned __int128 bits;
+-        std::memcpy(&bits,reinterpret_cast<const std::uint8_t *>(commas.data())+(offset>>3),sizeof(bits));
+-        auto shift=offset&7;
++        std::memcpy(&bits,bytes,sizeof(bits));
+         return {Word(bits>>shift),Word(bits>>(shift+32))};
++#endif
+     }
+ 
+     // Save ends independently of the previous row's decode. Bound the number

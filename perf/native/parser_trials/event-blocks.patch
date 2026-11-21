@@ -1,0 +1,174 @@
+--- a/build.sh
++++ b/build.sh
+@@ -8,6 +8,9 @@
+ fi
+ case "$(uname -s)-$(uname -m)" in
+     Linux-x86_64)
++        if [ "${EVENT_BLOCK_MASKS:-0}" = 1 ]; then
++            set -- "$@" -DSHOP_EVENT_BLOCK_MASKS
++        fi
+         set -- "$@" -fno-pie -no-pie -DSHOP_KERNEL_ABSOLUTE_TABLES cpp/pipeline/k_free_clicks.S
+         ;;
+ esac
+--- /dev/null
++++ b/cpp/pipeline/k_free_event_blocks.hpp
+@@ -0,0 +1,90 @@
++#pragma once
++#include <array>
++#include <bit>
++#include <cstdint>
++#include <cstring>
++#include <utility>
++
++namespace pipeline::k_free::detail {
++
++// Two retained lookahead lines cover both 64-bit delimiter windows, including
++// the final row whose first byte is at the last byte of the main tile.
++struct EventBlockTile {
++    static constexpr unsigned blocks=16, ahead=2, bytes=64*blocks;
++    using P=const std::uint8_t *;
++    using Word=std::uint64_t;
++    alignas(64) std::array<Word,blocks+ahead> commas, newlines;
++    P base;
++
++    template<class Classify> void fill(P start,bool retain,Classify classify) {
++        base=start;
++        if (retain) for (unsigned i=0;i<ahead;++i) {
++            commas[i]=commas[blocks+i];
++            newlines[i]=newlines[blocks+i];
++        }
++        for (unsigned i=retain?ahead:0;i<blocks+ahead;++i) {
++            auto [comma,newline]=classify(start+64*i);
++            commas[i]=comma;
++            newlines[i]=newline;
++        }
++    }
++
++    std::pair<Word,Word> windows(P p) const {
++        static_assert(std::endian::native==std::endian::little);
++        auto offset=unsigned(p-base);
++        unsigned __int128 bits;
++        std::memcpy(&bits,reinterpret_cast<const std::uint8_t *>(commas.data())+(offset>>3),sizeof(bits));
++        auto shift=offset&7;
++        return {Word(bits>>shift),Word(bits>>(shift+32))};
++    }
++
++    // Save ends independently of the previous row's decode. Bound the number
++    // of offsets by the maximum possible number of source bytes in this tile.
++    unsigned ends(std::uint16_t *lines) const {
++        unsigned n=0;
++        for (unsigned i=0;i<blocks+ahead;++i) {
++            auto bits=newlines[i];
++            while (bits) {
++                lines[n++]=std::uint16_t(64*i+std::countr_zero(bits)+1);
++                bits&=bits-1;
++            }
++        }
++        return n;
++    }
++};
++
++// Fast consumes one source row. Slow owns the original parser's restart cursor,
++// which can jump past several physical newlines. Discard stale ends after it.
++template<class Classify,class Fast,class Slow>
++inline EventBlockTile::P walk_event_blocks(EventBlockTile::P input,EventBlockTile::P p,EventBlockTile::P limit,
++                                          Classify classify,Fast fast,Slow slow) {
++    using Tile=EventBlockTile;
++    auto floor=[](Tile::P s) {return reinterpret_cast<Tile::P>(reinterpret_cast<std::uintptr_t>(s)&~std::uintptr_t{63});};
++    while (p<=limit && ((reinterpret_cast<std::uintptr_t>(p)&63)>std::size_t(p-input))) p=slow(p);
++    if (p>limit) return p;
++    Tile tile;
++    std::array<std::uint16_t,64*(Tile::blocks+Tile::ahead)> ends;
++    auto base=floor(p);
++    bool retain=false;
++    while (p<=limit) {
++        tile.fill(base,retain,classify);
++        auto count=tile.ends(ends.data());
++        auto block_end=base+Tile::bytes,stop=block_end<limit+1?block_end:limit+1;
++        for (unsigned j=0;j<count && p<stop;++j) {
++            const auto next=base+ends[j];
++            if (next<=p) continue;
++            const auto span=std::size_t(next-p);
++            if (span-33>63) {p=slow(p);continue;}
++            const auto [head,tail]=tile.windows(p);
++            p=fast(p,next,head,tail,span-33);
++        }
++        // A physical line may span multiple tiles. Let the original parser
++        // advance over it once as soon as the cached 96-byte window lacks LF.
++        while (p<stop) p=slow(p);
++        if (p>limit) break;
++        retain=p-block_end<64*Tile::ahead;
++        base=retain?block_end:floor(p);
++    }
++    return p;
++}
++}
+--- a/cpp/pipeline/k_free_x86.cpp
++++ b/cpp/pipeline/k_free_x86.cpp
+@@ -10,6 +10,10 @@
+ #else
+ #pragma GCC push_options
+ #pragma GCC target("avx2,bmi,bmi2,lzcnt,popcnt,avx512f,avx512bw,avx512vl,avx512dq")
++#endif
++
++#ifdef SHOP_EVENT_BLOCK_MASKS
++#include "k_free_event_blocks.hpp"
+ #endif
+ 
+ namespace pipeline::k_free::detail {
+@@ -297,8 +301,13 @@
+             _mm512_cmpeq_epi8_mask(tail,_mm512_set1_epi8('\n'))};
+ }
+ struct EvSt {const TjRow *tj; W x,days,bad2,bad;};
++#ifdef SHOP_EVENT_BLOCK_MASKS
++inline bool ev_s_known(Cx<EvBatch> &cx,P p,EvMasks k,std::size_t w,EvSt &st,u64 m) {
++    auto c0=tz(k.head),c1=tz(blsr(k.head)),c2=tz(blsr(blsr(k.head)));
++#else
+ inline bool ev_s(Cx<EvBatch> &cx,P p,EvMasks k,std::size_t w,EvSt &st) {
+     auto m=tz(k.newline),c0=tz(k.head),c1=tz(blsr(k.head)),c2=tz(blsr(blsr(k.head)));
++#endif
+     auto tb=bzhi(k.tail,m), z=lz(tb);
+     auto r6=m+z-64;
+     auto bits=shl(tb,z)<<1,r5=lz(bits);
+@@ -331,6 +340,11 @@
+         _mm256_or_si256(bad,_mm256_zextsi128_si256(k2)),bad};
+     return true;
+ }
++#ifdef SHOP_EVENT_BLOCK_MASKS
++inline bool ev_s(Cx<EvBatch> &cx,P p,EvMasks k,std::size_t w,EvSt &st) {
++    return ev_s_known(cx,p,k,w,st,tz(k.newline));
++}
++#endif
+ [[gnu::cold,gnu::noinline]] bool ev_purchase(P np,u64 &out) {
+     auto end=np-1,pt=end-32;
+     auto tw=lu2(pt);auto q=hi32(tw,'"')>>32,tb=hi32(tw,',');
+@@ -447,6 +461,21 @@
+     constexpr std::size_t reach=3*(40+64)+2,far=(NB+1)*(40+64+1);
+     if (!chain && buf.size()>=reach+far) {
+         auto limit=cx.end-reach-far;
++#ifdef SHOP_EVENT_BLOCK_MASKS
++        static_assert(reach+far>=64*(EventBlockTile::blocks+EventBlockTile::ahead));
++        auto classify=[](P q) {
++            auto z=_mm512_load_si512(q);
++            return std::pair<u64,u64>{_mm512_cmpeq_epi8_mask(z,_mm512_set1_epi8(',')),
++                                      _mm512_cmpeq_epi8_mask(z,_mm512_set1_epi8('\n'))};
++        };
++        auto fast=[&](P row,P next,u64 head,u64 tail,u64 m) {
++            prefetch(row);
++            EvSt st;
++            if (!ev_s_known(cx,row,{head,tail,0},w,st,m)) return ev_cold(cx,row,w);
++            return ev_d(cx,row,st,next,w).next;
++        };
++        p=walk_event_blocks(cx.base,p,limit,classify,fast,[&](P q){return ev_fast(cx,q,ev_masks(q),w);});
++#else
+         while (p<=limit) {
+             auto k=ev_masks(p);auto p1=k.next(p);
+             EvSt st;
+@@ -464,6 +493,7 @@
+                 k1=k2;
+             }
+         }
++#endif
+     }
+     constexpr std::size_t lookahead=2*(40+64)+1;
+     while (cx.end-p>=std::ptrdiff_t(lookahead)) {
