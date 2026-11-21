@@ -1,5 +1,6 @@
 #pragma once
 #include "pqw.hpp"
+#include "pqw_user_encode.hpp"
 #include <filesystem>
 #include <optional>
 
@@ -108,25 +109,19 @@ inline pqw::Meta range_chunk(pqw::Out& o,std::span<const i32> values,i32 lo,i32 
             p.form=Plan::Dense;p.min=lo;p.card=card;p.w=w;
         }
     }
-    if(p.form==Plan::Dense && p.card==1) {
-        page(o,2,4,1,0);o.put_le(lo);m.dict=true;m.dict_off=start;m.data_off=o.pos();
-        page(o,0,varlen(2*n)+2,n,8);o.put_le(u8{1});o.put_varint(2*n);o.put_le(u8{0});
+    if(p.form==Plan::Dense) {
+        page(o,2,p.card*4,p.card,0);
+        auto* dict=o.tail(p.card*4);
+        for(std::size_t i=0;i<p.card;++i) store(dict+4*i,u32(lo)+u32(i));
+        o.commit(4*p.card);m.dict=true;m.dict_off=start;m.data_off=o.pos();
+        if(p.card==1) {
+            page(o,0,varlen(2*n)+2,n,8);o.put_le(u8{1});o.put_varint(2*n);o.put_le(u8{0});
+        } else {
+            page(o,0,1+hybrid_len(n,p.w),n,8);o.put_le(u8(p.w));
+            emit_user_words(o,{reinterpret_cast<const u32*>(values.data()),n},u32(lo),p.w);
+        }
     } else emit_ints(o,values,p,m);
     m.size=o.pos()-start;return m;
-}
-
-inline std::size_t encode_key_runs(std::span<u8> bytes,std::span<const u32> keys,u32 base,u32 width) {
-    const auto value_bytes=(width+7)/8;
-    std::size_t out=0;
-    for(std::size_t i=0;i<keys.size();) {
-        std::size_t end=i+1;
-        while(end<keys.size() && end-i<63 && keys[end]==keys[i]) ++end;
-        bytes[out++]=u8(2*(end-i));
-        const u32 value=keys[i]-base;
-        for(u32 j=0;j<value_bytes;++j) bytes[out++]=u8(value>>(j*8));
-        i=end;
-    }
-    return out;
 }
 
 inline pqw::Meta user_ids(pqw::Out& o,const UserGroup& g,pqw::StrCol names,std::span<u8> scratch) {
@@ -137,15 +132,19 @@ inline pqw::Meta user_ids(pqw::Out& o,const UserGroup& g,pqw::StrCol names,std::
     string_dict_page(o,dict);
     const auto data=o.pos();const auto n=g.rows;const auto w=bits_for(g.kmax-g.kmin);
     const std::span<const u32> keys(g.keys.data(),n);
-    const auto first=encode_key_runs(scratch,keys.first(g.head),g.kmin,w);
-    const auto last=encode_key_runs(scratch.subspan(first),keys.subspan(g.head),g.kmin,w);
-    const auto tail_packed=hybrid_len(n-g.head,w),packed=hybrid_len(n,w);
-    const bool runs=first+std::min(last,tail_packed)<packed,both=last<=tail_packed;
-    page(o,0,1+(runs?first+std::min(last,tail_packed):packed),n,8);o.put_le(u8(w));
-    if(runs) o.put(scratch.first(first+(both?last:0)));
-    if(!runs||!both) {
-        const auto a=runs?g.head:0;
-        emit_packed(o,n-a,w,[&](std::size_t i){return keys[a+i]-g.kmin;});
+    const unsigned record_bytes=1+(w+7)/8;
+    const auto first=encode_user_runs(scratch.data(),keys.first(g.head),g.kmin,record_bytes);
+    const auto tail=keys.subspan(g.head);
+    const auto tail_packed=hybrid_len(tail.size(),w),packed=hybrid_len(n,w);
+    const auto estimated=estimated_run_bytes(tail,record_bytes);
+    if(first+std::min(estimated,tail_packed)<packed) {
+        const bool tail_runs=estimated<=tail_packed;
+        const auto last=tail_runs?encode_user_runs(scratch.data()+first,tail,g.kmin,record_bytes):0;
+        page(o,0,1+first+last+(tail_runs?0:tail_packed),n,8);o.put_le(u8(w));
+        o.put(scratch.first(first+last));
+        if(!tail_runs) emit_user_words(o,tail,g.kmin,w);
+    } else {
+        page(o,0,1+packed,n,8);o.put_le(u8(w));emit_user_words(o,keys,g.kmin,w);
     }
     return {6,true,o.pos()-start,data,start,n};
 }
@@ -182,7 +181,14 @@ inline pqw::Meta category_chunk(pqw::Out& o,const UserGroup& g,pqw::StrCol cats)
         auto* p=o.tail(total+8);store(p,u32(def));
         auto* levels=varint(p+4,2*((tail+7)/8)+1),*v=p+4+def;
         *v++=u8(w);
-        Packer pack(varint(v,2*((g.defined+7)/8)+1),w);
+        auto* codes=varint(v,2*((g.defined+7)/8)+1);
+#if defined(__x86_64__) && (defined(__clang__) || defined(__GNUC__)) && !defined(SHOP_SPARSE_FORCE_SCALAR)
+        if(w<=6 && __builtin_cpu_supports("avx2") && __builtin_cpu_supports("bmi2") && __builtin_cpu_supports("popcnt")) {
+            pack_user_categories(levels,codes,{g.category.data()+g.head,tail},w);
+            o.commit(total);m.size=o.pos()-start;return m;
+        }
+#endif
+        Packer pack(codes,w);
         for(std::size_t i=0;i<tail;i+=64) {
             const auto n=std::min<std::size_t>(tail-i,64);const auto* row=g.category.data()+g.head+i;
             auto mask=valid_mask(row,n);std::memcpy(levels+i/8,&mask,(n+7)/8);
@@ -209,7 +215,7 @@ class UserFile {
     std::vector<pqw::Group> groups_;
     std::size_t rows_{};
     UserGroup group_;
-    std::array<u8,5*USER_LIMIT> runs_;
+    std::array<u8,5*USER_LIMIT+32> runs_;
 public:
     explicit UserFile(const std::filesystem::path& p):path_(p),
         temporary_(p.parent_path()/("."+p.filename().native()+".writing")),

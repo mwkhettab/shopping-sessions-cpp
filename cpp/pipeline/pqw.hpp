@@ -22,7 +22,18 @@ inline void plain_strings(Out& o,const StrCol& s) {
     for(std::size_t a=0;a<s.len();a+=BLOCK) {
         const auto b=std::min(s.len(),a+BLOCK),size=4*(b-a)+s.bytes_in(a,b);
         auto *p=o.tail(size);
-        for(auto i=a;i<b;++i) p=copy_string(p,s,i);
+        if(s.data.size()-s.offsets[b]>=16) {
+            std::size_t offset=s.offsets[a];
+            for(auto i=a;i<b;++i) {
+                const std::size_t next=s.offsets[i+1],len=next-offset;
+                store(p,u32(len));
+                std::memcpy(p+4,s.data.data()+offset,16);
+                if(len>16) std::memcpy(p+20,s.data.data()+offset+16,len-16);
+                p+=4+len;offset=next;
+            }
+        } else {
+            for(auto i=a;i<b;++i) p=copy_string(p,s,i);
+        }
         o.commit(size);o.check();
     }
 }
