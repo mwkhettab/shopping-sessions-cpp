@@ -12,7 +12,14 @@ permissions:
 jobs:
   reports:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 115
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {lane: primary, previous: ubuntu-24.04}
+          - {lane: portable, previous: ubuntu-22.04}
+          - {lane: secondary, previous: ubuntu-latest}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -20,21 +27,41 @@ jobs:
       - name: Select completed comparison
         id: select
         run: python3 -c 'import json,os; print("id="+str(json.load(open("perf/native/recover-runs.json"))["run"]),file=open(os.environ["GITHUB_OUTPUT"],"a"))'
-      - name: Read the public benchmark artifacts from this repository
+      - name: Locate the report for this runner
+        id: artifact
+        uses: actions/github-script@v7
+        env:
+          RUN_ID: ${{ steps.select.outputs.id }}
+          LANE: ${{ matrix.lane }}
+          PREVIOUS: ${{ matrix.previous }}
+        with:
+          script: |
+            const args = { ...context.repo, run_id: Number(process.env.RUN_ID) }
+            const names = [process.env.LANE, process.env.PREVIOUS].map(s => `native-observations-${s}`)
+            for (;;) {
+              const { data: run } = await github.rest.actions.getWorkflowRun(args)
+              const { data } = await github.rest.actions.listWorkflowRunArtifacts({ ...args, per_page: 100 })
+              const match = names.find(name => data.artifacts.some(a => a.name === name && !a.expired))
+              if (match) {
+                core.setOutput('name', match)
+                return
+              }
+              if (run.status === 'completed') {
+                core.notice(`No artifact was published for ${process.env.LANE} in run ${args.run_id}`)
+                return
+              }
+              await new Promise(resolve => setTimeout(resolve, 30000))
+            }
+      - name: Read this runner's benchmark artifact
+        if: steps.artifact.outputs.name != ''
         uses: actions/download-artifact@v4
         with:
           github-token: ${{ github.token }}
           run-id: ${{ steps.select.outputs.id }}
-          path: ${{ runner.temp }}/previous-native
-      - name: Publish archived ubuntu-24.04 comparisons
-        run: |
-          data="$RUNNER_TEMP/previous-native/native-observations-ubuntu-24.04"
-          if test -d "$data"; then python3 perf/native/publish_profile.py "$data"; fi
-      - name: Publish archived ubuntu-22.04 comparisons
-        run: |
-          data="$RUNNER_TEMP/previous-native/native-observations-ubuntu-22.04"
-          if test -d "$data"; then python3 perf/native/publish_profile.py "$data"; fi
-      - name: Publish archived ubuntu-latest comparisons
-        run: |
-          data="$RUNNER_TEMP/previous-native/native-observations-ubuntu-latest"
-          if test -d "$data"; then python3 perf/native/publish_profile.py "$data"; fi
+          name: ${{ steps.artifact.outputs.name }}
+          path: ${{ runner.temp }}/${{ steps.artifact.outputs.name }}
+      - name: Publish this runner's archived comparison
+        if: steps.artifact.outputs.name != ''
+        env:
+          ARTIFACT_NAME: ${{ steps.artifact.outputs.name }}
+        run: python3 perf/native/publish_profile.py "$RUNNER_TEMP/$ARTIFACT_NAME"

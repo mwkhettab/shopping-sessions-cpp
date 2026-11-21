@@ -9,7 +9,107 @@ def emit(title, message):
     text=message.replace('%','%25').replace('\r','%0D').replace('\n','%0A')
     print(f'::notice file=BENCHMARKS.md,line=1,title={title}::{text}',flush=True)
 
+def publish_acceptance(root, status):
+    state = json.loads(status.read_text())
+    hw = json.loads(status.with_name("hardware.json").read_text())
+    builds = state["implementations"]
+    label = root.name
+    def notice(title, lines):
+        emit(f"Native {title} ({label})", "\n".join(lines))
+
+    status_line = f'{state["status"]} at {state["phase"]}'
+    if state.get("error"):
+        status_line += " — " + state["error"]
+    features = sorted(set(hw.get("isa", ())) & {"avx2", "avx512f", "avx512bw", "avx512cd",
+                                              "avx512vl", "avx512dq", "avx512_vnni", "bmi1", "bmi2"})
+    revisions = []
+    for tag, item in builds.items():
+        if not (item.get("source_commit") or item.get("hashes")):
+            continue
+        switches = ",".join(item.get("build_switches", ())) or "defaults"
+        files = " ".join(f'{name}={digest}' for name,digest in item.get("hashes", {}).items() if name != "LICENSE")
+        revisions.append(f'{tag} {item.get("source_commit") or "supplied binary"} {switches} {files}')
+    notice("hardware and revisions", [
+        f'{hw["vendor"]} {hw["model"]}, {hw["ncpu"]} vCPUs, affinity {hw["affinity"]}, '
+        f'container limit {hw["memory_mib"]} MiB, workflow {hw.get("workflow_sha")}',
+        "Relevant ISA " + ", ".join(features), status_line, *revisions,
+    ])
+
+    checked = state["verified"]
+    lines = []
+    for tag, item in builds.items():
+        checks = [f'{stage} {checked[stage + "/" + tag]}' for stage in
+                  ("1M", "patterned rules", "20M", "60M") if stage + "/" + tag in checked]
+        excluded = item.get("excluded") or item.get("reason")
+        if excluded:
+            checks.append(excluded)
+        lines.append(tag + " | " + (", ".join(checks) or "no recorded result"))
+    if "kernel" in checked:
+        lines.append("kernel " + checked["kernel"])
+    notice("correctness", [status_line, *lines])
+
+    for scale in ("20M", "60M"):
+        images = []
+        for tag in builds:
+            image = checked.get(f"{scale}/image/{tag}")
+            if image:
+                images.append(f'{tag} {image["wall_s"]:.4f} s, process peak {image["process_peak_mib"]:.1f} MiB, '
+                              f'cgroup peak {image["cgroup_peak_mib"]:.1f} MiB')
+        if images:
+            notice(scale + " containers", images)
+        stages = status.with_name(scale + "-stages.jsonl")
+        if stages.is_file():
+            names = {item.get("executable"):tag for tag,item in builds.items()}
+            lines = []
+            for row in map(json.loads, stages.read_text().splitlines()):
+                tag = names.get(row["binary"], Path(row["binary"]).parent.name)
+                profile = row.get("profile", "").strip().splitlines()
+                elapsed = next((s for s in profile if "parse=" in s or "parse " in s), "")
+                if not elapsed and profile:
+                    elapsed = profile[-1]
+                lines.append(f'{tag} wall={row["wall_s"]:.4f}s cpu={row["user_s"]+row["sys_s"]:.4f}s '
+                             f'major={row["major"]} {elapsed[:420]}')
+            if lines:
+                notice(scale + " stages", lines)
+
+    if state.get("status") == "failed":
+        errors = []
+        for log in sorted(status.parent.glob("*.log")):
+            with log.open("rb") as src:
+                src.seek(max(0, log.stat().st_size - 6000))
+                tail = src.read().decode(errors="replace").splitlines()
+            if tail and re.search(r"^exit (?!0\b)-?\d+ after", tail[-1]):
+                errors.append(f'{log.name}\n' + "\n".join(tail[-9:])[-1800:])
+        if errors:
+            notice("failed checks", errors[:2])
+
+    for scale, rows in state["timings"].items():
+        for mode in ("warm", "cold"):
+            lines = []
+            for key, metric in rows.items():
+                cache, tag = key.split("/", 1)
+                if cache != mode:
+                    continue
+                samples = ",".join(f'{s:.4f}' for s in metric["seconds"])
+                parts = [f'{tag} {metric["median_s"]:.4f} s, runs [{samples}], {metric["peak_mib"]:.1f} MiB']
+                if "eviction_confirmed_all" in metric:
+                    parts.append("cold verified=" + str(metric["eviction_confirmed_all"]))
+                if "paired_change_median" in metric:
+                    parts.append(f'vs baseline {metric["paired_change_median"]:+.2%} '
+                                 f'{metric["faster_pairs"]}/{len(metric["seconds"])} faster')
+                for control, pair in metric.get("versus", {}).items():
+                    parts.append(f'vs {control} {pair["median_ratio"]:.4f}x '
+                                 f'{pair["faster_pairs"]}/{pair["pairs"]} faster')
+                lines.append(" | ".join(parts))
+            if lines:
+                notice(scale + " " + mode, lines)
+
+
 for root in map(Path,sys.argv[1:]):
+    status = root / "port-acceptance" / "status.json"
+    if status.is_file():
+        publish_acceptance(root, status)
+        continue
     # GitHub displays ten annotations per step. Lead with full release images
     # from each runner and aggregate their other conclusions separately.
     for report in sorted(root.rglob('all-notes.json')):

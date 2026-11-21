@@ -47,6 +47,8 @@ jobs:
         shell: bash
         run: |
           vendor=$(awk -F: '/^vendor_id/{gsub(/ /,"",$2); print $2; exit}' /proc/cpuinfo)
+          model=$(awk -F: '/^model name/{sub(/^[[:space:]]+/,"",$2); print $2; exit}' /proc/cpuinfo)
+          printf '::notice file=BENCHMARKS.md,line=1,title=Native CPU::%s %s, %s lane\n' "$vendor" "$model" "${{ matrix.lane }}"
           if [ "$vendor" != GenuineIntel ] && [ "${{ matrix.lane }}" != portable ]; then
             echo "run=no" >> "$GITHUB_OUTPUT"
           else
@@ -159,6 +161,14 @@ jobs:
             fi
           fi
           "$RUNNER_TEMP/shopping-python/bin/python" perf/native/port_acceptance.py --candidate-source "$GITHUB_WORKSPACE/.acceptance/candidate" --release-generated-practice "${extra[@]}"
+      - name: Publish native comparison and correctness checks
+        if: always() && steps.hardware.outputs.run == 'yes'
+        shell: bash
+        run: |
+          results="$RUNNER_TEMP/shopping-trials/results"
+          if test -f "$results/port-acceptance/status.json"; then
+            python3 perf/native/publish_profile.py "$results"
+          fi
       - uses: actions/upload-artifact@v4
         if: always() && steps.hardware.outputs.run == 'yes'
         with:
