@@ -26,6 +26,12 @@ struct Scratch {
 inline constexpr unsigned IDX_SH=18;
 inline constexpr u64 IDX_BITS=0xffffffffu & ~((1u<<IDX_SH)-1);
 inline constexpr std::size_t SPLIT_MIN=128,SPLIT_PER=6,LSD_MIN=2048;
+#if defined(__x86_64__) && defined(SHOP_PAIRED_CLICK_SORT)
+namespace pair {
+template<class G> PIPELINE_ROUTING_X64 inline void small(const G&,const Click*,std::span<Click>);
+template<class G> PIPELINE_ROUTING_X64 inline void users(const G&,const u32*,std::size_t,std::size_t,Scratch&);
+}
+#endif
 inline std::atomic_bool DEFER_RAW{};
 inline std::mutex deferred_mutex;
 inline std::vector<std::span<Click>> deferred;
@@ -136,8 +142,11 @@ template<std::size_t R,class G> PIPELINE_ROUTING_X64 inline void sort_net(const 
 #endif
 template<class G> inline void sort_small(const G& g,const Click* src,std::span<Click> s) {
     if(s.size()<2){if(!s.empty())s[0]=src[0];return;}
+#if defined(__x86_64__) && defined(SHOP_PAIRED_CLICK_SORT)
+    if(parse::routing_x64()) {pair::small(g,src,s);return;}
+#endif
     if(s.size()==2){auto a=src[0],b=src[1];if((b[0]>>32)<(a[0]>>32))std::swap(a,b);s[0]=a;s[1]=b;auto x=a[0]^b[0];if(!(x>>32)&&(x>>4))fix_ties(g,s);return;}
-#if defined(__x86_64__)
+#if defined(__x86_64__) && !defined(SHOP_PAIRED_CLICK_SORT)
     if(parse::routing_x64()) {
         if(s.size()<=8)sort_net<1>(g,src,s);else if(s.size()<=16)sort_net<2>(g,src,s);else if(s.size()<=32)sort_net<4>(g,src,s);else if(s.size()<=64)sort_net<8>(g,src,s);else sort_net<16>(g,src,s);return;
     }
@@ -187,7 +196,9 @@ PIPELINE_ROUTING_X64 inline void classify_users(const u32 *off,std::size_t a,std
 #endif
 template<class G> inline void sort_users(const G& g,const u32* off,std::size_t ua,std::size_t ub,Scratch& sc) {
     auto& lists=sc.lens;
-#if defined(__x86_64__)
+#if defined(__x86_64__) && defined(SHOP_PAIRED_CLICK_SORT)
+    if(parse::routing_x64()) {pair::users(g,off,ua,ub,sc);return;}
+#elif defined(__x86_64__)
     if(parse::routing_x64()) classify_users(off,ua,ub,lists);else
 #endif
     {for(auto& l:lists){l.clear();l.reserve(ub-ua+16);}for(auto u=ua;u<ub;++u){const auto n=off[u+1]-off[u];if(n>=2)lists[n==2?0:n<=8?1:n<=16?2:3].push_back(u32(u));}}
@@ -195,3 +206,6 @@ template<class G> inline void sort_users(const G& g,const u32* off,std::size_t u
         const auto& l=lists[cat];for(std::size_t phase=0;phase<stride;++phase)for(auto i=phase;i<l.size();i+=stride){const u32 u=l[i],a=off[u],n=off[u+1]-a;sort_from(g,g.csr+a,std::span<Click>(g.csr+a,n),sc);}}
 }
 }
+#if defined(__x86_64__) && defined(SHOP_PAIRED_CLICK_SORT)
+#include "links_sort_pair.hpp"
+#endif
