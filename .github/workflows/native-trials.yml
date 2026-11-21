@@ -36,6 +36,8 @@ on:
       - perf/native/intel-wide-runner.py
       - .github/workflows/native-clock-training.yml
       - perf/native/clock_training/**
+      - .github/workflows/native-event-winners.yml
+      - perf/native/winner_trials/**
       - perf/native/finalist.json
       - perf/native/holdout_shipping.py
       - perf/native/port_input_settings.py

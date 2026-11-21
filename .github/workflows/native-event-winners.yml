@@ -1,0 +1,83 @@
+name: Native event winner storage
+on:
+  push:
+    branches: [bench/native-x64-trials]
+    paths:
+      - .github/workflows/native-event-winners.yml
+      - perf/native/winner_trials/**
+permissions:
+  contents: read
+jobs:
+  compare:
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [first, second, third]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    env:
+      CXX: g++-12
+      BUILDKIT_PROGRESS: plain
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Identify a native Intel worker
+        id: cpu
+        run: python3 perf/native/intel-wide-runner.py
+      - name: Check out the qualified Clang release
+        if: steps.cpu.outputs.wide == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: 29ee0cc5c26291c511cad44aec18c6531f050f79
+          path: .acceptance/candidate
+          persist-credentials: false
+      - name: Check out the independent reference implementation
+        if: steps.cpu.outputs.wide == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: 4db76beed31640ddf4b414ed19deba5ebc660b81
+          path: .acceptance/baseline
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        if: steps.cpu.outputs.wide == 'true'
+        with:
+          python-version: '3.12'
+      - name: Prepare the input files and published reference tables
+        if: steps.cpu.outputs.wide == 'true'
+        run: bash perf/native/prepare-port-runner.sh
+      - name: Build each storage policy and check cross-worker duplicate handling
+        if: steps.cpu.outputs.wide == 'true'
+        run: bash perf/native/winner_trials/build.sh .acceptance/candidate "$RUNNER_TEMP/shopping-trials/winner-binaries"
+      - name: Compare whole tables and time rotated fresh processes
+        if: steps.cpu.outputs.wide == 'true'
+        run: |
+          area="$RUNNER_TEMP/shopping-trials"
+          variants=()
+          for policy in staged bitmap cas; do
+            variants+=(--comparison-binary "winner-$policy=$area/winner-binaries/$policy/app/shopping")
+          done
+          "$RUNNER_TEMP/shopping-python/bin/python" perf/native/port_acceptance.py \
+            --candidate-source "$GITHUB_WORKSPACE/.acceptance/candidate" "${variants[@]}" \
+            --release-generated-practice --warm-20 9 --warm-60 5 --cold-runs 1
+          python3 - "$area/results/port-acceptance/status.json" <<'PY'
+          import json, sys
+          state = json.load(open(sys.argv[1]))
+          assert state["verified"]["kernel"] == "wide SIMD"
+          for policy in ("staged", "bitmap", "cas"):
+              for size in ("1M", "20M", "60M"):
+                  assert f"{size}/winner-{policy}" in state["verified"], (policy, size)
+          PY
+      - name: Publish stage and end-to-end results
+        if: always() && steps.cpu.outputs.wide == 'true'
+        run: |
+          area="$RUNNER_TEMP/shopping-trials/results"
+          if test -f "$area/port-acceptance/status.json"; then python3 perf/native/publish_profile.py "$area"; fi
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.cpu.outputs.wide == 'true'
+        with:
+          name: winner-storage-${{ matrix.lane }}
+          path: |
+            ${{ runner.temp }}/shopping-trials/results/
+            ${{ runner.temp }}/shopping-trials/winner-binaries/*.log
+          retention-days: 7

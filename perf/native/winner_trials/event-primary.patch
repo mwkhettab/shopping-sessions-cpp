@@ -1,0 +1,691 @@
+diff --git a/Dockerfile b/Dockerfile
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -4,7 +4,8 @@
+ WORKDIR /src
+ COPY cpp/pipeline cpp/pipeline
+ COPY build.sh .
+-RUN CXX=clang++-16 STATIC=1 sh build.sh
++ARG SHOP_EVENT_PRIMARY_DEFAULT=staged
++RUN CXX=clang++-16 STATIC=1 SHOP_EVENT_PRIMARY_DEFAULT="$SHOP_EVENT_PRIMARY_DEFAULT" sh build.sh
+ 
+ FROM scratch
+ COPY --from=build /src/build/shopping /app/shopping
+diff --git a/build.sh b/build.sh
+--- a/build.sh
++++ b/build.sh
+@@ -4,6 +4,10 @@
+ compiler=${CXX:-c++}
+ platform=$(uname -s)-$(uname -m)
+ set -- -std=c++20 -O3 -DNDEBUG -pthread
++case "${SHOP_EVENT_PRIMARY_DEFAULT:-staged}" in
++    staged|cas|bitmap) set -- "$@" "-DSHOP_EVENT_PRIMARY_DEFAULT=\"${SHOP_EVENT_PRIMARY_DEFAULT:-staged}\"" ;;
++    *) echo "Invalid SHOP_EVENT_PRIMARY_DEFAULT (use staged, cas or bitmap)" >&2; exit 2 ;;
++esac
+ 
+ if [ "$platform" = Linux-x86_64 ] && [ "${compiler##*/}" = clang++-16 ]; then
+     set -- "$@" -fno-pic -fno-pie -march=x86-64 -mtune=cascadelake \
+diff --git a/cpp/pipeline/event_primary.hpp b/cpp/pipeline/event_primary.hpp
+new file mode 100644
+--- /dev/null
++++ b/cpp/pipeline/event_primary.hpp
+@@ -0,0 +1,126 @@
++#pragma once
++#include "model_types.hpp"
++#include <array>
++#include <atomic>
++#include <bit>
++#include <cstddef>
++#include <cstdlib>
++#include <memory>
++#include <string_view>
++#include <vector>
++
++namespace pipeline {
++
++#ifndef SHOP_EVENT_PRIMARY_DEFAULT
++#define SHOP_EVENT_PRIMARY_DEFAULT "staged"
++#endif
++
++class EventPrimary {
++    enum class Mode { Staged, Cas, Bitmap };
++    struct Free {
++        void operator()(void* p) const noexcept { std::free(p); }
++    };
++    Mode mode_=Mode::Staged;
++    std::unique_ptr<void, Free> storage_;
++    Rec* rows_{};
++    std::unique_ptr<u64, Free> bitmap_;
++    mutable std::vector<u8> touched_;
++    std::size_t stride_{};
++
++    template<bool Bitmap, class Part>
++    inline void put(Part& duplicates,u8* touched,std::size_t b,Rec rec) const {
++        const auto index=(b<<BB)+(rec.w1&(BSIZE-1));
++        auto& slot=rows_[index];
++        // A bucket stores generation 1: index zero gets tag 1; the last gets BSIZE.
++        const auto tagged=rec.w1+1;
++        bool first;
++        if constexpr(Bitmap) {
++            const auto bit=u64{1}<<(index&63);
++            first=!(std::atomic_ref<u64>(bitmap_.get()[index>>6]).fetch_or(bit,std::memory_order_relaxed)&bit);
++            if(first) slot.w1=tagged;
++        } else {
++            u64 empty=0;
++            first=std::atomic_ref<u64>(slot.w1).compare_exchange_strong(empty,tagged,std::memory_order_relaxed);
++        }
++        if(first) {
++            slot.w0=rec.w0;
++            touched[b]=1;
++        } else {
++            // Losing workers never read the first writer's unfinished payload.
++            duplicates.push(b,rec.w0,rec.w1);
++        }
++    }
++    template<bool Bitmap, class Part>
++    void packet(Part& duplicates,u8* touched,u64 mask,std::size_t n,const u64* buckets,
++                const std::array<u64,2>* records) const {
++        auto row=[&](std::size_t i){put<Bitmap>(duplicates,touched,buckets[i],{records[i][0],records[i][1]});};
++        if(mask==(n==64?UINT64_MAX:(u64{1}<<n)-1)) {
++            for(std::size_t i=0;i<n;++i) row(i);
++        } else {
++            while(mask){const auto i=std::countr_zero(mask);mask&=mask-1;row(i);}
++        }
++    }
++public:
++    static constexpr std::string_view default_method=SHOP_EVENT_PRIMARY_DEFAULT;
++    void init(std::size_t nb,std::size_t nt,std::string_view method) {
++        // Above 2 GiB of primary records, use the bounded partitioned implementation.
++        constexpr std::size_t max_bytes=std::size_t{2}<<30;
++        if(!nb || !nt || nb>max_bytes/(BSIZE*sizeof(Rec)) || (method!="cas" && method!="bitmap")) return;
++        if constexpr(!std::atomic_ref<u64>::is_always_lock_free ||
++                     alignof(Rec)<std::atomic_ref<u64>::required_alignment ||
++                     offsetof(Rec,w1)%std::atomic_ref<u64>::required_alignment!=0) return;
++        const auto count=nb*BSIZE;
++        // calloc gives implicit-lifetime Rec objects defined zero values, including
++        // w1 for atomic_ref; the large empty table can remain demand paged.
++        const auto bytes=count*sizeof(Rec);
++        auto space=bytes+63;
++        storage_.reset(std::calloc(1,space));
++        if(!storage_) return;
++        void* aligned=storage_.get();
++        rows_=static_cast<Rec*>(std::align(64,bytes,aligned,space));
++        if(method=="bitmap") {
++            bitmap_.reset(static_cast<u64*>(std::calloc(count/64,sizeof(u64))));
++            if(!bitmap_){storage_.reset();rows_=nullptr;return;}
++        }
++        // Each parser marks its own cache-line-separated range.
++        stride_=((nb+63)&~std::size_t{63})+64;
++        touched_.resize(stride_*nt);
++        mode_=bitmap_?Mode::Bitmap:Mode::Cas;
++    }
++    bool active() const { return bool(rows_); }
++    const char* name() const {return mode_==Mode::Bitmap?"bitmap":mode_==Mode::Cas?"cas":"staged";}
++    template<class Part> void write_one(Part& duplicates,std::size_t tid,std::size_t b,Rec rec) const {
++        auto* touched=touched_.data()+tid*stride_;
++        if(mode_==Mode::Bitmap) put<true>(duplicates,touched,b,rec);
++        else put<false>(duplicates,touched,b,rec);
++    }
++    template<class Part> void write_batch(Part& duplicates,std::size_t tid,u64 mask,std::size_t n,
++                                         const u64* buckets,const std::array<u64,2>* records) const {
++        auto* touched=touched_.data()+tid*stride_;
++        if(mode_==Mode::Bitmap) packet<true>(duplicates,touched,mask,n,buckets,records);
++        else packet<false>(duplicates,touched,mask,n,buckets,records);
++    }
++    template<class G> Rec* bucket(const G& g,std::size_t b) const {
++        auto* slots=rows_+b*BSIZE;
++        bool any=false;
++        // The parser barrier precedes this loop. Stage 3 gives each bucket
++        // exactly one owner, so revision comparison now uses ordinary loads.
++        for(std::size_t tid=0;tid<g.nt;++tid) {
++            any|=bool(touched_[tid*stride_+b]);
++            g.t(tid).ev.for_each(b,[&](auto duplicates){
++                for(const auto& rec:duplicates) {
++                    auto& win=slots[rec.w1&(BSIZE-1)];
++                    if(((rec.w1>>16)&ING_MAX)<((win.w1>>16)&ING_MAX)) win={rec.w0,rec.w1+1};
++                }
++            });
++        }
++        return any?slots:nullptr;
++    }
++    void release() {storage_.reset();rows_=nullptr;bitmap_.reset();touched_.clear();}
++};
++
++template<class G> const EventPrimary* primary_events(const G& g) {
++    if constexpr(requires{g.primary;}) return g.primary.active()?&g.primary:nullptr;
++    return nullptr;
++}
++}
+diff --git a/cpp/pipeline/events.hpp b/cpp/pipeline/events.hpp
+--- a/cpp/pipeline/events.hpp
++++ b/cpp/pipeline/events.hpp
+@@ -90,6 +90,7 @@
+             stage3a_old(g,tid);
+         });
+     }
++    if constexpr(requires{g.primary.release();}) g.primary.release();
+     g.uf=links::uf_take(g);
+     const auto full=env_number("XL_SLABFULL").value_or(0);
+     if (full==1) for(std::size_t i=0;i<g.nt;++i) slab_full(g.t(i).core);
+diff --git a/cpp/pipeline/events_fast.hpp b/cpp/pipeline/events_fast.hpp
+--- a/cpp/pipeline/events_fast.hpp
++++ b/cpp/pipeline/events_fast.hpp
+@@ -568,25 +568,33 @@
+     t.cx_raw.reserve(g.ev_bytes/64/g.nt/16);
+     slab_cols(t.core,sh.slab,sh.slab_len);
+     const auto nd=g.nd,dig_min=DIG_MIN.load(relaxed); const auto org=u32(g.nc),trash=u32(g.nc+1);
++    const auto* direct=primary_events(g);
+     u64 gen=0;
+     using clock=std::chrono::steady_clock;
+     auto ns_since=[](auto a,auto b){return std::chrono::duration_cast<std::chrono::nanoseconds>(b-a).count();};
+     for(;;) {
+         const auto b=g.next.fetch_add(1,relaxed);if (b>=g.nb) break;
+         const auto ta=clock::now();
+-        if (++gen>BSIZE) {std::memset(fx.slots,0,BSIZE*sizeof(Rec));gen=1;}
+-        bool any=false;
+-        auto scatter=[&](const Rec* p,std::size_t n,const i8* next){any=true;scatter_chunk(p,n,fx.slots,gen,next);};
+-        for(std::size_t th=0;th<g.nt;++th) {
+-            const auto& part=g.t(th).ev;
+-            if constexpr (requires{part.for_each_chunk(b,scatter);}) part.for_each_chunk(b,scatter);
+-            else part.for_each(b,[&](std::span<const Rec> records){
+-                const i8* next=nullptr;
+-                if (records.size()==4032/16) std::memcpy(&next,reinterpret_cast<const u8*>(records.data())+4032,sizeof(next));
+-                scatter(records.data(),records.size(),next);
+-            });
+-        }
+-        auto& info=g.edges[b];info.n=0;if (!any) continue;
++        auto& info=g.edges[b];info.n=0;
++        if(direct) {
++            fx.slots=direct->bucket(g,b);
++            if(!fx.slots) continue;
++            gen=1;
++        } else {
++            if (++gen>BSIZE) {std::memset(fx.slots,0,BSIZE*sizeof(Rec));gen=1;}
++            bool any=false;
++            auto scatter=[&](const Rec* p,std::size_t n,const i8* next){any=true;scatter_chunk(p,n,fx.slots,gen,next);};
++            for(std::size_t th=0;th<g.nt;++th) {
++                const auto& part=g.t(th).ev;
++                if constexpr (requires{part.for_each_chunk(b,scatter);}) part.for_each_chunk(b,scatter);
++                else part.for_each(b,[&](std::span<const Rec> records){
++                    const i8* next=nullptr;
++                    if (records.size()==4032/16) std::memcpy(&next,reinterpret_cast<const u8*>(records.data())+4032,sizeof(next));
++                    scatter(records.data(),records.size(),next);
++                });
++            }
++            if (!any) continue;
++        }
+         const auto tb=clock::now();const auto k=pass_a(fx,t,gen);
+         const auto tc=clock::now();
+         t.prof[0]+=ns_since(ta,tb);t.prof[1]+=ns_since(tb,tc);
+diff --git a/cpp/pipeline/events_runs.hpp b/cpp/pipeline/events_runs.hpp
+--- a/cpp/pipeline/events_runs.hpp
++++ b/cpp/pipeline/events_runs.hpp
+@@ -1,4 +1,5 @@
+ #pragma once
++#include "event_primary.hpp"
+ #include "core.hpp"
+ #include "sys.hpp"
+ #include <algorithm>
+@@ -267,7 +268,8 @@
+ }
+ template<class G> void stage3a_old(const G& g,std::size_t tid) {
+     auto& t=g.t(tid);
+-    t.slots.assign(BSIZE,{UINT64_MAX,UINT64_MAX});
++    const auto* direct=primary_events(g);
++    if(!direct) t.slots.assign(BSIZE,{UINT64_MAX,UINT64_MAX});
+     auto ed=Edge::start(tid,nullptr);
+     auto slots=t.slots.data();
+     using clock=std::chrono::steady_clock;
+@@ -275,23 +277,27 @@
+         const auto b=g.next.fetch_add(1,relaxed);
+         if (b>=g.nb) break;
+         const auto ta=clock::now();
+-        std::memset(slots,255,BSIZE*sizeof(Rec));
+-        bool any=false;
+-        for (std::size_t th=0;th<g.nt;++th) g.t(th).ev.for_each(b,[&](auto records){
+-            any=true;
+-            for (auto r:records) {
+-                auto& s=slots[r.w1&(BSIZE-1)];
+-                if (((r.w1>>16)&ING_MAX)<((s.w1>>16)&ING_MAX)) s=r;
+-            }
+-        });
+-        auto& info=g.edges[b];
+-        info.n=0;
+-        if (!any) continue;
++        auto& info=g.edges[b];info.n=0;
++        if(direct) {
++            slots=direct->bucket(g,b);
++            if(!slots) continue;
++        } else {
++            std::memset(slots,255,BSIZE*sizeof(Rec));
++            bool any=false;
++            for (std::size_t th=0;th<g.nt;++th) g.t(th).ev.for_each(b,[&](auto records){
++                any=true;
++                for (auto r:records) {
++                    auto& s=slots[r.w1&(BSIZE-1)];
++                    if (((r.w1>>16)&ING_MAX)<((s.w1>>16)&ING_MAX)) s=r;
++                }
++            });
++            if(!any) continue;
++        }
+         const auto tb=clock::now();
+         std::size_t k=0;
+         for (std::size_t s=0;s<BSIZE;++s) {
+             const Rec r=slots[s];
+-            if ((r.w0>>33)==INVALID_TS) continue;
++            if ((direct && u16(r.w1)!=s+1) || (r.w0>>33)==INVALID_TS) continue;
+             if (r.w1>>63) {
+                 t.cx_raw.push_back({r.w0,ODDU|user_of(r)});++t.n_odd;
+             } else slots[k++]=r;
+diff --git a/cpp/pipeline/main.cpp b/cpp/pipeline/main.cpp
+--- a/cpp/pipeline/main.cpp
++++ b/cpp/pipeline/main.cpp
+@@ -74,6 +74,9 @@
+     std::fprintf(stderr,"[pipeline] events=%llu clicks=%llu links=%llu simple=%llu complex=%llu odd=%llu runs=%llu sessions=%llu user_rows=%llu\n",
+         (unsigned long long)ev,(unsigned long long)ck,(unsigned long long)lk,(unsigned long long)simple,(unsigned long long)cx,
+         (unsigned long long)od,(unsigned long long)runs,(unsigned long long)sessions,(unsigned long long)rows);
++    std::size_t staged=0;
++    for(std::size_t tid=0;tid<g.nt;++tid) for(std::size_t b=0;b<g.nb;++b) staged+=g.t(tid).ev.count(b);
++    std::fprintf(stderr,"[pipeline] event_primary=%s staged_event_records=%zu buckets=%zu\n",g.primary.name(),staged,g.nb);
+     std::fprintf(stderr,"[pipeline] thread-ms scatter=%.1f compact=%.1f runs=%.1f links=%.1f max_bucket=%.1f\n",
+         prof[0]/1e6,prof[1]/1e6,prof[2]/1e6,prof[3]/1e6,prof[4]/1e6);
+ }
+diff --git a/cpp/pipeline/model.hpp b/cpp/pipeline/model.hpp
+--- a/cpp/pipeline/model.hpp
++++ b/cpp/pipeline/model.hpp
+@@ -1,5 +1,6 @@
+ #pragma once
+ #include "links_uf.hpp"
++#include "event_primary.hpp"
+ #include "parse_part.hpp"
+ #include <memory>
+ #include <tuple>
+@@ -44,6 +45,7 @@
+     u64 ukey{},ekey{},ckey{},ccap{};
+     bool cpart{};
+     u64 ecap{},ucap{};
++    EventPrimary primary;
+     std::vector<u8> prod,camp;
+     std::size_t nc{};
+     std::vector<std::vector<u8>> cats,channels;
+diff --git a/cpp/pipeline/parse_sink.hpp b/cpp/pipeline/parse_sink.hpp
+--- a/cpp/pipeline/parse_sink.hpp
++++ b/cpp/pipeline/parse_sink.hpp
+@@ -1,5 +1,6 @@
+ #pragma once
+ #include "parse_packets.hpp"
++#include "event_primary.hpp"
+ #include "parse_part.hpp"
+ #include "sys.hpp"
+ #include <mutex>
+@@ -72,7 +73,10 @@
+         }
+         if(r.eid<=keyrec::MASK) {
+             if(auto v=keyrec::unscramble(r.eid,g.ekey);v<g.ecap) {
+-                t.ev.push(v>>BB,w0,(v&(BSIZE-1))|((ing/1000)<<16)|(user<<37)); return;
++                const Rec rec{w0,(v&(BSIZE-1))|((ing/1000)<<16)|(user<<37)};
++                if(auto* direct=primary_events(g)) direct->write_one(t.ev,tid,v>>BB,rec);
++                else t.ev.push(v>>BB,rec.w0,rec.w1);
++                return;
+             }
+         }
+         t.odd_events.push_back({token(r.eid),r.ingest,w0,user});
+@@ -84,7 +88,8 @@
+         const EvP p{g.ing_base,g.ws,g.wlen,g.ukey,g.ekey,g.ucap,g.ecap,tb.prod.data(),t.ev.lines_ptr()};
+         const auto [regular,special,bad]=u64(TS_BAD)-u64(p.ing_base)>=ING_MAX*1000 ? ev_vec<false>(eb,out,n,p) : ev_vec<true>(eb,out,n,p);
+         if(bad) sys::fallback("ingest_ts bad or out of range");
+-        t.ev.push_many(regular,n,out.ob.data(),out.lp.data(),out.rec.data());
++        if(auto* direct=primary_events(g)) direct->write_batch(t.ev,tid,regular,n,out.ob.data(),out.rec.data());
++        else t.ev.push_many(regular,n,out.ob.data(),out.lp.data(),out.rec.data());
+         for(auto m=special;m;m&=m-1) ev_one(eb.row(std::countr_zero(m)));
+     }
+     [[gnu::noinline]] void ck_one(const ClRow& r) {
+diff --git a/cpp/pipeline/setup.hpp b/cpp/pipeline/setup.hpp
+--- a/cpp/pipeline/setup.hpp
++++ b/cpp/pipeline/setup.hpp
+@@ -48,6 +48,8 @@
+     g->ws_mod=u64(ws%DAY_MS);g->day0=i32(ws/DAY_MS);g->nd=std::size_t((g->wlen+g->ws_mod+DAY_MS-1)/DAY_MS);
+     g->ukey=keys.user;g->ekey=keys.event;g->ckey=keys.click;g->ccap=keys.ccap;g->cpart=ckix_mode()==2;
+     auto [ev,ck,lk]=c.bytes;auto [nb,nub]=part_counts(ev);g->nb=nb;g->nub=nub;g->ecap=nb<<BB;g->ucap=nub<<UB;g->ev_bytes=ev;g->row_cap=row_capacity(ev,nt);
++    const char* method=std::getenv("XL_EVENT_PRIMARY");
++    g->primary.init(nb,nt,method?std::string_view(method):EventPrimary::default_method);
+     g->ev_arena=sys::Arena(ev/28*16+nt*nb*4096+nt*sys::HP+(16u<<20));g->us_arena=sys::Arena((ck/10+lk/6)*16+nt*nub*4096+nt*sys::HP+(16u<<20));
+     g->prod=std::move(products.prod);g->cats=std::move(products.cats);g->camp=std::move(campaigns.camp);g->channels=std::move(campaigns.channels);g->nc=campaigns.nc;
+     g->region=c.region;g->files=std::move(c.files);g->queue=std::move(c.queue);g->workers.reserve(nt);g->csr_cap=csr_cap(g->ccap,ck,lk);
+diff --git a/tests/pipeline/event_primary.cpp b/tests/pipeline/event_primary.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/pipeline/event_primary.cpp
+@@ -0,0 +1,140 @@
++#include "../../cpp/pipeline/event_primary.hpp"
++#include <algorithm>
++#include <array>
++#include <barrier>
++#include <cstdio>
++#include <random>
++#include <span>
++#include <stdexcept>
++#include <thread>
++#include <vector>
++
++using namespace pipeline;
++namespace {
++constexpr std::size_t threads=8,buckets=5,capacity=buckets*BSIZE;
++
++struct Part {
++    std::array<std::vector<Rec>,buckets> records;
++    void push(std::size_t bucket,u64 w0,u64 w1) {records.at(bucket).push_back({w0,w1});}
++    template<class F> void for_each(std::size_t bucket,F&& f) const {
++        f(std::span<const Rec>(records.at(bucket)));
++    }
++};
++struct Context {
++    struct Worker {Part ev;};
++    std::array<Worker,threads> workers;
++    static constexpr std::size_t nt=threads;
++    const Worker& t(std::size_t i) const {return workers.at(i);}
++};
++void require(bool test,const char* message) {
++    if(!test) throw std::runtime_error(message);
++}
++struct Row {
++    std::size_t ordinal;
++    Rec rec;
++};
++u64 ingest(const Rec& rec) {return (rec.w1>>16)&ING_MAX;}
++
++void exercise(std::string_view mode,unsigned round) {
++    EventPrimary table;
++    table.init(buckets,threads,mode);
++    require(table.active() && table.name()==mode,"policy unavailable");
++    Context ctx;
++    std::array<std::vector<Row>,threads> work;
++    std::vector<Rec> oracle(capacity);
++    std::vector<bool> present(capacity);
++    std::size_t copies=0,unique=0;
++    auto add=[&](std::size_t ordinal,std::size_t tid,u64 when,u64 person,u64 payload) {
++        const Rec r{payload,(person<<37)|(when<<16)|(ordinal&(BSIZE-1))};
++        work[tid].push_back({ordinal,r});
++        if(!present[ordinal] || when<ingest(oracle[ordinal])) oracle[ordinal]=r;
++        unique+=!present[ordinal];
++        present[ordinal]=true;
++        ++copies;
++    };
++    // Simultaneous insertions include earliest-invalid and latest-invalid
++    // versions, rank-zero records, identical ties, and arbitrary-user payloads.
++    for(std::size_t ordinal:{0u,1u,62u,63u,64u,65u,16382u,16383u,16384u,
++                              16385u,32767u,32768u,32769u,49151u,49152u,65535u}) {
++        for(std::size_t i=0;i<threads;++i) {
++            const auto rank=(i*5+ordinal+round)%threads;
++            const u64 person=(ordinal%4==1?ODDU:0)+rank;
++            const u64 payload=(ordinal%3==0 && rank==0) || (ordinal%3==2 && rank==7)
++                ?UINT64_MAX:0x2480ULL+(ordinal<<5)+rank;
++            add(ordinal,i,rank,person,payload);
++            if(rank==0) add(ordinal,(i+1)%threads,rank,person,payload);
++        }
++    }
++    // Leave the last whole bucket empty. Distribute the other slots sparsely
++    // so the test can examine every never-written generation word.
++    for(std::size_t i=0;i<1493;++i) {
++        const auto ordinal=(i*4921+113)%(4*BSIZE);
++        if(present[ordinal]) continue;
++        add(ordinal,i%threads,ING_MAX-1,ODDU+(i%27),i+1);
++        if(i%7==3) add(ordinal,(i+3)%threads,ING_MAX-2,i%63,UINT64_MAX);
++    }
++    std::barrier start{std::ptrdiff_t(threads)};
++    std::array<std::thread,threads> jobs;
++    for(std::size_t tid=0;tid<threads;++tid) {
++        jobs[tid]=std::thread([&,tid]{
++            auto& rows=work[tid];
++            std::mt19937 rng(unsigned(7369*round+tid));
++            std::shuffle(rows.begin(),rows.end(),rng);
++            auto& dup=ctx.workers[tid].ev;
++            start.arrive_and_wait();
++            for(std::size_t at=0,group=0;at<rows.size();++group) {
++                if(group%3==0) {
++                    const auto& r=rows[at++];
++                    table.write_one(dup,tid,r.ordinal>>BB,r.rec);
++                    continue;
++                }
++                std::array<u64,64> bs{};
++                std::array<std::array<u64,2>,64> records{};
++                std::size_t n=0;
++                u64 mask=0;
++                for(;at<rows.size() && n<64;++n) {
++                    if(group%3==2 && n%3==1) continue;
++                    const auto& r=rows[at++];
++                    bs[n]=r.ordinal>>BB;
++                    records[n]={r.rec.w0,r.rec.w1};
++                    mask|=u64{1}<<n;
++                }
++                table.write_batch(dup,tid,mask,n,bs.data(),records.data());
++            }
++        });
++    }
++    for(auto& job:jobs) job.join();
++    std::size_t losers=0;
++    for(const auto& w:ctx.workers) for(const auto& d:w.ev.records) losers+=d.size();
++    require(losers==copies-unique,"duplicate count");
++    for(std::size_t b=0;b<buckets;++b) {
++        const auto* slots=table.bucket(ctx,b);
++        require(bool(slots)==(b<buckets-1),"touched-bucket map");
++        if(!slots) continue;
++        require(reinterpret_cast<std::uintptr_t>(slots)%64==0,"slot alignment");
++        for(std::size_t s=0;s<BSIZE;++s) {
++            const auto i=b*BSIZE+s;
++            const auto& slot=slots[s];
++            if(!present[i]) {require(slot.w1==0,"unused generation");continue;}
++            require(slot.w1==oracle[i].w1+1 && slot.w0==oracle[i].w0,"earliest winner");
++            require(u16(slot.w1)==s+1,"generation-one tag");
++        }
++    }
++    table.release();
++    require(!table.active() && table.name()==mode,"release lost diagnostics");
++}
++}
++int main() {
++    for(const char* method:{"cas","bitmap"}) {
++        EventPrimary over_budget;
++        over_budget.init(1+(std::size_t{2}<<30)/(BSIZE*sizeof(Rec)),threads,method);
++        require(!over_budget.active() && std::string_view(over_budget.name())=="staged","memory budget");
++        for(unsigned i=0;i<8;++i) exercise(method,i);
++    }
++    for(const char* method:{"staged","unknown"}) {
++        EventPrimary table;
++        table.init(buckets,threads,method);
++        require(!table.active(),"ordinary storage fallback");
++    }
++    std::puts("event primary: both policies, 16 eight-worker rounds, zero/edge generations, caps passed");
++}
+diff --git a/tests/pipeline/event_primary.py b/tests/pipeline/event_primary.py
+new file mode 100644
+--- /dev/null
++++ b/tests/pipeline/event_primary.py
+@@ -0,0 +1,187 @@
++"""Exercise dedup-before-validation across compact event bucket boundaries."""
++import argparse
++from collections import defaultdict
++from datetime import datetime, timezone
++from pathlib import Path
++import json
++import os
++import re
++import subprocess
++import tempfile
++
++import pyarrow.parquet as pq
++from check_keys import spelling
++
++START = 1835395200
++DAY = 86400
++ANCHORS = 36000
++TABLES = {
++    "user_daily": ("user_id", "day", "sessions", "events", "revenue_cents", "top_category"),
++    "campaign_daily": ("campaign_id", "channel", "day", "sessions", "purchasing_sessions",
++                       "revenue_cents", "assisted_sessions"),
++}
++HEADERS = {
++    "events": "event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents",
++    "clicks": "click_id,user_id,campaign_id,ts",
++    "links": "user_id_a,user_id_b",
++}
++
++
++def timestamp(seconds):
++    return datetime.fromtimestamp(seconds, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
++
++
++def prepare(data):
++    for kind in HEADERS:
++        (data / kind).mkdir(parents=True)
++    (data / "manifest.json").write_text(json.dumps({
++        "window_start": timestamp(START), "window_end": timestamp(START + 14*DAY)}))
++    (data / "products.csv").write_text("product_id,category\np1,A\n")
++    (data / "campaigns.csv").write_text("campaign_id,channel\nc_1,mail\n")
++    (data / "clicks/part.csv").write_text(HEADERS["clicks"] + "\n")
++    (data / "links/part.csv").write_text(HEADERS["links"] + "\n")
++    when = timestamp(START)
++    groups = {}
++    ids = {}
++
++    def user(i):
++        if i not in groups:
++            groups[i] = "u" + spelling(i * 512, 0x12ECB0A367)
++        return groups[i]
++
++    def eid(i):
++        if i not in ids:
++            ids[i] = "e" + spelling(i, 0x1D0896B42F)
++        return ids[i]
++
++    revisions = [[] for _ in range(16)]
++    # Values in this independent oracle are (ingest, person, revenue or None).
++    # None means a physically valid row whose winning copy fails validation.
++    expected = {}
++    compact_copies = 0
++
++    def remember(key, seconds, name, revenue):
++        row = (seconds, name, revenue)
++        if key not in expected or seconds < expected[key][0]:
++            expected[key] = row
++        elif seconds == expected[key][0]:
++            assert expected[key] == row, (key, expected[key], row)
++
++    with (data / "events/anchors.csv").open("w") as f:
++        print(HEADERS["events"], file=f)
++        for i in range(ANCHORS):
++            group = 0 if i < 1000 else 1 + (i - 1000)//128
++            print(",".join((eid(i), user(group), when, timestamp(START+30),
++                           "view", "p1", "")), file=f)
++            remember(eid(i), START+30, user(group), 0)
++            compact_copies += 1
++
++    def add(part, key, name, t, seconds, kind, prod, price, value, compact=True):
++        nonlocal compact_copies
++        row = [key, name, t, timestamp(seconds), kind, prod, price]
++        if part % 3 == 1:
++            row = ['"' + field + '"' for field in row]
++        revisions[part].append(",".join(row))
++        remember(key, seconds, name, value)
++        compact_copies += compact
++
++    special = [0, 1, 62, 63, 64, 65, 8191, 8192, 16382, 16383, 16384,
++               16385, 24574, 32766, 32767, 32768, 32769, 35999]
++    raw_users = [" \x00raw ", "u00", "élève", "long-" + "Z"*320]
++    for j, i in enumerate(special):
++        key = eid(i)
++        owner = raw_users[j % 4] if j % 2 else user(j + 300)
++        for rank in range(8):
++            part = (7*rank + j)%len(revisions)
++            # Some rank-zero records are invalid, including empty users,
++            # unknown types, invalid timestamps, invalid price, and absent product.
++            name, t, kind, product, price, value = owner, when, "purchase", "p1", str(17+j), 17+j
++            if rank:
++                name, price, value = user(j + 400 + rank), str(9000 + rank), 9000 + rank
++            elif j % 8 == 1:
++                name, value = "", None
++            elif j % 8 == 2:
++                t, value = "2028-02-30T00:00:00Z", None
++            elif j % 8 == 4:
++                kind, value = "Purchase", None
++            elif j % 8 == 6:
++                price, value = "0", None
++            elif j % 8 == 7:
++                product, value = "", None
++            # For ordinal zero both the input ordinal and the packed ingest
++            # bits are zero; the winning event still needs a live generation.
++            sec = START-DAY+rank if i == 0 else START+rank
++            add(part, key, name, t, sec, kind, product, price, value)
++            if rank == 0:
++                add((part+1)%16, key, name, t, sec, kind, product, price, value)
++        # The CSV parser must drop this otherwise earlier revision.
++        revisions[(j+3)%16].append(",".join((key, user(999), when, timestamp(START-DAY),
++                                               "purchase", "p1", "323", "extra")))
++    for j, key in enumerate(("e00", "Év\x00", "E-arbitrary-"+"x"*327)):
++        add(2*j, key, user(391), when, START+2, "purchase", "p1", "7001", 7001, False)
++        add(2*j+1, key, raw_users[j], when, START, "purchase", "p1", str(j+101), j+101, False)
++    # A syntactically normal encoded ID outside the estimated dense ordinal
++    # range is still an arbitrary event. Its identity must survive global dedup.
++    outside = eid(1 << 29)
++    add(4, outside, user(389), when, START+2, "purchase", "p1", "88", 88, False)
++    add(5, outside, raw_users[3], when, START+1, "view", "p1", "ignored", 0, False)
++    for part, rows in enumerate(revisions):
++        sequence = rows if part % 2 else list(reversed(rows))
++        # Deliberately omit the final newline in half the shards.
++        suffix = "\n" if part % 2 else ""
++        (data / "events" / f"r{part:02}.csv").write_text(
++            HEADERS["events"] + "\n" + "\n".join(sequence) + suffix)
++    by_user = defaultdict(lambda: [0, 0])
++    for _, name, value in expected.values():
++        if value is None:
++            continue
++        by_user[name][0] += 1
++        by_user[name][1] += value
++    day = datetime.fromtimestamp(START, timezone.utc).date()
++    users = sorted((name, day, 1, n, rev, "A" if rev else None)
++                   for name, (n, rev) in by_user.items())
++    campaign = [("organic", "organic", day, len(users), sum(r[4] > 0 for r in users),
++                 sum(r[4] for r in users), 0)]
++    return [users, campaign], compact_copies
++
++
++def check(binary, scratch):
++    data = scratch / "input"
++    tables, compact_copies = prepare(data)
++    for mode, threads, legacy in [
++        ("cas", 1, True), ("bitmap", 8, True), ("bitmap", 1, False),
++        ("cas", 8, False), ("staged", 8, False), ("generic", 4, False),
++    ]:
++        out = scratch / f"out-{mode}-{threads}"
++        out.mkdir(mode=0o777)
++        out.chmod(0o777)
++        command = [str(binary), *(["--generic"] if mode == "generic" else []), str(data), str(out)]
++        env = os.environ | {"NCPU": str(threads), "XL_OLD3": str(int(legacy)),
++                            "XL_EVENT_PRIMARY": mode, "XL_TIMING": "1", "V1ND_LOG": "1"}
++        result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=60)
++        if result.returncode:
++            raise RuntimeError(f"{mode} failed with {result.returncode}: {result.stderr[-3000:]}")
++        if mode != "generic":
++            trace = re.search(r"event_primary=(\w+) staged_event_records=(\d+) buckets=(\d+)", result.stderr)
++            target = compact_copies if mode == "staged" else compact_copies-ANCHORS
++            if not (trace and trace[1] == mode and int(trace[2]) == target and int(trace[3]) >= 3):
++                raise AssertionError((mode, target, result.stderr[-3000:]))
++        for (name, columns), want in zip(TABLES.items(), tables):
++            rows = []
++            for file in (out / name).glob("*.parquet"):
++                tab = pq.read_table(file, columns=list(columns))
++                rows.extend(zip(*(tab[c].to_pylist() for c in columns)))
++            if sorted(rows) != want:
++                raise AssertionError((mode, name, len(rows), len(want),
++                                      list(set(rows) - set(want))[:3], list(set(want) - set(rows))[:3]))
++        print(f"{mode} with {threads} workers, legacy={int(legacy)}: "
++              f"{len(tables[0])} user rows, one campaign row, exact", flush=True)
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("binary", type=Path)
++    parser.add_argument("--scratch-parent", type=Path)
++    args = parser.parse_args()
++    with tempfile.TemporaryDirectory(dir=args.scratch_parent) as folder:
++        check(args.binary.resolve(), Path(folder))
