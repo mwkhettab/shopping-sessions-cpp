@@ -13,6 +13,9 @@
 | `4db76beed31640ddf4b414ed19deba5ebc660b81` | **0.87 s** | Variable-width direct event decoding, grouped revision tags and reuse of revision pages for person timelines |
 | `25a940f0d0a8f4a38ab8c5c96a47bb8927b3e4e3` | **0.88 s** | Verified tile-wide CSV structure and marked field boundaries on supporting x86-64 CPUs |
 | `dc216ac44dcaeb30ace2af3f2d2ff1d782ef78f0` | **0.33 s** | Partitioned event decoding, compact click index, session reconciliation and direct Parquet output |
+| `d6f4a028fbee7a350a1b77a22dc02c40670d279e` | **0.32 s** | Corrected long-ID parsing and Clang 16 full link-time optimization |
+
+The entrant reported **0.32 s** for the published Clang release. The executable is identical to the qualified `29ee0cc5c26291c511cad44aec18c6531f050f79` build. The official practice improvement was 0.01 s, or about 3.0% of the prior 0.33 s score. A 0.28 s run would require another 0.04 s reduction.
 
 The entrant reported **0.33 s** after submitting the `dc216ac44dca` release from `origin/main`. This cuts 0.54 s (62.1%) from the previous 0.87 s best. The production sources and Docker build at this revision match `faf1047c6cb0` exactly.
 
