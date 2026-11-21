@@ -9,17 +9,31 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-22.04]
+        os: [ubuntu-24.04, ubuntu-22.04, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 63
     steps:
+      - name: Identify CPU vendor
+        id: hardware
+        shell: bash
+        run: |
+          vendor=$(awk -F: '/^vendor_id/{gsub(/ /,"",$2); print $2; exit}' /proc/cpuinfo)
+          if [ "${{ matrix.os }}" = ubuntu-latest ] && [ "$vendor" != GenuineIntel ]; then
+            echo "run=no" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=yes" >> "$GITHUB_OUTPUT"
+          fi
+          lscpu
       - uses: actions/checkout@v4
+        if: steps.hardware.outputs.run == 'yes'
         with:
           persist-credentials: false
       - uses: actions/setup-python@v5
+        if: steps.hardware.outputs.run == 'yes'
         with:
           python-version: '3.12'
       - name: Prepare public generator, fixtures and references
+        if: steps.hardware.outputs.run == 'yes'
         shell: bash
         run: |
           set -eu
@@ -40,9 +54,10 @@ jobs:
           lscpu
           df -h .
       - name: Validate and measure fresh processes
+        if: steps.hardware.outputs.run == 'yes'
         run: "$RUNNER_TEMP/shopping-python/bin/python perf/native/run.py"
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: always() && steps.hardware.outputs.run == 'yes'
         with:
           name: native-observations-${{ matrix.os }}
           path: ${{ runner.temp }}/shopping-trials/results/

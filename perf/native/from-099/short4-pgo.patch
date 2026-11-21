@@ -1,0 +1,145 @@
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -159,6 +159,7 @@
+ struct Result {
+   SessionBins bins;
+ #ifdef SHOPPING_DIAGNOSTICS
++  size_t short_people{},short_events{},short_clicks{};
+   size_t people{}, events_seen{}, clicks_seen{}, max_events{}, max_clicks{};
+ #endif
+   ScratchArray<ActiveCampaign> activity;
+@@ -201,6 +202,7 @@
+   }
+ };
+ 
++#include "short_sessions.hpp"
+ template <class Layout>
+ void summarize(Key user, std::span<typename Layout::E> events,
+                std::span<typename Layout::C> clicks, const Catalog &cat,
+@@ -214,6 +216,7 @@
+   result.max_events = std::max(result.max_events, events.size());
+   result.max_clicks = std::max(result.max_clicks, clicks.size());
+ #endif
++  if (summarize_short<4>(user,events,clicks,cat,result,layout))return;
+   const bool use_bins = !result.bins.cells.empty() && events.size() >= 32;
+   {
+     MEASURE(sorting);
+@@ -810,6 +813,9 @@
+             << ", grouped events " << events_seen << ", grouped clicks "
+             << clicks_seen << ", largest timelines " << max_events
+             << " events / " << max_clicks << " clicks\n";
++  size_t matches=0,se=0,sc=0;
++  for(const auto &r:results){matches+=r.short_people;se+=r.short_events;sc+=r.short_clicks;}
++  std::cerr<<"bounded sessions handled "<<matches<<" people, "<<se<<" events, "<<sc<<" clicks\n";
+   metrics::report();
+ #endif
+ }
+--- /dev/null
++++ b/cpp/short_sessions.hpp
+@@ -0,0 +1,106 @@
++#pragma once
++
++template<size_t Limit, class Layout>
++bool summarize_short(Key user, std::span<typename Layout::E> events,
++                     std::span<typename Layout::C> clicks, const Catalog &cat,
++                     Result &result, Layout layout) {
++  constexpr size_t maximum_events=64;
++  if(events.empty() || events.size()>maximum_events)return false;
++  struct Session {Time first,last;int64_t count,revenue;};
++  std::array<Session,Limit> groups;
++  std::array<Event,maximum_events> purchases;
++  unsigned n=0,np=0;
++  auto separated=[](Time earlier,Time later) {
++    return earlier<later && uint64_t(later)-uint64_t(earlier)>uint64_t(session_gap);
++  };
++  for(auto record:events) {
++    Event e=layout.unpack(record);
++    unsigned i=0;
++    while(i<n && separated(groups[i].last,e.ts))++i;
++    if(i==n || separated(e.ts,groups[i].first)) {
++      if(n==Limit)return false;
++      for(unsigned j=n;j>i;--j) groups[j]=groups[j-1];
++      groups[i]={e.ts,e.ts,1,e.price};
++      ++n;
++    } else {
++      auto &a=groups[i];
++      a.first=std::min(a.first,e.ts);a.last=std::max(a.last,e.ts);
++      ++a.count;a.revenue+=e.price;
++      if(i+1<n && !separated(a.last,groups[i+1].first)) {
++        auto b=groups[i+1];
++        a.last=std::max(a.last,b.last);a.count+=b.count;a.revenue+=b.revenue;
++        for(unsigned j=i+1;j+1<n;++j)groups[j]=groups[j+1];
++        --n;
++      }
++    }
++    if(e.price)purchases[np++]=e;
++  }
++  // A click enters the first session at or after its timestamp. A prefix
++  // maximum of those entries gives every winner. Campaign masks union the
++  // exact set of qualifying sessions, including boundary and duplicate clicks.
++  using Click=typename Layout::C;
++  std::array<const Click*,Limit> incoming{};
++  auto prefer=[](const Click &a,const Click &b) {
++    return a.ts>b.ts || (a.ts==b.ts && a.id.user_less(b.id,'k'));
++  };
++  for(const auto &click:clicks) {
++    auto t=layout.click_time(click);
++    unsigned lo=0;
++    while(lo<n && groups[lo].first<t)++lo;
++    if(lo==n)continue;
++    unsigned hi=lo;
++    while(hi<n && uint64_t(groups[hi].first)-uint64_t(t)<=uint64_t(reach))++hi;
++    if(hi==lo)continue;
++    if(!incoming[lo] || prefer(click,*incoming[lo])) incoming[lo]=&click;
++    auto &mask=result.activity[click.campaign].count;
++    if(!mask) result.active.push_back(click.campaign);
++    mask|=(size_t{1}<<hi)-(size_t{1}<<lo);
++  }
++  std::array<int32_t,Limit> days;
++  UserDay daily{user,0,0,0,0,{}};
++  auto emit=[&] {
++    int64_t high=0;
++    for(int k:result.purchased) {
++      auto &sum=result.spend[k];
++      if(sum>high || (sum==high && cat.categories[k]<*daily.category)) {
++        high=sum;daily.category=cat.categories[k];
++      }
++      sum=0;
++    }
++    result.purchased.clear();
++    result.users.push_back(daily);
++  };
++  const Click *latest=nullptr;
++  for(unsigned i=0;i<n;++i) {
++    auto &s=groups[i];int32_t day=days[i]=utc_day(s.first);
++    if(daily.sessions && day!=daily.day) {
++      emit();daily={user,day,0,0,0,{}};
++    }
++    daily.day=day;++daily.sessions;daily.events+=s.count;daily.revenue+=s.revenue;
++    if(s.revenue)for(unsigned j=0;j<np;++j) {
++      const auto &e=purchases[j];
++      if(e.ts<s.first || e.ts>s.last)continue;
++      auto &total=result.spend[e.category];
++      if(!total)result.purchased.push_back(e.category);
++      total+=e.price;
++    }
++    if(incoming[i]) latest=incoming[i];
++    int campaign=latest && uint64_t(s.first)-uint64_t(layout.click_time(*latest))<=uint64_t(reach) ? latest->campaign : 0;
++    auto &credit=result.at(campaign,day);
++    ++credit.sessions;credit.purchases+=s.revenue!=0;credit.revenue+=s.revenue;
++  }
++  emit();
++  for(int campaign:result.active) {
++    auto &stored=result.activity[campaign].count;
++    size_t bits=stored;stored=0;
++    while(bits) {
++      ++result.at(campaign,days[std::countr_zero(bits)]).assists;
++      bits&=bits-1;
++    }
++  }
++  result.active.clear();
++#ifdef SHOPPING_DIAGNOSTICS
++  ++result.short_people;result.short_events+=events.size();result.short_clicks+=clicks.size();
++#endif
++  return true;
++}

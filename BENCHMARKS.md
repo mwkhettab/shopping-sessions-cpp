@@ -33,6 +33,24 @@ Each pair used the same runner and files. Each build passed 36 supplied fixtures
 
 A separate AMD test varied the allocation order of the partition slabs. Interleaving only the raw-event and click partitions in tiles of 256 reduced the medians from 1.1712 to 1.1540 s at 20M and from 3.6514 to 3.5975 s at 60M on an EPYC 9V74. Both binaries in that comparison used interval attribution. Interleaving both revisions and raw records took 3.6981 s at 60M. [Full slab comparisons](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44876273411/job/136761546768)
 
+### Compiler, revision index and CSV scanner comparisons
+
+| Four-vCPU Intel 20M medians | Xeon 6975P-C | Xeon Platinum 8370C |
+| --- | ---: | ---: |
+| Official 0.99 s source | 1.1885 s | 1.6464 s |
+| Add a hash tag to the winner locator | 1.1833 s | 1.6321 s |
+| Encode short base-36 event IDs in a smaller revision record | 1.2156 s | 1.6730 s |
+| GCC tuning for Skylake, baseline instruction set | 1.1929 s | 1.6518 s |
+| GCC profile-guided build with link-time optimization | 1.1976 s | 1.6402 s |
+| Third synthetic training population | 1.1837 s | 1.6342 s |
+| Clang 16 profile-guided build, ordinary / ThinLTO | 1.2032 / 1.2366 s | unavailable |
+
+The extra hash tag lost a separate seven-pair comparison on the 6975P-C, 1.1883 versus 1.1767 s. On the 8370C it took 1.6336 versus 1.6407 s. The third training population reduced the 8370C five-pair 60M median from 5.0360 to 5.0151 s. At 60M on the 6975P-C two independent builds of the scored source measured 3.6283 and 3.5550 s in the same rotation, bracketing the third-population build at 3.5667 s. The smaller revision record increased peak RSS from 8,283 to 8,531 MiB on the 6975P-C because it maintained separate compact and fallback partitions. [Intel 6975P-C comparisons](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44878671795/job/136768926855) · [Intel 8370C comparisons](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44878671795/job/136768927025)
+
+Classifying each 64-byte input block once required carrying delimiter, quote and newline masks across records. On a four-vCPU EPYC 9V74, the AVX2 and AVX-512 implementations took 1.2116 and 1.2020 s against 1.1183 s for the existing row scanner. At 60M the same times were 3.6462, 3.6290 and 3.3762 s. Row-wise AVX-512 took 1.1337 and 3.4256 s. The AVX2-only 7763 also favored the original scanner. [AVX-512 host](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44878966869/job/136769828527) · [AVX2 host](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44878966869/job/136769828385)
+
+Seed 733 supplies an independently generated second 60M population with 15M requested clicks. The scored implementation produced 6,621,736 user-day rows and 28,014 campaign-day rows. Both native runners compared the complete schema, all unique keys, nulls and values for this population. On the EPYC 9V45 a persistent worker team pinned within the allowed CPU set took 2.5834 versus 2.6429 s in the seed-47 paired rerun. On the EPYC 9V74, compressing delimiter positions into packed field boundaries using VBMI2 took 3.6022 versus 3.6570 s on seed 733, while the 9V45 measured 2.5911 versus 2.5912 s. Both CPUs advertised VBMI2. Short-ID load and worker-scheduling changes also changed rank between runners. [Seed 733 and worker comparisons on 9V45](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44880020704/job/136773037873) · [Seed 733 and parser comparisons on 9V74](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44880020704/job/136773038080)
+
 ## Reversible IDs and profile-guided compilation
 
 The Intel runner measured the exact source of the 1.13 s release against a lossless ID representation and a GCC profile-guided build. The ID permutation computes the hash at ingestion. Repeated shard and table lookups reuse it. Recovering the original bytes preserves lexicographic ordering for linked names and click ties. Indirect strings retain their full bytes and cache their hash. Two small synthetic build-time workloads exercise short and wide windows, ordinary and arbitrary IDs, and conflicting revisions. The container includes only the resulting executable and the Debian runtime.

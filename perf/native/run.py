@@ -44,8 +44,11 @@ def main():
             shutil.copy2(root/'build.sh',src/'build.sh')
             if name not in ('haswell','skylake'):
                 revision='fin-slabkey-pgo' if name=='base' else name
-                with (root/f'perf/native/{revision}.patch').open('rb') as patch:
-                    subprocess.run(['patch','-s','-p1'],cwd=src,stdin=patch,check=True)
+                relative=root/'perf/native/from-099'/(name+'.patch')
+                patches=[root/'perf/native/fin-slabkey-pgo.patch',relative] if relative.exists() else [root/f'perf/native/{revision}.patch']
+                for path in patches:
+                    with path.open('rb') as patch:
+                        subprocess.run(['patch','-s','-p1'],cwd=src,stdin=patch,check=True)
             if name=='base': run('sha256sum','--check',root/'perf/native/official-099.sha256',cwd=src)
             compiler=shutil.which('g++-12') or shutil.which('g++')
             if name in ('haswell','skylake'):
@@ -79,6 +82,7 @@ def main():
             run(unit)
             run(python,root/'verify.py',binary,area/'dev','--starter',area/'starter-pyspark','--answer',area/'dev-answer')
             run(python,root/'perf/native/random_rules.py',binary)
+            run(python,root/'perf/native/interval_oracle.py',binary)
             binaries.append(binary)
         except (subprocess.CalledProcessError,OSError) as exc:
             if name=='base': raise
@@ -175,6 +179,7 @@ def main():
         for b,obs in observations.items():
             if obs: note('Eviction '+scale+' '+b.name,f"(seconds, starting residency, major faults) {obs}")
         if scale=='practice':
+            practice_times=performance.copy()
             practice_winner=best.name
             src=area/best.name
             run('sh','build.sh',cwd=src,extra={'CXX':shutil.which('g++-12'),'PYTHON':python,'DIAGNOSTICS':'1'})
@@ -184,6 +189,11 @@ def main():
                 note('Profile '+best.name,' '.join(proc.stderr.splitlines()[-12:])[-1150:])
         if scale in ('final', 'holdout'):
             from native_images import verify_images
+            if scale=='final':
+                options=[b.name for b in binaries if b.name not in ('base','fin-slabkey-pgo')]
+                if options:
+                    practice_winner=min(options,key=lambda n: (practice_times[n]/practice_times['base'])*(performance[n]/performance['base'])**2)
+                note('Image selection',practice_winner+' by the product of the 20M ratio and the squared first 60M ratio; seed 733 is held out.')
             scales = [('practice',5),('final',3)] if scale=='final' else [('holdout',3)]
             verify_images(root,area,practice_winner,run,note,env,scales)
             if scale=='final':

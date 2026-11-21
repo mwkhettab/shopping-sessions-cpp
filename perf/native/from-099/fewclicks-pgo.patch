@@ -1,0 +1,32 @@
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -220,7 +220,7 @@
+     if (!use_bins)
+       std::sort(events.begin(), events.end(),
+                 [&](auto a, auto b) { return layout.less(a, b); });
+-    std::sort(clicks.begin(), clicks.end(), [](const auto &a, const auto &b) {
++    if(clicks.size()>4)std::sort(clicks.begin(), clicks.end(), [](const auto &a, const auto &b) {
+       return a.ts == b.ts ? b.id.user_less(a.id, 'k') : a.ts < b.ts;
+     });
+   }
+@@ -259,6 +259,20 @@
+     ++daily.sessions;
+     daily.events += count;
+     daily.revenue += revenue;
++    if(clicks.size()<=4) {
++      std::array<int,4> assists;unsigned n=0;
++      const typename Layout::C *best=nullptr;
++      for(const auto &c:clicks) {
++        Time ts=layout.click_time(c);
++        if(ts>start || uint64_t(start)-uint64_t(ts)>uint64_t(reach))continue;
++        if(!best || c.ts>best->ts || (c.ts==best->ts && c.id.user_less(best->id,'k')))best=&c;
++        if(std::find(assists.begin(),assists.begin()+n,c.campaign)==assists.begin()+n)assists[n++]=c.campaign;
++      }
++      auto &credit=result.at(best?best->campaign:0,day);
++      ++credit.sessions;credit.purchases+=revenue!=0;credit.revenue+=revenue;
++      for(unsigned i=0;i<n;++i)++result.at(assists[i],day).assists;
++      return;
++    }
+     {
+       MEASURE(attribution);
+       while (right < clicks.size() &&

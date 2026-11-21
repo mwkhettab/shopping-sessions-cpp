@@ -1,0 +1,194 @@
+--- a/cpp/input.hpp
++++ b/cpp/input.hpp
+@@ -428,54 +428,5 @@
+   }
+ };
+ constexpr size_t shards = 512;
+-template <class F> void parallel(size_t jobs, unsigned threads, F &&f) {
+-  std::atomic<size_t> next{0};
+-  std::exception_ptr error;
+-  std::mutex lock;
+-  std::vector<std::jthread> workers;
+-#ifdef SHOPPING_DIAGNOSTICS
+-  std::vector<metrics::WorkerLoad> loads(std::min<size_t>(threads, jobs));
+-#endif
+-  for (unsigned t = 0; t < std::min<size_t>(threads, jobs); ++t)
+-    workers.emplace_back([&, t] {
+-#ifdef SHOPPING_DIAGNOSTICS
+-      auto &load = loads[t];
+-      const auto start = metrics::now(), cpu = metrics::thread_cpu();
+-#endif
+-      try {
+-        for (size_t i;
+-             (i = next.fetch_add(1, std::memory_order_relaxed)) < jobs;) {
+-          f(i, t);
+-#ifdef SHOPPING_DIAGNOSTICS
+-          ++load.jobs;
+-#endif
+-        }
+-      } catch (...) {
+-        std::lock_guard guard(lock);
+-        error = std::current_exception();
+-        next.store(jobs);
+-      }
+-#ifdef SHOPPING_DIAGNOSTICS
+-      load.elapsed = metrics::now() - start;
+-      load.cpu = metrics::thread_cpu() - cpu;
+-#endif
+-    });
+-  workers.clear();
+-#ifdef SHOPPING_DIAGNOSTICS
+-  if (!loads.empty()) {
+-    double min_s = 1e100, max_s = 0, cpu_s = 0;
+-    size_t min_jobs = jobs, max_jobs = 0;
+-    for (auto &l : loads) {
+-      min_s = std::min(min_s, l.elapsed * 1e-9);
+-      max_s = std::max(max_s, l.elapsed * 1e-9);
+-      cpu_s += l.cpu * 1e-9;
+-      min_jobs = std::min(min_jobs, l.jobs);
+-      max_jobs = std::max(max_jobs, l.jobs);
+-    }
+-    std::cerr << "worker jobs " << min_jobs << ".." << max_jobs << ", active "
+-              << min_s << ".." << max_s << " s, CPU " << cpu_s << " s\n";
+-  }
+-#endif
+-  if (error)
+-    std::rethrow_exception(error);
+-}
++#define SHOPPING_PIN_WORKERS 1
++#include "worker_team.hpp"
+--- /dev/null
++++ b/cpp/worker_team.hpp
+@@ -0,0 +1,132 @@
++#pragma once
++#include <condition_variable>
++#if defined(__linux__) && defined(SHOPPING_PIN_WORKERS)
++#include <sched.h>
++#endif
++
++class WorkerTeam {
++  struct Job {
++    size_t count, batch;
++    void *closure;
++    void (*apply)(void *,size_t,unsigned);
++    alignas(64) std::atomic<size_t> next{0};
++    std::exception_ptr error;
++    std::mutex error_lock;
++#ifdef SHOPPING_DIAGNOSTICS
++    std::vector<metrics::WorkerLoad> loads;
++#endif
++    void consume(unsigned worker) {
++#ifdef SHOPPING_DIAGNOSTICS
++      auto &load=loads[worker];auto start=metrics::now(),cpu=metrics::thread_cpu();
++#endif
++      try {
++        for (;;) {
++          size_t first=next.fetch_add(batch,std::memory_order_relaxed);
++          if(first>=count)break;
++          for(size_t i=first;i<first+std::min(batch,count-first);++i){
++            apply(closure,i,worker);
++#ifdef SHOPPING_DIAGNOSTICS
++            ++load.jobs;
++#endif
++          }
++        }
++      } catch (...) {
++        std::lock_guard lock(error_lock);
++        error=std::current_exception();
++        next.store(count,std::memory_order_relaxed);
++      }
++#ifdef SHOPPING_DIAGNOSTICS
++      load.elapsed=metrics::now()-start;load.cpu=metrics::thread_cpu()-cpu;
++#endif
++    }
++  };
++  std::mutex state;
++  std::condition_variable ready,finished;
++  Job *current{};
++  size_t generation{}, remaining{};
++  bool closing{};
++  std::vector<std::jthread> workers;
++#if defined(__linux__) && defined(SHOPPING_PIN_WORKERS)
++  cpu_set_t original{};
++  std::vector<unsigned> cpus;
++  void bind(unsigned i) {
++    if(i>=cpus.size())return;
++    cpu_set_t mask;CPU_ZERO(&mask);CPU_SET(cpus[i],&mask);
++    sched_setaffinity(0,sizeof mask,&mask);
++  }
++  void restore(){if(!cpus.empty())sched_setaffinity(0,sizeof original,&original);}
++#else
++  void bind(unsigned){}
++  void restore(){}
++#endif
++  void work(unsigned i) {
++    bind(i);
++    size_t observed=0;
++    for(;;) {
++      Job *job;
++      {
++        std::unique_lock lock(state);
++        ready.wait(lock,[&]{return closing || generation!=observed;});
++        if(closing)return;
++        job=current;observed=generation;
++      }
++      job->consume(i);
++      {
++        std::lock_guard lock(state);
++        if(!--remaining)finished.notify_one();
++      }
++    }
++  }
++  void stop(){
++    {std::lock_guard lock(state);closing=true;}
++    ready.notify_all();
++    workers.clear();
++  }
++public:
++  explicit WorkerTeam(unsigned threads) {
++#if defined(__linux__) && defined(SHOPPING_PIN_WORKERS)
++    if(sched_getaffinity(0,sizeof original,&original)==0){
++      for(unsigned cpu=0;cpu<CPU_SETSIZE;++cpu)if(CPU_ISSET(cpu,&original))cpus.push_back(cpu);
++      if(cpus.size()<threads)cpus.clear();
++    }
++#endif
++    try { for(unsigned i=1;i<threads;++i) workers.emplace_back([this,i]{work(i);}); }
++    catch(...){stop();throw;}
++  }
++  ~WorkerTeam(){stop();}
++  unsigned size() const {return unsigned(workers.size()+1);}
++  template<class F> void run(size_t count,F &f) {
++#ifdef SHOPPING_BATCH_JOBS
++    size_t batch=count>=128*size()?4:1;
++#else
++    size_t batch=1;
++#endif
++    Job job{count,batch,&f,[](void *arg,size_t i,unsigned t){(*static_cast<F*>(arg))(i,t);},{},nullptr,{}
++#ifdef SHOPPING_DIAGNOSTICS
++      ,std::vector<metrics::WorkerLoad>(size())
++#endif
++    };
++    {
++      std::lock_guard lock(state);current=&job;remaining=workers.size();++generation;
++    }
++    ready.notify_all();
++    bind(0);job.consume(0);restore();
++    {std::unique_lock lock(state);finished.wait(lock,[&]{return !remaining;});current=nullptr;}
++    if(job.error)std::rethrow_exception(job.error);
++#ifdef SHOPPING_DIAGNOSTICS
++    double min_s=1e100,max_s=0,cpu=0;size_t min_jobs=count,max_jobs=0;
++    for(auto &l:job.loads){min_s=std::min(min_s,l.elapsed*1e-9);max_s=std::max(max_s,l.elapsed*1e-9);cpu+=l.cpu*1e-9;min_jobs=std::min(min_jobs,l.jobs);max_jobs=std::max(max_jobs,l.jobs);}
++    std::cerr<<"worker jobs "<<min_jobs<<".."<<max_jobs<<", active "<<min_s<<".."<<max_s<<" s, CPU "<<cpu<<" s\n";
++#endif
++  }
++};
++inline WorkerTeam &team_for(unsigned workers) {
++  static thread_local std::unique_ptr<WorkerTeam> team;
++  if(!team || team->size()!=workers)team=std::make_unique<WorkerTeam>(workers);
++  return *team;
++}
++template<class F>void parallel(size_t jobs,unsigned workers,F &&f){
++  if(!jobs)return;
++  if(jobs==1 || workers==1){for(size_t i=0;i<jobs;++i)f(i,0);return;}
++  team_for(workers).run(jobs,f);
++}

@@ -1,0 +1,248 @@
+--- /dev/null
++++ b/cpp/click_ranges.hpp
+@@ -0,0 +1,188 @@
++#pragma once
++#include "session_bins.hpp"
++// Sessions are already chronological. Each click can affect a single interval
++// of session indices. The first eligible session suffices to order winners.
++struct ClickRanges {
++  struct Start {
++    Time time;
++    int32_t day;
++    int64_t revenue;
++    size_t intervals{}, next_day{};
++    Time best = bad;
++    Key click{};
++    int campaign{};
++  };
++  struct Interval {
++    int campaign;
++    size_t end, previous;
++  };
++  std::vector<Start> starts;
++  std::vector<Interval> intervals;
++  struct DayMask {int32_t day;uint16_t word;size_t bits;};
++  std::vector<DayMask> days;
++  std::vector<size_t> campaign_masks;
++  std::vector<uint16_t> next_start;
++
++  template <class Click, class Result, class Layout>
++  void attribute(std::span<Click> clicks, Result &result, Layout layout) {
++    if (starts.empty())
++      return;
++    auto offer = [](Start &s, Time ts, const Click &c) {
++      if (ts > s.best || (ts == s.best && c.id.user_less(s.click, 'k'))) {
++        s.best = ts;
++        s.click = c.id;
++        s.campaign = c.campaign;
++      }
++    };
++    auto credit = [&](const Start &s, int campaign) {
++      auto &v = result.at(campaign, s.day);
++      ++v.sessions;
++      v.purchases += s.revenue != 0;
++      v.revenue += s.revenue;
++    };
++    if (starts.size() == 1) {
++      auto &s = starts.front();
++      for (auto &c : clicks) {
++        Time ts = layout.click_time(c);
++        if (ts < s.time - reach || ts > s.time)
++          continue;
++        offer(s, ts, c);
++        auto &seen = result.activity[c.campaign].count;
++        if (!seen) {
++          seen = 1;
++          result.active.push_back(c.campaign);
++          ++result.at(c.campaign, s.day).assists;
++        }
++      }
++      credit(s, s.campaign);
++      starts.clear();
++      return;
++    }
++    {
++      constexpr size_t bit_width=sizeof(size_t)*8;
++      const size_t sessions=starts.size();
++      const size_t words=(sessions+bit_width-1)/bit_width;
++      // Bound simultaneous campaign masks. The interval fallback grows with
++      // the number of actual clicks even for unbounded campaign catalogs.
++      if(sessions<=4096 && words<=262144/std::max<size_t>(1,std::min(clicks.size(),result.campaigns))) {
++        const Time origin=starts.front().time,last_time=starts.back().time;
++        const uint64_t buckets=(uint64_t(last_time)-uint64_t(origin))/session_gap+1;
++        bool indexed=false;
++#ifdef SHOPPING_SESSION_INDEX
++        indexed=buckets<=8192 && sessions>=4 && clicks.size()>std::max<uint64_t>(96,buckets/2);
++#endif
++        if(indexed) {
++          next_start.resize(buckets);
++          size_t j=0;
++          for(size_t b=0;b<buckets;++b) {
++            Time boundary=origin+Time(b*session_gap);
++            while(j<sessions && starts[j].time<boundary)++j;
++            next_start[b]=uint16_t(j);
++          }
++        }
++        auto lower=[&](Time t)->size_t {
++          if(t<=origin)return 0;
++          if(t>last_time)return sessions;
++          if(indexed) {
++            size_t i=next_start[(uint64_t(t)-uint64_t(origin))/session_gap];
++            return i+size_t(starts[i].time<t);
++          }
++          return size_t(std::lower_bound(starts.begin(),starts.end(),t,[](const Start &s,Time t){return s.time<t;})-starts.begin());
++        };
++        auto low=[](size_t n)->size_t{return n==bit_width ? SIZE_MAX : (size_t{1}<<n)-1;};
++        campaign_masks.clear();
++        for(const auto &c:clicks) {
++          Time t=layout.click_time(c);
++          size_t first=lower(t);
++          if(first==sessions || uint64_t(starts[first].time)-uint64_t(t)>uint64_t(reach))continue;
++          Time edge=t>INT64_MAX-reach ? INT64_MAX : t+reach;
++          size_t end=lower(edge);
++          if(end!=sessions && starts[end].time==edge)++end;
++          offer(starts[first],t,c);
++          size_t &entry=result.activity[c.campaign].count;
++          if(!entry) {
++            result.active.push_back(c.campaign);
++            if(words!=1) {entry=campaign_masks.size()+1;campaign_masks.resize(campaign_masks.size()+words);}
++          }
++          size_t *m=words==1? &entry : campaign_masks.data()+entry-1;
++          size_t a=first/bit_width,b=(end-1)/bit_width;
++          auto lo_mask=~low(first%bit_width),hi_mask=low((end-1)%bit_width+1);
++          if(a==b) m[a]|=lo_mask&hi_mask;
++          else {
++            m[a]|=lo_mask;
++            for(size_t j=a+1;j<b;++j)m[j]=SIZE_MAX;
++            m[b]|=hi_mask;
++          }
++        }
++        int winning=0;Time latest=bad;
++        days.clear();
++        for(size_t i=0;i<sessions;++i) {
++          auto &s=starts[i];
++          if(s.best!=bad){latest=s.best;winning=s.campaign;}
++          credit(s,latest>=s.time-reach?winning:0);
++          size_t word=i/bit_width;
++          if(days.empty() || days.back().day!=s.day || days.back().word!=word)days.push_back({s.day,uint16_t(word),0});
++          days.back().bits|=size_t{1}<<(i%bit_width);
++        }
++        for(int campaign:result.active) {
++          size_t &entry=result.activity[campaign].count;
++          auto *m=words==1?&entry:campaign_masks.data()+entry-1;
++          for(auto &d:days) {
++            auto present=m[d.word]&d.bits;
++            if(present) result.at(campaign,d.day).assists+=std::popcount(present);
++          }
++        }
++        starts.clear();
++        return;
++      }
++    }
++    for (size_t i = starts.size(); i-- > 0;)
++      starts[i].next_day =
++          i + 1 < starts.size() && starts[i].day == starts[i + 1].day
++              ? starts[i + 1].next_day
++              : i + 1;
++    for (auto &c : clicks) {
++      Time ts = layout.click_time(c);
++      auto first =
++          std::lower_bound(starts.begin(), starts.end(), ts,
++                           [](const Start &s, Time t) { return s.time < t; });
++      if (first == starts.end() || ts < first->time - reach)
++        continue;
++      auto end =
++          std::upper_bound(first, starts.end(), ts, [](Time t, const Start &s) {
++            return t < s.time - reach;
++          });
++      offer(*first, ts, c);
++      intervals.push_back(
++          {c.campaign, size_t(end - starts.begin()), first->intervals});
++      first->intervals = intervals.size();
++    }
++    int campaign = 0;
++    Time last = bad;
++    for (size_t i = 0; i < starts.size(); ++i) {
++      auto &s = starts[i];
++      if (s.best != bad) {
++        last = s.best;
++        campaign = s.campaign;
++      }
++      credit(s, last >= s.time - reach ? campaign : 0);
++      for (size_t at = s.intervals; at; at = intervals[at - 1].previous) {
++        const auto &interval = intervals[at - 1];
++        auto &covered = result.activity[interval.campaign].count;
++        if (covered >= interval.end)
++          continue;
++        if (!covered)
++          result.active.push_back(interval.campaign);
++        size_t pos = std::max(i, covered);
++        covered = interval.end;
++        while (pos < covered) {
++          size_t next = std::min(covered, starts[pos].next_day);
++          result.at(interval.campaign, starts[pos].day).assists += next - pos;
++          pos = next;
++        }
++      }
++    }
++    starts.clear();
++    intervals.clear();
++  }
++};
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -155,9 +155,11 @@
+ struct ActiveCampaign {
+   size_t count{}, slot{};
+ };
++#include "click_ranges.hpp"
+ #include "session_bins.hpp"
+ struct Result {
+   SessionBins bins;
++  ClickRanges ranges;
+ #ifdef SHOPPING_DIAGNOSTICS
+   size_t people{}, events_seen{}, clicks_seen{}, max_events{}, max_clicks{};
+ #endif
+@@ -214,15 +216,17 @@
+   result.max_events = std::max(result.max_events, events.size());
+   result.max_clicks = std::max(result.max_clicks, clicks.size());
+ #endif
++  const bool use_ranges = clicks.size() >= 24;
+   const bool use_bins = !result.bins.cells.empty() && events.size() >= 32;
+   {
+     MEASURE(sorting);
+     if (!use_bins)
+       std::sort(events.begin(), events.end(),
+                 [&](auto a, auto b) { return layout.less(a, b); });
+-    std::sort(clicks.begin(), clicks.end(), [](const auto &a, const auto &b) {
+-      return a.ts == b.ts ? b.id.user_less(a.id, 'k') : a.ts < b.ts;
+-    });
++    if (!use_ranges)
++      std::sort(clicks.begin(), clicks.end(), [](const auto &a, const auto &b) {
++        return a.ts == b.ts ? b.id.user_less(a.id, 'k') : a.ts < b.ts;
++      });
+   }
+   size_t left = 0, right = 0;
+   UserDay daily{user, 0, 0, 0, 0, {}};
+@@ -259,6 +263,10 @@
+     ++daily.sessions;
+     daily.events += count;
+     daily.revenue += revenue;
++    if (use_ranges) {
++      result.ranges.starts.push_back({start, day, revenue});
++      return;
++    }
+     {
+       MEASURE(attribution);
+       while (right < clicks.size() &&
+@@ -315,6 +323,10 @@
+     }
+   }
+   finish_day();
++  if (use_ranges) {
++    MEASURE(attribution);
++    result.ranges.attribute(clicks, result, layout);
++  }
+   for (int campaign : result.active)
+     result.activity[campaign].count = 0;
+   result.active.clear();

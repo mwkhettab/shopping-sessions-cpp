@@ -1,0 +1,114 @@
+--- a/cpp/input.hpp
++++ b/cpp/input.hpp
+@@ -147,8 +147,10 @@
+ #endif
+ #include "csv_x86.hpp"
+ #include "line_csv.hpp"
++#include "packed_csv.hpp"
+ template <size_t N, class F> void parse_rows(Str data, F &&callback) {
+ #ifdef SHOPPING_X86_CSV
++  if (packed_csv_supported()) { packed_csv_rows<N>(data,callback); return; }
+   if (wide_csv_supported()) { line_csv_rows<N>(data,callback); return; }
+   if (wide_csv_supported()) {
+     wide_csv_rows<N>(data, callback);
+--- /dev/null
++++ b/cpp/packed_csv.hpp
+@@ -0,0 +1,98 @@
++#pragma once
++#ifdef SHOPPING_X86_CSV
++
++struct PackedFields {
++  const char *base;
++  std::array<unsigned char, 8> first, last;
++  template<size_t N> operator std::array<Str,N>() const {
++    std::array<Str,N> fields;
++    for(size_t i=0;i<N;++i) fields[i]=(*this)[i];
++    return fields;
++  }
++  Str operator[](size_t i) const {
++    return {base + first[i], size_t(last[i] - first[i])};
++  }
++};
++
++inline bool packed_csv_supported() {
++  return wide_csv_supported() && __builtin_cpu_supports("avx512bw") &&
++         __builtin_cpu_supports("avx512vbmi") && __builtin_cpu_supports("avx512vbmi2");
++}
++
++__attribute__((target("avx512f,avx512bw,avx512vbmi,avx512vbmi2"),always_inline))
++inline uint64_t delimiter_positions(__mmask64 separators, __m512i positions) {
++  auto selected = _mm512_maskz_compress_epi8(separators, positions);
++  return uint64_t(_mm_cvtsi128_si64(_mm512_castsi512_si128(selected)));
++}
++
++template <size_t N, class F>
++__attribute__((target("avx2,bmi,popcnt,avx512f,avx512bw,avx512vbmi,avx512vbmi2")))
++void packed_csv_rows(Str data, F &callback) {
++  static_assert(N <= 8);
++  alignas(64) static constexpr auto indices = []{
++    std::array<unsigned char,64> a{};
++    for (unsigned i=0;i<a.size();++i) a[i]=static_cast<unsigned char>(i);
++    return a;
++  }();
++  const auto low_positions=_mm512_load_si512(indices.data());
++  const auto high_positions=_mm512_add_epi8(low_positions,_mm512_set1_epi8(64));
++  while(data.size()>=128) {
++    const auto *p=data.data();
++    __m512i lo=_mm512_loadu_si512(p);
++    __m512i hi=_mm512_setzero_si512();
++    uint64_t low_lfs=_mm512_cmpeq_epi8_mask(lo,_mm512_set1_epi8('\n'));
++    uint64_t low_commas=_mm512_cmpeq_epi8_mask(lo,_mm512_set1_epi8(','));
++    uint64_t low_quotes=_mm512_cmpeq_epi8_mask(lo,_mm512_set1_epi8('"'));
++    uint64_t high_marks=0,high_quotes=0,low_marks;
++    unsigned end;
++    if(low_lfs) {
++      uint64_t last=low_lfs&-low_lfs;
++      end=std::countr_zero(last);
++      low_marks=(low_commas&(last-1))|last;
++      low_quotes&=last-1;
++    } else {
++      hi=_mm512_loadu_si512(p+64);
++      uint64_t newlines=_mm512_cmpeq_epi8_mask(hi,_mm512_set1_epi8('\n'));
++      if(!newlines) {
++        size_t lf=data.find('\n',128);
++        size_t bytes=lf==Str::npos ? data.size() : lf+1;
++        wide_csv_rows<N>(data.substr(0,bytes),callback);
++        data.remove_prefix(bytes);
++        continue;
++      }
++      uint64_t last=newlines&-newlines;
++      end=64+std::countr_zero(last);
++      low_marks=low_commas;
++      high_marks=(_mm512_cmpeq_epi8_mask(hi,_mm512_set1_epi8(','))&(last-1))|last;
++      high_quotes=_mm512_cmpeq_epi8_mask(hi,_mm512_set1_epi8('"'))&(last-1);
++    }
++    data.remove_prefix(end+1);
++    unsigned n_low=std::popcount(low_marks);
++    if(n_low+std::popcount(high_marks)!=N) continue;
++    uint64_t cuts=delimiter_positions(low_marks,low_positions);
++    if(high_marks) cuts|=delimiter_positions(high_marks,high_positions)<<(n_low*8);
++    uint64_t starts=(cuts<<8)+0x0101010101010100ULL;
++    __m128i begin=_mm_cvtsi64_si128(starts),finish=_mm_cvtsi64_si128(cuts);
++    if(low_quotes|high_quotes) {
++      // Gather the first and last byte of all fields together. Empty and
++      // one-byte fields cannot contribute a syntactic pair of quotes.
++      auto before=_mm_sub_epi8(finish,_mm_set1_epi8(1));
++      auto fronts=_mm512_permutex2var_epi8(lo,_mm512_castsi128_si512(begin),hi);
++      auto backs=_mm512_permutex2var_epi8(lo,_mm512_castsi128_si512(before),hi);
++      unsigned wrapped=unsigned(_mm512_cmpeq_epi8_mask(fronts,_mm512_set1_epi8('"'))) &
++                       unsigned(_mm512_cmpeq_epi8_mask(backs,_mm512_set1_epi8('"')));
++      auto lengths=_mm_sub_epi8(finish,begin);
++      wrapped &= unsigned(_mm_movemask_epi8(_mm_cmpgt_epi8(lengths,_mm_set1_epi8(1)))) & ((1u<<N)-1);
++      if(2*std::popcount(wrapped)!=std::popcount(low_quotes)+std::popcount(high_quotes)) continue;
++      auto trim=_mm512_castsi512_si128(_mm512_maskz_set1_epi8(wrapped,1));
++      begin=_mm_add_epi8(begin,trim);
++      finish=_mm_sub_epi8(finish,trim);
++    }
++    PackedFields fields{p,{},{}};
++    _mm_storel_epi64(reinterpret_cast<__m128i*>(fields.first.data()),begin);
++    _mm_storel_epi64(reinterpret_cast<__m128i*>(fields.last.data()),finish);
++    callback(fields);
++  }
++  line_csv_rows<N>(data,callback);
++}
++#endif

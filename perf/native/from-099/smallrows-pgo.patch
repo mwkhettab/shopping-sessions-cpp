@@ -1,0 +1,145 @@
+--- a/cpp/event_layout.hpp
++++ b/cpp/event_layout.hpp
+@@ -12,7 +12,8 @@
+     int campaign;
+   };
+ 
+-  E pack(Event raw) const { return raw; }
++  using Raw=std::pair<Key,E>;
++  E pack(Event raw, unsigned) const { return raw; }
+   Event unpack(E e) const { return e; }
+   Time time(E e) const { return e.ts; }
+   Time click_time(C c) const { return c.ts; }
+@@ -30,7 +31,8 @@
+     int campaign;
+   };
+   Time origin;
+-  E pack(Event raw) const {
++  using Raw=std::pair<Key,E>;
++  E pack(Event raw, unsigned) const {
+     return ((uint64_t(raw.ts) - uint64_t(origin)) << 32) |
+            (uint64_t(uint32_t(raw.price)) << 8) | uint32_t(raw.category);
+   }
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -8,6 +8,8 @@
+ 
+ size_t bucket(Key k) { return k.hash() % shards; }
+ #include "event_layout.hpp"
++#define SHOPPING_PACK_RAW 1
++#include "narrow_events.hpp"
+ struct RevisionIndex {
+   Key id;
+   uint32_t ingest, location;
+@@ -26,7 +28,7 @@
+   using Candidate = RevisionIndex;
+   std::vector<ExtendedRevision> extended;
+   PartitionSlab<Candidate> candidates;
+-  PartitionSlab<std::pair<Key, EventData>> events;
++  PartitionSlab<typename Layout::Raw> events;
+   PartitionSlab<std::pair<Key, ClickData>> clicks;
+   struct Vertex {
+     Key name;
+@@ -668,7 +670,7 @@
+   };
+   auto rev_hint = hint(event_count, sizeof(Candidate), size_t(1536) << 20);
+   auto event_hint =
+-      hint(event_count, sizeof(std::pair<Key, typename Layout::E>),
++      hint(event_count, sizeof(typename Layout::Raw),
+            size_t(1536) << 20);
+   auto click_hint =
+       hint(click_count, sizeof(std::pair<Key, typename Layout::C>),
+@@ -733,7 +735,7 @@
+             size_t b = user.hash() % shards;
+             auto &rows = w.events[b];
+             location = uint64_t(rows.size()) * shards + b + 1;
+-            rows.emplace_back(Key{user.bits}, layout.pack(e));
++            rows.emplace_back(Key{user.bits}, layout.pack(e,t));
+           }
+           Time seconds = ingest / 1000;
+           Time relative = seconds - anchor;
+@@ -819,6 +821,19 @@
+   Window window(input.map(data / "manifest.json"));
+   Catalog cat(input, data);
+   uint64_t width = uint64_t(window.end) - uint64_t(window.start);
++  if (width<=ShortEventLayout::purchase_flag && cat.categories.size()<=256) {
++    try {
++      Input event_input;
++      std::vector<std::vector<ShortEventLayout::Purchase>> purchases(threads);
++      unsigned bits=std::bit_width(threads-1);
++      run_layout(data,output,threads,event_input,window,cat,timer,
++                 ShortEventLayout{window.start,purchases,bits,(1u<<bits)-1});
++      return;
++    } catch(const PurchaseIndexLimit &) {
++      // The input-stage worker pool joined and released all storage before
++      // retrying the wider representation. Output starts after that stage.
++    }
++  }
+   if (width <= UINT32_MAX - uint64_t(reach) && cat.categories.size() <= 256)
+     run_layout(data, output, threads, input, window, cat, timer,
+                WordLayout{window.start});
+--- /dev/null
++++ b/cpp/narrow_events.hpp
+@@ -0,0 +1,62 @@
++#pragma once
++struct PurchaseIndexLimit {};
++
++// The ordinary 31-bit value is the exact millisecond offset. Purchases refer
++// to append-only arrays owned by the reading worker and frozen before grouping.
++struct ShortEventLayout {
++  using E=uint32_t;
++  using C=WordLayout::C;
++  struct Purchase {uint32_t time,details;};
++  struct PackedBits {
++    std::array<uint32_t,2> words;
++    PackedBits()=default;
++    PackedBits(uintptr_t n){*this=n;}
++    PackedBits &operator=(uintptr_t n) {
++      uint64_t v=n;std::memcpy(words.data(),&v,sizeof v);return *this;
++    }
++    operator uintptr_t() const {
++      uint64_t v;std::memcpy(&v,words.data(),sizeof v);return uintptr_t(v);
++    }
++  };
++  struct StoredKey {PackedBits bits;};
++  struct RawRecord {
++    StoredKey first;
++    E second;
++    RawRecord(Key k,E value):first{k.bits},second(value){}
++  };
++#ifdef SHOPPING_PACK_RAW
++  using Raw=RawRecord;
++#else
++  using Raw=std::pair<Key,E>;
++#endif
++  static_assert(sizeof(RawRecord)==12);
++  static constexpr uint32_t purchase_flag=uint32_t{1}<<31;
++  Time origin;
++  std::span<std::vector<Purchase>> purchases;
++  unsigned owner_bits,mask;
++
++  E pack(Event raw,unsigned worker) const {
++    uint32_t t=uint32_t(uint64_t(raw.ts)-uint64_t(origin));
++    if(!raw.price)return t;
++    auto &out=purchases[worker];
++    if(out.size()>((purchase_flag-1)>>owner_bits))throw PurchaseIndexLimit{};
++    uint32_t index=uint32_t(out.size());
++    out.push_back({t,(uint32_t(raw.price)<<8)|uint32_t(raw.category)});
++    return purchase_flag | (index<<owner_bits) | worker;
++  }
++  const Purchase &purchase(E e) const {
++    return purchases[e&mask][(e & ~purchase_flag)>>owner_bits];
++  }
++  uint32_t offset(E e) const {return e&purchase_flag?purchase(e).time:e;}
++  Time time(E e) const{return origin+offset(e);}
++  Event unpack(E e) const {
++    if(!(e&purchase_flag)) return {origin+e,0,0};
++    const auto &p=purchase(e);
++    return {origin+p.time,int32_t(p.details>>8),int32_t(p.details&255)};
++  }
++  bool less(E a,E b) const{return offset(a)<offset(b);}
++  Time click_time(C c) const{return origin-reach+Time(c.ts);}
++  C click(Key id,Time ts,int campaign) const {
++    return {id,uint32_t(uint64_t(ts)-uint64_t(origin)+reach),campaign};
++  }
++};

@@ -1,1 +1,1 @@
-base fin-slabkey-pgo hotbins2-pgo hotbins16-pgo freqalias-pgo freqbins-pgo rawclock-pgo cutoffclock-pgo civilclock-pgo vecdecimal-pgo civilvec-pgo
+base fin-slabkey-pgo short1-pgo short4-pgo short8-pgo fewclicks-pgo bitassists-pgo indexassists-pgo allassists-pgo indirect32-pgo smallrows-pgo packedrows-pgo teampin-pgo
