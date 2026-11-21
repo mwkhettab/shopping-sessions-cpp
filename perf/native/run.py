@@ -2,6 +2,7 @@
 import json
 import os
 import platform
+import pwd
 import shutil
 import statistics
 import subprocess
@@ -50,6 +51,8 @@ def main():
             wrapper.write_text(f'#!/bin/sh\nexec {compiler} -march={arch} "$@"\n')
             wrapper.chmod(0o755)
             compiler=str(wrapper)
+        if (src/'cpp/flat_parquet.hpp').exists():
+            shutil.copy2(root/'perf/native/standalone-build.sh',src/'build.sh')
         run('sh','build.sh',cwd=src,extra={'CXX':compiler,'PYTHON':python})
         binary=area/'bin'/name
         shutil.copy2(src/'build/shopping',binary)
@@ -64,7 +67,7 @@ def main():
         with tempfile.TemporaryDirectory(dir=area) as temp:
             try:
                 probe=subprocess.run(['sudo','-n','perf','stat','-e','cycles,instructions,cache-misses,dTLB-load-misses,branch-misses',
-                    str(area/'bin/base'),str(area/'dev'),temp],text=True,capture_output=True,timeout=25,env=env)
+                    'runuser','-u',pwd.getpwuid(os.getuid()).pw_name,'--',str(area/'bin/base'),str(area/'dev'),temp],text=True,capture_output=True,timeout=25,env=env)
                 note('PMU',probe.stderr.strip()[-650:].replace('\n',' '))
             except (OSError,subprocess.TimeoutExpired) as error: note('PMU',str(error))
     for mode in ('read','lex'):
@@ -120,9 +123,37 @@ def main():
                         phases.setdefault(key,[]).append(float(value))
             note(scale+' '+b.name,f'median {statistics.median(times):.4f} s, runs {times}, peak {max(r["peak_mib"] for r in rows):.0f} MiB, user {statistics.median(r["user_s"] for r in rows):.2f} s. '+str({k:round(statistics.median(v),3) for k,v in phases.items()}))
 
+        best=min((b for b in binaries if b!=binary0),key=lambda b:performance[b.name])
+        # Request eviction only for this job's generated CSVs and record the
+        # actual residency before the executable starts.
+        for b in [binary0,best]:
+            os.sync()
+            for csv in data.rglob('*.csv'):
+                with csv.open('rb') as stream:
+                    os.posix_fadvise(stream.fileno(),0,0,os.POSIX_FADV_DONTNEED)
+            cold=outcomes/(scale+'-cold-'+b.name+'.jsonl')
+            run(python,root/'perf/measure.py',data,b,'--runs','1','--warmup','0','--residency','--profile','--output-parent',area,'--log',cold)
+            rec=json.loads(cold.read_text())
+            note('Eviction '+scale+' '+b.name,f"{rec['wall_s']:.3f} s, starting residency {rec['resident_before']:.3f}, major faults {rec['major']}, input blocks {rec['inblock']}.")
+        if scale=='practice':
+            src=area/best.name
+            run('sh','build.sh',cwd=src,extra={'CXX':shutil.which('g++-12'),'PYTHON':python,'DIAGNOSTICS':'1'})
+            with tempfile.TemporaryDirectory(dir=area) as temp:
+                proc=subprocess.run([src/'build/shopping-profile',data,temp],env=env|{'PROFILE':'1'},capture_output=True,text=True,check=True)
+                (outcomes/'profile.txt').write_text(proc.stderr)
+                note('Profile '+best.name,' '.join(proc.stderr.splitlines()[-12:])[-1150:])
+        publish()
+
+published=0
+def publish():
+    global published
+    while published<len(notes):
+        payload=' || '.join(notes[published:published+4]).replace('%','%25').replace('\r','%0D').replace('\n','%0A')
+        print(f'::notice file=BENCHMARKS.md,line=1,title=Native results {published+1}::{payload}',flush=True)
+        published+=min(4,len(notes)-published)
 if __name__=='__main__':
     try: main()
-    finally:
-        for i in range(0,len(notes),3):
-            payload=' || '.join(notes[i:i+3]).replace('%','%25').replace('\r','%0D').replace('\n','%0A')
-            print(f'::notice file=BENCHMARKS.md,line=1,title=Native results {i//3+1}::{payload}')
+    except BaseException as exc:
+        note('Failure',repr(exc))
+        raise
+    finally: publish()
