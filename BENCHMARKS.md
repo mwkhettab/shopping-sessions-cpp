@@ -40,6 +40,31 @@ The exact linux/amd64 image repeated the seed-47 comparison against the same log
 
 Component tests also check the complete 1,804-byte inner click loop and its 59 ELF relocations, session state and attribution, union-find, bucket joining, worker ownership, all 32 Parquet key widths and file bytes across three output methods. The large Parquet test produced three files of 1,015,543 bytes each matching the oracle at every offset. Interpreter and emulation checks establish behavior and produce no native performance estimate.
 
+## Runtime and compiler trials
+
+At `b5f19ac6cc222f166ae9581a8cef9b87bb3c4263`, five Docker build arguments make the following experiments reproducible. All default to zero. The combined image sets each to `1`.
+
+| Build argument | Change |
+| --- | --- |
+| `PAIRED_CLICK_SORT` | Classify click lists and sort short lists using pairs of 256-bit vectors on capable CPUs. |
+| `CUSTOM_MEMORY` | Use small overlap-safe vector moves and REP string instructions. Static glibc resolves each entry once using a baseline-ISA resolver. |
+| `INTEL_LAYOUT` | Enable GCC whole-program LTO, Cascade Lake scheduling and 32-byte branch-boundary alignment. |
+| `V4_SIDECAR` | Package a separate x86-64-v4 ELF and select it after a CPU and OS feature check in the baseline executable. |
+| `DIRECT_DICT_LOOPS` | Reduce the values of dictionary keys directly and inline the 16-byte short-string copy when the complete input block is readable. |
+
+The combined linux/amd64 image has local image ID `sha256:8c82f79a929660bfe97636720735e658edf049cbca396641eb07e7048be8331f`. Under Docker Desktop x86 emulation, it passed the memory self-test, 36 fixtures, the additional edge cases and both published 1M tables. Another 54 patterned comparisons matched the qualified release. Both large outputs matched the independent control at every row and key and reproduced all four reference hashes.
+
+| Input | Emulated wall time | Process RSS | Cgroup peak | User-day rows | Campaign-day rows |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 20M events, seed 23 | 10.097 s | 905.1 MiB | 2,743.9 MiB | 2,226,509 | 28,014 |
+| 60M events, seed 47 | 23.801 s | 1,966.2 MiB | 7,168.0 MiB | 6,684,549 | 28,014 |
+
+Both runs used eight guest CPUs, a 7,168 MiB memory cap and disabled swap. The guest ran the baseline executable. The paired-sort tests separately exercised 2,064 guard-page cases, 65,536 masks and 192 mixed user groups in instruction emulation. GCC 12.2 static binaries passed 227,778 guarded memory checks per implementation with and without LTO. Both Parquet writer settings matched the complete byte oracle at four row counts for all three output methods. These checks establish correctness and memory use. The independent Docker runs used different input-cache states. A paired native AVX-512 Linux run is needed to rank the builds.
+
+On Apple Silicon, two executables from the same trial source differed only in `DIRECT_DICT_LOOPS`. Both passed the fixtures, the 1M references and the 20M and 60M independent table comparisons. The 20M trial rotated both with the qualified `faf1047` release for six timed processes per binary after a warmup. Initial page residency was 100% for every observation. The release median was 0.638 s, the trial-source control took 0.651 s and the writer alternative took 0.664 s. The writer won three of six same-round comparisons, with a median paired time ratio of 1.003. This supplies no repeatable full-process improvement on the Mac. The setting stays experimental for the Intel comparisons.
+
+At 60M even the sequential preload left 46.22–52.85% of input pages resident across the completed measurements of all three executables. The seven timed processes each incurred more than 271,000 major faults. The remaining repetitions stopped when free disk fell below 600 MiB. No 60M winner was selected from this partial experiment.
+
 ## Release candidate with two CPU training paths
 
 The release processes eight CSV records together after validating their field boundaries and quote placement. The build trains both the automatically selected reader and the AVX2 reader with generated short and wide inputs. The executable selects its supported instructions at runtime. IDs, timestamps, product presence and purchase fields retain their original validation.
