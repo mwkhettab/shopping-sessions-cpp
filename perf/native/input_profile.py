@@ -20,7 +20,9 @@ def collect(root,area,variant,note,run,env):
             if cycle: times[mode].append(round(elapsed,4))
             if checks.setdefault(mode,sig)!=sig:raise ValueError('non-deterministic input probe')
     for i,values in enumerate(times):
-        note('Input probe '+('field_lengths','semantic_validation','validation_and_keys')[i],f'uninstrumented checksummed scan, median {statistics.median(values):.4f} s, runs {values}, digest {checks[i]}')
+        note('Input probe '+variant+' '+('field_lengths','semantic_validation','validation_and_keys')[i],f'GCC -O3 without PGO, checksummed scan, median {statistics.median(values):.4f} s, runs {values}, digest {checks[i]}')
+    record=area/'results'/('input-probe-'+variant+'.json')
+    record.write_text(json.dumps({'variant':variant,'cycles':times,'digests':checks}))
     if not shutil.which('perf'):return
     with tempfile.TemporaryDirectory(dir=area) as directory:
         directory=Path(directory)
@@ -33,7 +35,7 @@ def collect(root,area,variant,note,run,env):
             note('Native sampling unavailable',p.stderr.strip()[-260:])
             return
         rep=subprocess.run(['sudo','-n','perf','report','--stdio','--no-children','--percent-limit','1','--sort','symbol','-i',profile],capture_output=True,text=True,env=env)
-        (area/'results/cpu-samples.txt').write_text(rep.stdout)
+        (area/'results'/('cpu-samples.txt' if variant=='base' else 'cpu-samples-'+variant+'.txt')).write_text(rep.stdout)
         import re
         top=[line.strip() for line in rep.stdout.splitlines() if re.match(r'^\s*\d+\.\d+%',line)]
-        note('Native CPU samples',' / '.join(line[:155] for line in top[:7]))
+        note('Native CPU samples '+variant,' / '.join(line[:155] for line in top[:7]))

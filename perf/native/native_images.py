@@ -32,6 +32,17 @@ def verify_images(root,area,best,run,note,env,scales):
     shutil.copy2(root/'perf/native/train.py',control/'perf/train.py')
     run('docker','build','--platform','linux/amd64','-t',tags[0],control)
     run('docker','build','--platform','linux/amd64','-t',tags[1],src)
+    labels={tags[0]:'base',tags[1]:best}
+    released=area/'shipreader-pgo'
+    if released.is_dir() and best!='shipreader-pgo':
+        for f in ('build.sh','Dockerfile','.dockerignore'):
+            shutil.copy2(root/'perf/native'/('image-pgo-'+f.lstrip('.')),released/f)
+        (released/'perf').mkdir(exist_ok=True)
+        shutil.copy2(root/'perf/native/train.py',released/'perf/train.py')
+        tags.append('shopping-native:release')
+        labels[tags[-1]]='shipreader-pgo'
+        run('docker','build','--platform','linux/amd64','-t',tags[-1],released)
+
     fingerprint=subprocess.check_output(['docker','run','--rm','--platform','linux/amd64','--entrypoint','sha256sum',tags[1],'/app/shopping'],text=True).split()[0]
     note('Image binary '+best,f'sha256 {fingerprint}')
     fast=subprocess.run(['docker','run','--rm','--platform','linux/amd64','--entrypoint','sha256sum',tags[1],'/app/shopping.opt'],capture_output=True,text=True)
@@ -47,14 +58,15 @@ def verify_images(root,area,best,run,note,env,scales):
             import hashlib
             assert hashlib.sha256(binary.read_bytes()).hexdigest()==fingerprint
             run(os.sys.executable,root/'verify.py',binary,area/'dev','--starter',area/'starter-pyspark','--answer',area/'dev-answer')
-            for suite in ('random_rules.py','interval_oracle.py','page_oracle.py'):
+            for suite in ('random_rules.py','interval_oracle.py','page_oracle.py','prefix_oracle.py'):
                 run(os.sys.executable,root/'perf/native'/suite,binary)
-            note('Docker fixture binary '+best,f'{fingerprint} passed 36 fixtures, published 1M tables and all three independent differential suites.')
+            note('Docker fixture binary '+best,f'{fingerprint} passed 36 fixtures, published 1M tables and all four independent differential suites.')
     for scale,repeats in scales:
         data=area/scale
         totals={tag:[] for tag in tags}
         for round_num in range(-1,repeats):
-            for tag in (tags if round_num%2==0 else tags[::-1]):
+            offset=round_num%len(tags)
+            for tag in tags[offset:]+tags[:offset]:
                 for path in data.rglob('*.csv'):
                     with path.open('rb',buffering=0) as file:
                         block=bytearray(1<<20)
@@ -79,6 +91,9 @@ def verify_images(root,area,best,run,note,env,scales):
                         if round_num>=0: totals[tag].append((*map(float,m.groups()),external))
                         else: run(os.sys.executable,root/'perf/native/compare_large.py',out,area/(scale+'-oracle'))
                     finally: subprocess.run(['sudo','-n','chmod','-R','a+rwX',out,scratch],check=True)
+        if len(tags)==3:
+            pairs=[a[0]/b[0]-1 for a,b in zip(totals[tags[1]],totals[tags[2]])]
+            note('Release image pairs '+scale,f'{best} vs shipreader. {sum(x<0 for x in pairs)}/{len(pairs)} faster and {median(pairs):.2%} median paired change.')
         for tag,obs in totals.items():
-            note('Docker '+scale+' '+(best if tag==tags[1] else 'base'),
+            note('Docker '+scale+' '+labels[tag],
                  f'median {median(x[0] for x in obs):.3f} s, runs {[x[0] for x in obs]}, peak RSS {max(x[1] for x in obs):.1f} MiB, cgroup {max(x[2] for x in obs):.1f} MiB, median including docker run {median(x[3] for x in obs):.3f} s.')

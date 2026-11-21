@@ -1,1 +1,1 @@
-base fin-slabkey-pgo shipreader-pgo colpagelines-pgo releasehot-pgo grid16x32-pgo grid32x64-pgo grid32x32tiles-pgo fusedviews-pgo fusedbounds-pgo boundsreader-pgo fusedallids-pgo indexcuts-pgo indexvbmi-pgo indexoverlap-pgo indexfused-pgo coalescebins-pgo coalescelast-pgo assistday64-pgo assistruns32-pgo
+base fin-slabkey-pgo shipreader-pgo colpagelines-pgo readerintel-pgo quotecmov-pgo cutspecial-pgo cutanchors-pgo hotanchors-pgo ctrlraw-pgo ctrlrev-pgo ctrlboth-pgo ctrlstream-pgo chronobins-pgo chronopack-pgo maskprefix-pgo maskemit-pgo maskcolumn-pgo

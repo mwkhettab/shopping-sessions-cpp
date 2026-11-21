@@ -83,7 +83,7 @@ def main():
             shutil.copytree(root/'tests',localtests,dirs_exist_ok=True)
             run(compiler,'-std=c++20','-O2',str(localtests/'input.cpp'),'-o',unit)
             run(unit)
-            if name.startswith(('index','boundsreader','fused','shipreader')):
+            if name.startswith(('index','boundsreader','fused','shipreader','mask','quotecmov','cut','hotanchors')):
                 run(compiler,'-std=c++20','-O2','-fsanitize=undefined','-fno-sanitize-recover=all',
                     '-I',src/'cpp',root/'perf/native/mutated_rows.cpp','-o',unit)
                 run(unit)
@@ -91,6 +91,7 @@ def main():
             run(python,root/'perf/native/random_rules.py',binary)
             run(python,root/'perf/native/interval_oracle.py',binary)
             run(python,root/'perf/native/page_oracle.py',binary)
+            run(python,root/'perf/native/prefix_oracle.py',binary)
             binaries.append(binary)
         except (subprocess.CalledProcessError,OSError) as exc:
             if name=='base': raise
@@ -230,7 +231,8 @@ def main():
     from population_stats import collect as population_profile
     population_profile(root,area,note,run,env)
     from input_profile import collect
-    collect(root,area,'base',note,run,env)
+    for label in dict.fromkeys(['base','shipreader-pgo',practice_winner]):
+        if (area/'bin'/label).is_file():collect(root,area,label,note,run,env)
     from extra_checks import scaling, race
     scaling(root,area,practice_winner,note,run,env)
     for name in dict.fromkeys([practice_winner, *[b for b in candidates if b.startswith("pipe")]]):

@@ -4,6 +4,7 @@ on:
     branches: [bench/native-x64-trials]
     paths:
       - perf/native/recover-runs.json
+      - perf/native/publish_profile.py
       - .github/workflows/native-report.yml
 permissions:
   actions: read

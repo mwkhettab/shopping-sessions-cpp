@@ -14,11 +14,11 @@ for root in map(Path,sys.argv[1:]):
     # from each runner and aggregate their other conclusions separately.
     for report in sorted(root.rglob('all-notes.json')):
         notes=json.loads(report.read_text())
-        images=[x for x in notes if x.startswith(('Image selection','Image binary','Image optimized binary','Docker fixture binary','Docker practice','Docker final','Docker holdout'))]
+        images=[x for x in notes if x.startswith(('Image selection','Image binary','Image optimized binary','Docker fixture binary','Docker practice','Docker final','Docker holdout','Release image pairs'))]
         if images:emit('Release images '+report.parent.name,' || '.join(images)[:4000])
     for report in sorted(root.rglob('all-notes.json')):
         notes=json.loads(report.read_text())
-        keep=[re.sub(r' {2,}',' ',x) for x in notes if x.startswith(('Release pairs','Population structure','ThreadSanitizer','20M process PMU','Sampled branch-misses','Sampled cache-misses'))]
+        keep=[re.sub(r' {2,}',' ',x) for x in notes if x.startswith(('Release pairs','Population structure','ThreadSanitizer','20M process PMU','Sampled branch-misses','Sampled cache-misses','Input probe'))]
         if keep:emit('Paired comparisons and profiles '+report.parent.name,' || '.join(keep)[:4000])
     for source in root.rglob('source-lines*.txt'):
         folder=source.parent

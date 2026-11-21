@@ -1,1 +1,1 @@
-base fin-slabkey-pgo shipreader-pgo colpagelines-pgo assistday64-pgo coalescelast-pgo @best
+base fin-slabkey-pgo shipreader-pgo colpagelines-pgo cutanchors-pgo chronopack-pgo @best
