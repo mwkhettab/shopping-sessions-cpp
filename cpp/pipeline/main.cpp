@@ -1,6 +1,7 @@
 #include "setup.hpp"
 #include "events.hpp"
 #include "out.hpp"
+#include "diagnostics.hpp"
 #include "generic/mod.hpp"
 #include <exception>
 
@@ -8,6 +9,10 @@ namespace pipeline {
 bool toggle(const char* name,bool fallback) {
     const char* value=std::getenv(name);
     return value?std::string_view(value)=="1":fallback;
+}
+bool enabled_unless_zero(const char* name) {
+    const char* value=std::getenv(name);
+    return !value || std::string_view(value)!="0";
 }
 std::string directory(const char* name,const char* fallback) {
     const char* path=std::getenv(name);
@@ -31,8 +36,10 @@ void check_base36() {
         buf.clear();keyrec::base36_encode(y,buf);
         const auto [v,n]=enc36(y);
         const auto word=__builtin_bswap64(v);
-        if(n!=buf.size() || std::memcmp(buf.data(),&word,n) || (n<8 && (word>>(n*8))%256))
-            sys::fallback("base36 conversion");
+        if(n!=buf.size() || std::memcmp(buf.data(),&word,n) || (n<8 && (word>>(n*8))%256)) {
+            std::fprintf(stderr,"[pipeline] base36 conversion failed for %llu\n",static_cast<unsigned long long>(y));
+            ::_exit(5);
+        }
     }
 }
 void release_final(const G& g,bool force) {
@@ -92,27 +99,32 @@ void report(const G& g,sys::Instant::time_point start) {
     sys::HUGE_PAGES.store(!toggle("XL_NOHUGE",false));sys::detect_pages();
     if(toggle("XL_ALLOC",true)) {sys::alloc_enable();std::pmr::set_default_resource(&sys::region_resource);}
     sys::FIRST_SMALL.store(toggle("XL_FIRST4K",false));sys::PREFAULT.store(toggle("XL_PREFAULT",false));
-    sys::ANON_REGION.store(toggle("XL_ANONR",true));sys::CORE_NOTOUCH.store(toggle("XL_NOTOUCH",true));
+    sys::ANON_REGION.store(enabled_unless_zero("XL_ANONR"));sys::CORE_NOTOUCH.store(enabled_unless_zero("XL_NOTOUCH"));
     sys::SPIN_TICKS.store(events::env_number("XL_SPIN").value_or(SPIN_US_DEFAULT)*2000);
     sys::PIN_AT_START.store(parse::pin_mode()==2 && toggle("XL_PINSTART",false));
     sys::SETUP_KP.store(events::env_number("XL_KP").value_or(0));
-    out::REGION_UNMAP.store(toggle("XL_RGREL",true));sys::SETUP_PARTS.store(toggle("XL_PPARTS",true));
+    out::REGION_UNMAP.store(toggle("XL_RGREL",true));sys::SETUP_PARTS.store(enabled_unless_zero("XL_PPARTS"));
     if(sys::PIN_AT_START.load()) sys::worker_pool().cpus=parse::cpu_order();
     if(toggle("XL_POOL",true)) sys::pool_start(nt);
     parse::NT=toggle("XL_NT",true);parse::RELEASE=toggle("XL_REL",true);parse::PREFETCH=toggle("XL_PF",false);
     sys::RELEASE.store(toggle("XL_FREE",true));
     if(check) check_base36();
+    if(diagnostics::memtest_requested()) {diagnostics::report_memtest();::_exit(0);}
     auto state=setup::setup(data,nt,check);auto& g=*state;
-    sys::lap("setup");sys::run_par(nt,[&](std::size_t tid){parse::stage1(g,tid);});
+    sys::lap("setup");
+    if(diagnostics::sortbench_requested()) ::_exit(diagnostics::sort_bench(g));
+    sys::run_par(nt,[&](std::size_t tid){parse::stage1(g,tid);});
     sys::lap("parse");links::stage2(g);sys::lap("st2sort");events::stage3(g);sys::lap("ev3b");
     const char* overlap=std::getenv("XL_OVL");
     if(!overlap||std::string_view(overlap)!="0") out::stage45(g,output);
     else {complex::stage4(g);sys::lap("complex");out::stage5(g,output);}
-    sys::lap("write");if(timing||check) report(g,start);
+    sys::lap("write");
+    if(timing||check) {report(g,start);diagnostics::remaining_profile(g);}
     const char *end=std::getenv("XL_ENDREL");
     const bool force=end && std::string_view(end)=="2";
     if(force || (sys::SMALLPAGES.load() && toggle("XL_ENDREL",true))) release_final(g,force);
     if(timing) std::fprintf(stderr,"[pipeline] exit %.1f ms\n",std::chrono::duration<double,std::milli>(sys::Instant::now()-start).count());
+    if(diagnostics::debug_requested()) diagnostics::end_memory_report();
     ::_exit(0);
 }
 }
