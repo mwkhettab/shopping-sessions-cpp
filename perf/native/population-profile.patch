@@ -1,0 +1,99 @@
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -156,7 +156,9 @@
+   size_t count{}, slot{};
+ };
+ #include "session_bins.hpp"
++#include "population_structure.hpp"
+ struct Result {
++  PopulationStructure structure;
+   SessionBins bins;
+ #ifdef SHOPPING_DIAGNOSTICS
+   size_t people{}, events_seen{}, clicks_seen{}, max_events{}, max_clicks{};
+@@ -214,6 +216,8 @@
+   result.max_events = std::max(result.max_events, events.size());
+   result.max_clicks = std::max(result.max_clicks, clicks.size());
+ #endif
++  auto &measured=result.structure.record(events,clicks.size(),layout,result.bins.origin,result.bins.cells.size(),true);
++  size_t measured_sessions=0;uint64_t measured_assists=0;
+   const bool use_bins = !result.bins.cells.empty() && events.size() >= 32;
+   {
+     MEASURE(sorting);
+@@ -286,6 +290,7 @@
+     ++counts.sessions;
+     counts.purchases += revenue != 0;
+     counts.revenue += revenue;
++    measured_assists+=result.active.size();++measured_sessions;
+     for (int campaign : result.active)
+       ++result.at(campaign, day).assists;
+   };
+@@ -315,6 +320,9 @@
+     }
+   }
+   finish_day();
++  measured.sessions+=measured_sessions;measured.assists+=measured_assists;
++  auto &hist=result.structure.counts[PopulationStructure::tier(clicks.size())][PopulationStructure::tier(measured_sessions)];
++  ++hist.owners;hist.events+=events.size();hist.clicks+=clicks.size();hist.sessions+=measured_sessions;hist.assists+=measured_assists;
+   for (int campaign : result.active)
+     result.activity[campaign].count = 0;
+   result.active.clear();
+@@ -516,6 +524,7 @@
+                     .subspan(event_offset, g.event_end - event_offset);
+       auto cl = std::span(store.clicks)
+                     .subspan(click_offset, g.click_end - click_offset);
++      results[t].structure.record(ev,cl.size(),layout,results[t].bins.origin,results[t].bins.cells.size(),false);
+       if (g.vertex) {
+         auto &v = nodes[g.vertex - 1];
+         v = {g.key, &v, &v, 1, ev, cl};
+@@ -788,6 +797,7 @@
+         {cat.campaigns[key.first], cat.channels[key.first], key.second, c});
+   write_campaigns(output / "campaign_daily" / "part-0.parquet", campaigns);
+   timer.mark("merge and Parquet output");
++  PopulationStructure::report(results);
+ #ifdef SHOPPING_DIAGNOSTICS
+   size_t revisions = 0, valid = 0, duplicates = 0, clicks_kept = 0, people = 0;
+   size_t events_seen = 0, clicks_seen = 0, max_events = 0, max_clicks = 0;
+--- /dev/null
++++ b/cpp/population_structure.hpp
+@@ -0,0 +1,41 @@
++#pragma once
++struct PopulationStructure {
++  struct Sample {uint64_t owners{},events{},clicks{},bins{},sessions{},assists{};};
++  std::array<Sample,12> raw{},persons{};
++  std::array<std::array<Sample,7>,7> counts{};
++  std::vector<uint64_t> marks;
++  uint64_t generation{};
++  static unsigned tier(size_t n) {
++    if(n<=2)return unsigned(n);
++    if(n<=4)return 3;
++    if(n<=16)return 4;
++    if(n<=128)return 5;
++    return 6;
++  }
++  template<class E,class Layout> Sample &record(std::span<E> ev,size_t clicks,Layout layout,
++       Time origin,size_t capacity,bool person) {
++    auto &out=(person?persons:raw)[std::min<size_t>(11,std::bit_width(ev.size()))];
++    ++out.owners;out.events+=ev.size();out.clicks+=clicks;
++    if(capacity) {
++      if(marks.size()!=capacity)marks.assign(capacity,0);
++      ++generation;
++      for(auto e:ev){size_t i=(uint64_t(layout.time(e))-uint64_t(origin))/session_gap;
++        if(marks.at(i)!=generation){marks[i]=generation;++out.bins;}}
++    }
++    return out;
++  }
++  template<class R> static void report(const std::vector<R> &results) {
++    auto add=[](Sample &a,const Sample &b){a.owners+=b.owners;a.events+=b.events;a.clicks+=b.clicks;a.bins+=b.bins;a.sessions+=b.sessions;a.assists+=b.assists;};
++    auto print=[](Str label,size_t a,size_t b,Sample s){
++      if(s.owners)std::cerr<<label<<" "<<a<<" "<<b<<" "<<s.owners<<" "<<s.events<<" "<<s.clicks<<" "<<s.bins<<" "<<s.sessions<<" "<<s.assists<<"\n";
++    };
++    for(int action=0;action<2;++action)for(unsigned i=0;i<12;++i){
++      Sample s;for(const auto &r:results)add(s,action?r.structure.persons[i]:r.structure.raw[i]);
++      print(action?"personcounts":"rawcounts",i,0,s);
++    }
++    for(unsigned i=0;i<7;++i)for(unsigned j=0;j<7;++j){
++      Sample s;for(const auto &r:results)add(s,r.structure.counts[i][j]);
++      print("clicksessioncounts",i,j,s);
++    }
++  }
++};

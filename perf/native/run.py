@@ -47,6 +47,7 @@ def main():
                 relative=root/'perf/native/from-099'/(name+'.patch')
                 patches=[root/'perf/native/fin-slabkey-pgo.patch',relative] if relative.exists() else [root/f'perf/native/{revision}.patch']
                 for path in patches:
+                    if path.stat().st_size==0: continue
                     with path.open('rb') as patch:
                         subprocess.run(['patch','-s','-p1'],cwd=src,stdin=patch,check=True)
             if name=='base': run('sha256sum','--check',root/'perf/native/official-099.sha256',cwd=src)
@@ -75,6 +76,8 @@ def main():
             run('sh','build.sh',cwd=src,extra={'CXX':compiler,'PYTHON':python,'COMPILER_TRIAL':mode,'PGO':'1' if mode=='pgo' else '0'})
             binary=area/'bin'/name
             shutil.copy2(src/'build/shopping',binary)
+            optimized=src/'build/shopping.opt'
+            if optimized.is_file(): shutil.copy2(optimized,binary.with_name(binary.name+'.opt'))
             unit=area/'bin'/('unit-'+name)
             localtests=src/'tests'
             shutil.copytree(root/'tests',localtests,dirs_exist_ok=True)
@@ -206,6 +209,8 @@ def main():
         publish()
     from line_profile import collect as source_profile
     source_profile(root,area,note,run,env,practice_winner)
+    from population_stats import collect as population_profile
+    population_profile(root,area,note,run,env)
     from input_profile import collect
     collect(root,area,'base',note,run,env)
     from extra_checks import scaling, race

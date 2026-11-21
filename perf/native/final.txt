@@ -1,1 +1,1 @@
-base fin-slabkey-pgo releasehot-pgo colpage-pgo colpagelines-pgo @best
+base fin-slabkey-pgo shipreader-pgo reader12-pgo readercol-pgo @best

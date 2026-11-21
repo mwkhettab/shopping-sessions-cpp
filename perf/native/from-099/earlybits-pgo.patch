@@ -1,0 +1,290 @@
+--- /dev/null
++++ b/cpp/early_winners.hpp
+@@ -0,0 +1,101 @@
++#pragma once
++struct RevisionExclusions {
++  std::vector<uint32_t> offsets;
++#ifdef SHOPPING_LOSER_BITS
++  std::vector<uint64_t> words;
++#endif
++  void finish() {
++#ifdef SHOPPING_LOSER_BITS
++    if(offsets.empty())return;
++    words.resize(*std::max_element(offsets.begin(),offsets.end())/64+1);
++    for(auto offset:offsets)words[offset/64]|=uint64_t{1}<<(offset%64);
++    std::vector<uint32_t>().swap(offsets);
++#else
++    std::sort(offsets.begin(),offsets.end());
++#endif
++  }
++  bool contains(size_t offset,size_t &cursor) const {
++#ifdef SHOPPING_LOSER_BITS
++    (void)cursor;
++    return offset/64<words.size() && ((words[offset/64]>>(offset%64))&1);
++#else
++    while(cursor<offsets.size() && offsets[cursor]<offset)++cursor;
++    return cursor<offsets.size() && offsets[cursor]==offset;
++#endif
++  }
++};
++struct SourceRevision {Key id;uint32_t chunk,offset;};
++inline std::vector<RevisionExclusions> find_exclusions(const std::vector<InputChunk> &chunks,size_t expected,unsigned threads) {
++  if(chunks.size()>UINT32_MAX)throw std::length_error("input chunk count exceeds compact locator");
++  struct Reader {KeyPool keys;PartitionSlab<SourceRevision> by_id;std::vector<uint64_t> losers;};
++  std::vector<Reader> readers(threads);
++  std::vector<Str> bodies(chunks.size());
++  for(auto &r:readers)r.by_id.reserve(std::min<size_t>(expected+expected/8,(size_t(1536)<<20)/sizeof(SourceRevision))/threads/shards);
++  parallel(chunks.size(),threads,[&](size_t chunk,unsigned worker){
++    auto bytes=bodies[chunk]=chunks[chunk].body();
++    if(bytes.empty())return;
++    const char *base=bytes.data(),*p=base,*end=p+bytes.size();
++    auto &r=readers[worker];
++    auto record=[&](const char *line,const char *last) {
++      const char *comma=nullptr;
++#if defined(__SSE2__)
++      if(end-line>=16) {
++        auto chars=_mm_loadu_si128(reinterpret_cast<const __m128i*>(line));
++        unsigned bits=unsigned(_mm_movemask_epi8(_mm_cmpeq_epi8(chars,_mm_set1_epi8(','))));
++        if(bits){auto pos=std::countr_zero(bits);if(last-line>pos)comma=line+pos;else return;}
++      }
++#endif
++      if(!comma)comma=static_cast<const char*>(std::memchr(line,',',size_t(last-line)));
++      if(!comma)return;
++      Str id(line,comma-line);
++      if(id.size()>=2 && id.front()=='"' && id.back()=='"'){id.remove_prefix(1);id.remove_suffix(1);}
++      if(id.empty())return;
++      // The chunk owns only physical lines whose first byte is inside its nominal range.
++      // A final very long line can extend past that range without changing its start.
++      auto key=r.keys.encode(id,'e');
++      r.by_id[bucket(key)].push_back({key,uint32_t(chunk),uint32_t(line-base)});
++    };
++#if defined(__SSE2__)
++    for(auto *q=p;end-q>=16;q+=16){
++      auto chars=_mm_loadu_si128(reinterpret_cast<const __m128i*>(q));
++      unsigned lf=unsigned(_mm_movemask_epi8(_mm_cmpeq_epi8(chars,_mm_set1_epi8('\n'))));
++      while(lf){auto *stop=q+std::countr_zero(lf);record(p,stop);p=stop+1;lf&=lf-1;}
++    }
++#endif
++    while(p<end){auto lf=static_cast<const char*>(std::memchr(p,'\n',end-p));if(!lf){record(p,end);break;}record(p,lf);p=lf+1;}
++  });
++  auto valid_ingest=[&](const SourceRevision &row) -> std::optional<Time> {
++    Str rest=bodies[row.chunk].substr(row.offset);
++    auto lf=rest.find('\n');
++    std::optional<Time> result;
++    scalar_rows<7>(rest.substr(0,lf),[&](const auto &fields){if(!fields[0].empty())result=ingest_time(fields[3]);});
++    return result;
++  };
++  parallel(shards,threads,[&](size_t shard,unsigned worker){
++    size_t count=0;
++    for(auto &r:readers)count+=r.by_id[shard].size();
++    size_t size=std::bit_ceil(std::max<size_t>(2,count+count/2));
++    std::vector<const SourceRevision*> table(size);
++    auto &losers=readers[worker].losers;
++    for(auto &r:readers){
++      for(auto span:r.by_id[shard].spans())for(auto &entry:span){
++        size_t i=(entry.id.hash()/shards)&(size-1);
++        while(table[i] && !(table[i]->id==entry.id))i=(i+1)&(size-1);
++        if(!table[i]){table[i]=&entry;continue;}
++        auto later=valid_ingest(entry);if(!later)continue;
++        auto earlier=valid_ingest(*table[i]);if(!earlier){table[i]=&entry;continue;}
++        const auto *drop=&entry;
++        if(*later<*earlier){drop=table[i];table[i]=&entry;}
++        losers.push_back((uint64_t(drop->chunk)<<32)|drop->offset);
++      }
++    }
++    for(auto &r:readers)r.by_id[shard].release();
++  });
++  std::vector<RevisionExclusions> excluded(chunks.size());
++  for(auto &reader:readers){
++    reader.by_id.release();
++    for(auto code:reader.losers)excluded[code>>32].offsets.push_back(uint32_t(code));
++  }
++  parallel(excluded.size(),threads,[&](size_t i,unsigned){excluded[i].finish();});
++  return excluded;
++}
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -20,12 +20,12 @@
+ };
+ template <class T> using Bins = std::array<std::vector<T>, shards>;
+ #include "partition_slab.hpp"
++#define SHOPPING_LOSER_BITS 1
++#include "early_winners.hpp"
+ template <class Layout> struct ScanWorker {
+   using EventData = typename Layout::E;
+   using ClickData = typename Layout::C;
+   using Candidate = RevisionIndex;
+-  std::vector<ExtendedRevision> extended;
+-  PartitionSlab<Candidate> candidates;
+   PartitionSlab<std::pair<Key, EventData>> events;
+   PartitionSlab<std::pair<Key, ClickData>> clicks;
+   struct Vertex {
+@@ -330,74 +330,6 @@
+     last = now;
+   }
+ };
+-template <class Layout>
+-void resolve_revisions(std::vector<ScanWorker<Layout>> &workers,
+-                       unsigned threads, Time anchor) {
+-  using Candidate = typename ScanWorker<Layout>::Candidate;
+-  parallel(shards, threads, [&](size_t b, [[maybe_unused]] unsigned t) {
+-    size_t count = 0;
+-    for (auto &w : workers)
+-      count += w.candidates[b].size();
+-    // The low hash bits selected this shard. Use the remaining bits
+-    // for open addressing and compare the original bytes on a hash match.
+-    size_t capacity = 1;
+-    while (capacity < count + count / 2)
+-      capacity *= 2;
+-    MEASURE(dedup);
+-    std::vector<uint64_t> best(capacity);
+-    auto seconds = [&](const Candidate &r, unsigned owner) {
+-      return r.ingest & 0x80000000u
+-                 ? workers[owner].extended[r.location].seconds
+-                 : Time(r.ingest) - Time(1u << 30) + anchor;
+-    };
+-    auto discard = [&](const Candidate &r, unsigned owner) {
+-      auto &w = workers[owner];
+-      uint64_t location =
+-          r.ingest & 0x80000000u ? w.extended[r.location].location : r.location;
+-      if (location) {
+-        --location;
+-        w.events[location % shards][location / shards].first.bits = 0;
+-      }
+-    };
+-    for (unsigned owner = 0; owner < workers.size(); ++owner) {
+-      auto &refs = workers[owner].candidates[b];
+-      // Reserve zero for an empty slot. Six low bits identify one of at most
+-      // 64 input workers, and the remaining bits locate its immutable revision.
+-      for (size_t i = 0; i < refs.size(); ++i) {
+-        auto &r = refs[i];
+-        size_t at = (r.id.hash() / shards) & (capacity - 1);
+-        for (;;) {
+-          auto code = best[at];
+-          if (!code) {
+-            best[at] = 1 + (i << 6) + owner;
+-            break;
+-          }
+-          auto old_owner = unsigned((code - 1) & 63);
+-          auto &old = workers[old_owner].candidates[b][(code - 1) >> 6];
+-          if (old.id == r.id) {
+-#ifdef SHOPPING_DIAGNOSTICS
+-            ++workers[t].duplicates;
+-#endif
+-            bool before = (r.ingest | old.ingest) & 0x80000000u
+-                              ? seconds(r, owner) < seconds(old, old_owner)
+-                              : r.ingest < old.ingest;
+-            if (before) {
+-              discard(old, old_owner);
+-              best[at] = 1 + (i << 6) + owner;
+-            } else
+-              discard(r, owner);
+-            break;
+-          }
+-          at = (at + 1) & (capacity - 1);
+-        }
+-      }
+-    }
+-    for (auto &w : workers)
+-      w.candidates[b].release();
+-  });
+-  for (auto &w : workers)
+-    w.candidates.release();
+-}
+ template <class Layout>
+ void process_people(std::vector<ScanWorker<Layout>> &workers,
+                     std::vector<Result> &results, const Catalog &cat,
+@@ -666,7 +598,8 @@
+   auto hint = [&](size_t count, size_t row_bytes, size_t budget) {
+     return std::min(count + count / 8, budget / row_bytes) / threads / shards;
+   };
+-  auto rev_hint = hint(event_count, sizeof(Candidate), size_t(1536) << 20);
++  auto exclusions=find_exclusions(events,event_count,threads);
++  timer.mark("locate duplicate physical rows and select valid earliest revisions");
+   auto event_hint =
+       hint(event_count, sizeof(std::pair<Key, typename Layout::E>),
+            size_t(1536) << 20);
+@@ -674,11 +607,9 @@
+       hint(click_count, sizeof(std::pair<Key, typename Layout::C>),
+            size_t(768) << 20);
+   for (auto &w : workers) {
+-    w.candidates.reserve(rev_hint);
+     w.events.reserve(event_hint);
+     w.clicks.reserve(click_hint);
+   }
+-  const Time anchor = window.start / 1000;
+   parallel(
+       links.size() + events.size() + clicks.size(), threads,
+       [&](size_t job, unsigned t) {
+@@ -715,12 +646,21 @@
+           });
+           return;
+         }
+-        rows<7>(events[job].body(), [&](auto &r) {
++        auto bytes=events[job].body();
++        auto &excluded=exclusions[job];size_t cursor=0;
++        rows<7>(bytes, [&](auto &r) {
+           if (r[0].empty())
+             return;
++          auto offset=size_t(r[0].data()-bytes.data());
++          if(offset && bytes[offset-1]=='"')--offset;
++          if(excluded.contains(offset,cursor)){
++#ifdef SHOPPING_DIAGNOSTICS
++            ++workers[t].duplicates;
++#endif
++            return;
++          }
+           Time ingest = ingest_time(r[3]);
+           // Invalid revisions still take part in earliest-ingest selection.
+-          Key id = workers[t].pool.encode(r[0], 'e');
+           Event e = validate(r, ingest, cat, window);
+ #ifdef SHOPPING_DIAGNOSTICS
+           ++workers[t].revisions;
+@@ -728,46 +668,10 @@
+ #endif
+           Key user = e.ts == bad ? Key{} : workers[t].pool.encode(r[1], 'u');
+           auto &w = workers[t];
+-          uint64_t location = 0;
+-          if (user.bits) {
+-            size_t b = user.hash() % shards;
+-            auto &rows = w.events[b];
+-            location = uint64_t(rows.size()) * shards + b + 1;
+-            rows.emplace_back(Key{user.bits}, layout.pack(e));
+-          }
+-          Time seconds = ingest / 1000;
+-          Time relative = seconds - anchor;
+-          // Bias signed seconds into 31 bits. The high bit selects the overflow
+-          // vector.
+-          uint64_t when = uint64_t(relative) + (uint64_t{1} << 30);
+-          Candidate ref{id, 0, 0};
+-          if (when < 0x80000000ULL && location <= UINT32_MAX) {
+-            ref.ingest = uint32_t(when);
+-            ref.location = uint32_t(location);
+-          } else {
+-            if (w.extended.size() > UINT32_MAX)
+-              throw std::length_error("revision index exhausted");
+-            ref.ingest = 0x80000000u;
+-            ref.location = uint32_t(w.extended.size());
+-            w.extended.push_back({seconds, location});
+-          }
+-          w.candidates[bucket(id)].push_back(ref);
++          if(user.bits)w.events[bucket(user)].emplace_back(user,layout.pack(e));
+         });
+       });
+   timer.mark("concurrent input, raw user partition and revision index");
+-#ifdef SHOPPING_DIAGNOSTICS
+-  size_t revision_count = 0, revision_capacity = 0;
+-  for (const auto &worker : workers)
+-    for (const auto &bin : worker.candidates) {
+-      revision_count += bin.size();
+-      revision_capacity += bin.capacity();
+-    }
+-  std::cerr << "revision storage " << revision_count * sizeof(Candidate)
+-            << " used bytes, " << revision_capacity * sizeof(Candidate)
+-            << " capacity bytes\n";
+-#endif
+-  resolve_revisions(workers, threads, anchor);
+-  timer.mark("global event dedup and loser removal");
+   std::vector<Result> results(threads);
+   for (auto &result : results)
+     result.configure(window, cat, threads);

@@ -1,1 +1,1 @@
-base fin-slabkey-pgo releasehot-pgo colpage-pgo colpagelines-pgo allcolpage-pgo rawcol256-pgo col256-pgo streamhot-pgo releasecampaign-pgo arena4-pgo discover8-pgo typedwidth-pgo prefixlookup-pgo onesweep-pgo fewclick-pgo multrotate-pgo
+base fin-slabkey-pgo reader4-pgo reader12-pgo readerperiod-pgo readerintel-pgo readercol-pgo shipreader-pgo reservelines-pgo densereserve-pgo colpage-pgo earlybits-pgo coldpaths-pgo inlinecheck-pgo dualv3-pgo dualv4-pgo serialtrain-pgo eighttrain-pgo

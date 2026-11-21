@@ -1,0 +1,73 @@
+--- a/cpp/input.hpp
++++ b/cpp/input.hpp
+@@ -408,6 +408,11 @@
+ };
+ struct KeyPool {
+   std::deque<BorrowedKey> other;
++  [[gnu::noinline]] Key borrowed(Str s) {
++    other.push_back({s,std::hash<Str>{}(s)});
++    static_assert(alignof(Str) >= 4);
++    return {reinterpret_cast<uintptr_t>(&other.back()) | 1};
++  }
+   Key encode(Str s, char prefix) {
+     if constexpr (sizeof(uintptr_t) == 8 &&
+                   std::endian::native == std::endian::little) {
+@@ -422,9 +427,7 @@
+           return {uintptr_t(permute_key(n) << 1)};
+       }
+     }
+-    other.push_back({s,std::hash<Str>{}(s)});
+-    static_assert(alignof(Str) >= 4);
+-    return {reinterpret_cast<uintptr_t>(&other.back()) | 1};
++    return borrowed(s);
+   }
+ };
+ constexpr size_t shards = 512;
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -124,8 +124,14 @@
+       throw std::runtime_error("invalid manifest window");
+   }
+ };
++[[gnu::noinline]] Event validated_purchase(Time ts,Str product,Str price_field,const Catalog &catalog) {
++  Time price = number(price_field, 10000000);
++  if (price < 1)
++    return {bad,0,0};
++  return {ts, int32_t(price), std::max(0, catalog.product.find(product))};
++}
+ template <class Row>
+-Event validate(const Row &r, Time ingest, const Catalog &catalog, Window w) {
++[[gnu::always_inline]] inline Event validate(const Row &r, Time ingest, const Catalog &catalog, Window w) {
+   Event drop{bad, 0, 0};
+   if (r[1].empty() || r[5].empty())
+     return drop;
+@@ -136,10 +142,7 @@
+     return {ts, 0, 0};
+   if (r[4] != "purchase")
+     return drop;
+-  Time price = number(r[6], 10000000);
+-  if (price < 1)
+-    return drop;
+-  return {ts, int32_t(price), std::max(0, catalog.product.find(r[5]))};
++  return validated_purchase(ts,r[5],r[6],catalog);
+ }
+ using Totals = std::map<std::pair<int, int32_t>, Counts>;
+ int32_t utc_day(Time ts) { return int32_t(ts / day_ms - (ts % day_ms < 0)); }
+--- a/cpp/partition_slab.hpp
++++ b/cpp/partition_slab.hpp
+@@ -11,11 +11,14 @@
+   auto spans() {
+     return std::array{std::span<T>(data, used), std::span<T>(tail)};
+   }
++  template<class... Args> [[gnu::noinline]] void extend(Args &&...args) {
++    tail.emplace_back(std::forward<Args>(args)...);
++  }
+   template <class... Args> void emplace_back(Args &&...args) {
+     if (used < limit)
+       std::construct_at(data + used++, std::forward<Args>(args)...);
+     else
+-      tail.emplace_back(std::forward<Args>(args)...);
++      extend(std::forward<Args>(args)...);
+   }
+   void push_back(T v) { emplace_back(v); }
+   void release() { std::vector<T>().swap(tail); }

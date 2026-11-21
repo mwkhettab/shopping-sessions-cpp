@@ -1,0 +1,25 @@
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -826,6 +826,22 @@
+     run_layout(data, output, threads, input, window, cat, timer, WideLayout{});
+ }
+ int main(int argc, char **argv) {
++#if defined(__linux__) && defined(__x86_64__) && defined(SHOPPING_DISPATCH_LEVEL)
++#if SHOPPING_DISPATCH_LEVEL == 3
++  const bool supported=__builtin_cpu_supports("x86-64-v3");
++#else
++  const bool supported=__builtin_cpu_supports("x86-64-v4");
++#endif
++  if(supported) {
++    // Advanced instructions live in a separate ELF. A portable-only install still runs here.
++    std::array<char,4096> path;
++    auto n=readlink("/proc/self/exe",path.data(),path.size());
++    if(n>0 && size_t(n)<=path.size()-5) {
++      std::memcpy(path.data()+n,".opt",5);
++      execv(path.data(),argv);
++    }
++  }
++#endif
+   auto env = [](const char *key, const char *fallback) {
+     auto s = std::getenv(key);
+     return s ? s : fallback;

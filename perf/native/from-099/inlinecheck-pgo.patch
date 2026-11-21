@@ -1,0 +1,11 @@
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -125,7 +125,7 @@
+   }
+ };
+ template <class Row>
+-Event validate(const Row &r, Time ingest, const Catalog &catalog, Window w) {
++[[gnu::always_inline]] inline Event validate(const Row &r, Time ingest, const Catalog &catalog, Window w) {
+   Event drop{bad, 0, 0};
+   if (r[1].empty() || r[5].empty())
+     return drop;

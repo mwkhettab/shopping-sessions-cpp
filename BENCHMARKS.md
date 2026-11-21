@@ -73,6 +73,20 @@ Batching event newline discovery reduced the 6975P-C Docker median from 1.218 to
 
 The 6975P-C hardware counters recorded 22.22 billion instructions, 18.34 billion cycles, 2.88 billion branches and 115.3 million branch misses on one full 20M control process. Measured across the four workers, IPC was 1.21 and the branch-miss rate was 4.0%. The independent 8573C source profile attributed a larger share of samples to partition writes. [Hardware counters and optimized source samples](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44885535835/job/136789890234)
 
+### Batched event decoding and dense campaign reduction
+
+On the four-vCPU Xeon 6975P-C, collecting 16 event line endings at a time, bounding each worker’s initial user-day allocation and summing dense campaign counters directly reduced the actual Linux amd64 Docker medians at all three scales. The event decoder checks every delimiter and quote before accepting a row. Short buffers, long records and processors without the required instructions have exact fallback paths. Sparse campaign populations still use the keyed reduction.
+
+| Fresh process inside native Docker, warm input | Official 0.99 s source | Candidate | Candidate peak RSS |
+| --- | ---: | ---: | ---: |
+| 20M events, seed 23 | 1.248 s | **1.155 s** | 2,811 MiB |
+| 60M events, seed 47 | 3.771 s | **3.474 s** | 8,281 MiB |
+| 60M events, independent seed 733 | 3.720 s | **3.459 s** | 8,318 MiB |
+
+The five 20M candidate times were 1.155, 1.150, 1.155, 1.150 and 1.158 s. Both tables matched for the 36 fixtures, both published 1M answers and the complete 20M and two 60M populations. The native tests also exercised an independent scalar oracle, wide click windows, identity bridges and eight-worker ThreadSanitizer regressions. On EPYC 9V45 the batched reader took 0.9128 s versus 0.9002 s for the scored source at 20M. The bounded allocation and dense reduction alone took 0.8530 s on that CPU. The production comparison targets Intel. The native executable inside the measured Intel candidate image had SHA-256 `2d8a06e5041b5be1836d345b2558b2c77699653d784139a30e63e8f33de9e3da`. [Intel comparisons](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44886735220/job/136793519592) · [EPYC comparisons](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44886735220/job/136793519366) · [Complete native Docker, second-population and memory results](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44889289986/job/136801362027)
+
+A competing pipeline let a dedicated consumer resolve event revisions while the other cores continued parsing. Its output and eight-worker race checks passed, but it increased the 20M Intel median from 1.1976 to 2.0907 s and the AMD median from 0.9002 to 1.5689 s. Write-combining raw partition records measured 1.3429 s on the same Intel runner. These designs were discarded. [Native pipeline comparisons](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44886735220)
+
 ## Reversible IDs and profile-guided compilation
 
 The Intel runner measured the exact source of the 1.13 s release against a lossless ID representation and a GCC profile-guided build. The ID permutation computes the hash at ingestion. Repeated shard and table lookups reuse it. Recovering the original bytes preserves lexicographic ordering for linked names and click ties. Indirect strings retain their full bytes and cache their hash. Two small synthetic build-time workloads exercise short and wide windows, ordinary and arbitrary IDs, and conflicting revisions. The container includes only the resulting executable and the Debian runtime.

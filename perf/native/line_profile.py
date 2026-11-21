@@ -12,7 +12,8 @@ def collect(root,area,note,run,env,variant="base"):
     with tempfile.TemporaryDirectory(dir=area) as temp:
         work=Path(temp)
         for name in ('cpp','perf'):shutil.copytree(area/variant/name,work/name)
-        shutil.copy2(root/'perf/native/image-pgo-build.sh',work/'build.sh')
+        settings=root/'perf/native/build-settings'/variant
+        shutil.copy2(settings/'build.sh' if settings.is_dir() else root/'perf/native/image-pgo-build.sh',work/'build.sh')
         wrapper=work/'cxx'
         wrapper.write_text('#!/bin/sh\nexec g++-12 -g "$@"\n')
         wrapper.chmod(0o755)

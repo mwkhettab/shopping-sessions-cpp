@@ -1,0 +1,264 @@
+--- /dev/null
++++ b/cpp/adaptive_csv.hpp
+@@ -0,0 +1,52 @@
++#pragma once
++#include <ctime>
++struct EventReaderChoice {
++#ifdef SHOPPING_X86_CSV
++  static constexpr unsigned per_reader=SHOPPING_CSV_PAIRS;
++  std::array<std::array<double,per_reader>,2> samples{};
++  unsigned visits{},since{};
++  bool use_tiled{};
++  static uint64_t clock_ns(){
++    timespec ts{};
++    if(clock_gettime(CLOCK_THREAD_CPUTIME_ID,&ts)==0)return uint64_t(ts.tv_sec)*1000000000+ts.tv_nsec;
++    return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
++      std::chrono::steady_clock::now().time_since_epoch()).count());
++  }
++#endif
++  template<class F> void scan(Str bytes,unsigned owner,F &&callback) {
++#ifdef SHOPPING_X86_CSV
++    if(wide_csv_supported() && bytes.size()>=32768) {
++#ifdef SHOPPING_VENDOR_READER
++      if(__builtin_cpu_is("intel"))rows<7,true>(bytes,callback);
++      else rows<7>(bytes,callback);
++      return;
++#else
++      if(visits>=2+2*per_reader) {
++#ifdef SHOPPING_REPEAT_READER
++        if(++since>=96){visits=since=0;}
++        else
++#endif
++        {
++          if(use_tiled)rows<7,true>(bytes,callback);else rows<7>(bytes,callback);
++          return;
++        }
++      }
++      // Alternate both within each pair and between pairs; include both paths in warm-up.
++      unsigned round=visits/2,mode=(visits^round^owner)&1;
++      auto start=clock_ns();
++      if(mode)rows<7,true>(bytes,callback);else rows<7>(bytes,callback);
++      auto ns=clock_ns()-start;
++      if(round)samples[mode][round-1]=double(ns)/double(bytes.size());
++      if(++visits==2+2*per_reader){
++        for(auto &series:samples)std::sort(series.begin(),series.end());
++        use_tiled=samples[1][per_reader/2]<samples[0][per_reader/2]*0.992;
++      }
++      return;
++#endif
++    }
++#else
++    (void)owner;
++#endif
++    rows<7>(bytes,callback);
++  }
++};
+--- a/cpp/input.hpp
++++ b/cpp/input.hpp
+@@ -147,8 +147,10 @@
+ #endif
+ #include "csv_x86.hpp"
+ #include "line_csv.hpp"
+-template <size_t N, class F> void parse_rows(Str data, F &&callback) {
++#include "line_tile.hpp"
++template <size_t N,bool Tiled=false, class F> void parse_rows(Str data, F &&callback) {
+ #ifdef SHOPPING_X86_CSV
++  if constexpr(Tiled && N==7)if(wide_csv_supported()){tiled_lines<N,16>(data,callback);return;}
+   if (wide_csv_supported()) { line_csv_rows<N>(data,callback); return; }
+   if (wide_csv_supported()) {
+     wide_csv_rows<N>(data, callback);
+@@ -206,7 +208,7 @@
+   scalar_rows<N>(data, callback);
+ #endif
+ }
+-template <size_t N, class F> void rows(Str data, F &&callback) {
++template <size_t N,bool Tiled=false, class F> void rows(Str data, F &&callback) {
+ #ifdef SHOPPING_DIAGNOSTICS
+   // Instrument all callbacks in one of every 32 chunks on each worker.
+   // Report the sample itself so estimates can be scaled by input coverage.
+@@ -215,7 +217,7 @@
+   if (chunk_count++ % 32 == 0) {
+     auto start = metrics::now();
+     int64_t callbacks = 0;
+-    parse_rows<N>(data, [&](auto &r) {
++    parse_rows<N,Tiled>(data, [&](auto &r) {
+       auto entry = metrics::now();
+       callback(r);
+       callbacks += metrics::now() - entry;
+@@ -225,7 +227,7 @@
+     return;
+   }
+ #endif
+-  parse_rows<N>(data, callback);
++  parse_rows<N,Tiled>(data, callback);
+ }
+ 
+ inline Time number(Str s, Time limit) {
+--- /dev/null
++++ b/cpp/line_tile.hpp
+@@ -0,0 +1,66 @@
++#pragma once
++#ifdef SHOPPING_X86_CSV
++inline uint64_t mask_to(unsigned n){return n>=64?~uint64_t{}:(uint64_t{1}<<n)-1;}
++template<size_t N,class F>
++__attribute__((target("avx2,bmi,popcnt"),always_inline))
++inline void split_known_line(const char *p,size_t len,const char *end,F &fn) {
++  if(len>=128||end-p<128) {
++    scalar_rows<N>(Str(p,len),fn);
++    return;
++  }
++  uint64_t lo,hi=0,ql,qh=0;
++  auto get=[&](unsigned at,uint64_t &commas,uint64_t &quotes)
++      __attribute__((target("avx2,bmi,popcnt"),always_inline)) {
++    auto a=_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p+at));
++    auto b=_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p+at+32));
++    auto comma=_mm256_set1_epi8(','),quote=_mm256_set1_epi8('"');
++    uint64_t c0=unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a,comma)));
++    uint64_t q0=unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a,quote)));
++    uint64_t c1=unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b,comma)));
++    uint64_t q1=unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b,quote)));
++    auto mask=mask_to(unsigned(len)-at);
++    commas=(c0|(c1<<32))&mask;quotes=(q0|(q1<<32))&mask;
++  };
++  get(0,lo,ql);
++  if(len>64)get(64,hi,qh);
++  if(size_t(std::popcount(lo)+std::popcount(hi))!=N-1)return;
++  std::array<Str,N> fields;
++  unsigned start=0,wrapped=0;
++  for(unsigned i=0;i<N;++i) {
++    unsigned cut=unsigned(len);
++    if(i+1<N) {
++      if(lo){cut=std::countr_zero(lo);lo&=lo-1;}
++      else{cut=64+std::countr_zero(hi);hi&=hi-1;}
++    }
++    unsigned width=cut-start;
++    bool quotes=width>=2 && ((p[start]=='"') & (p[cut-1]=='"'));
++    wrapped+=2*quotes;
++    fields[i]={p+start+quotes,width-2*quotes};start=cut+1;
++  }
++  if(wrapped==unsigned(std::popcount(ql)+std::popcount(qh)))fn(fields);
++}
++
++template<size_t N,unsigned Batch,class F>
++__attribute__((target("avx2,bmi,popcnt"))) void tiled_lines(Str data,F &fn) {
++  size_t from=0,scan=0;
++  std::array<size_t,Batch> ends;
++  unsigned n=0;
++  auto flush=[&]() __attribute__((target("avx2,bmi,popcnt"),always_inline)){
++    for(unsigned i=0;i<n;++i) {
++      auto to=ends[i];split_known_line<N>(data.data()+from,to-from,data.data()+data.size(),fn);from=to+1;
++    }
++    n=0;
++  };
++  auto lf=_mm256_set1_epi8('\n');
++  for(;scan+32<=data.size();scan+=32) {
++    auto v=_mm256_loadu_si256(reinterpret_cast<const __m256i*>(data.data()+scan));
++    auto mask=unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v,lf)));
++    while(mask) {
++      ends[n++]=scan+std::countr_zero(mask);mask&=mask-1;
++      if(n==Batch)flush();
++    }
++  }
++  if(n)flush();
++  if(from<data.size())line_csv_rows<N>(data.substr(from),fn);
++}
++#endif
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -7,6 +7,9 @@
+ #include <span>
+ 
+ size_t bucket(Key k) { return k.hash() % shards; }
++#define SHOPPING_CSV_PAIRS 4
++#define SHOPPING_VENDOR_READER 1
++#include "adaptive_csv.hpp"
+ #include "event_layout.hpp"
+ struct RevisionIndex {
+   Key id;
+@@ -38,6 +41,7 @@
+   std::vector<std::array<Vertex *, 2>> edges;
+   Bins<std::pair<Key, size_t>> endpoints;
+   KeyPool pool;
++  EventReaderChoice reader;
+ #ifdef SHOPPING_DIAGNOSTICS
+   size_t revisions{}, valid_events{}, duplicates{}, valid_clicks{};
+ #endif
+@@ -233,7 +237,7 @@
+       auto &v = result.spend[k];
+       if (v > best || (v == best && cat.categories[k] < *daily.category)) {
+         best = v;
+-        daily.category = cat.categories[k];
++        daily.category = &cat.categories[k];
+       }
+       v = 0;
+     }
+@@ -715,7 +719,7 @@
+           });
+           return;
+         }
+-        rows<7>(events[job].body(), [&](auto &r) {
++        workers[t].reader.scan(events[job].body(),t, [&](auto &r) {
+           if (r[0].empty())
+             return;
+           Time ingest = ingest_time(r[3]);
+@@ -769,8 +773,11 @@
+   resolve_revisions(workers, threads, anchor);
+   timer.mark("global event dedup and loser removal");
+   std::vector<Result> results(threads);
+-  for (auto &result : results)
+-    result.configure(window, cat, threads);
++  size_t rows_hint=std::min<size_t>(event_count/8,(size_t(512)<<20)/sizeof(UserDay))/threads;
++  for(auto &result:results) {
++    result.users.reserve(rows_hint);
++    result.configure(window,cat,threads);
++  }
+   process_people(workers, results, cat, threads, timer, layout);
+   fs::create_directories(output / "user_daily");
+   fs::create_directories(output / "campaign_daily");
+@@ -779,13 +786,29 @@
+                     ("part-" + std::to_string(i) + ".parquet"),
+                 results[i].users);
+   });
+-  Totals merged;
+-  for (auto &r : results)
+-    r.merge_into(merged);
+   std::vector<CampaignDay> campaigns;
+-  for (auto &[key, c] : merged)
+-    campaigns.push_back(
+-        {cat.campaigns[key.first], cat.channels[key.first], key.second, c});
++  auto append=[&](size_t id,int32_t day,const Counts &c){
++    campaigns.push_back({cat.campaigns[id],cat.channels[id],day,c});
++  };
++  const auto &first=results.front();
++  if(!first.table.empty()) {
++    for(size_t start=0;start<first.table.size();start+=first.campaigns) {
++      int32_t day=first.first_day+int32_t(start/first.campaigns);
++      for(size_t id=0;id<first.campaigns;++id) {
++        Counts c{};
++        for(const auto &r:results) {
++          const auto &part=r.table[start+id];
++          c.sessions+=part.sessions;c.purchases+=part.purchases;
++          c.revenue+=part.revenue;c.assists+=part.assists;
++        }
++        if(c.sessions||c.assists)append(id,day,c);
++      }
++    }
++  } else {
++    Totals merged;
++    for(auto &r:results)r.merge_into(merged);
++    for(auto &[key,c]:merged)append(key.first,key.second,c);
++  }
+   write_campaigns(output / "campaign_daily" / "part-0.parquet", campaigns);
+   timer.mark("merge and Parquet output");
+ #ifdef SHOPPING_DIAGNOSTICS
+--- a/cpp/output.hpp
++++ b/cpp/output.hpp
+@@ -3,7 +3,7 @@
+   Key user;
+   int32_t day;
+   int64_t sessions, events, revenue;
+-  std::optional<Str> category;
++  const Str *category{};
+ };
+ struct Counts {
+   int64_t sessions{}, purchases{}, revenue{}, assists{};

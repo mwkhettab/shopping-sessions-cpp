@@ -34,6 +34,8 @@ def verify_images(root,area,best,run,note,env,scales):
     run('docker','build','--platform','linux/amd64','-t',tags[1],src)
     fingerprint=subprocess.check_output(['docker','run','--rm','--platform','linux/amd64','--entrypoint','sha256sum',tags[1],'/app/shopping'],text=True).split()[0]
     note('Image binary '+best,f'sha256 {fingerprint}')
+    fast=subprocess.run(['docker','run','--rm','--platform','linux/amd64','--entrypoint','sha256sum',tags[1],'/app/shopping.opt'],capture_output=True,text=True)
+    if fast.returncode==0:note('Image optimized binary '+best,'sha256 '+fast.stdout.split()[0])
     for scale,repeats in scales:
         data=area/scale
         totals={tag:[] for tag in tags}
