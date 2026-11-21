@@ -25,6 +25,56 @@ The entrant reported **0.88 s** for `BB-1F2F9464` at `25a940f0d0a8`. The entered
 
 The scorer entered `BB-3FCA75FD` in the final at **0.87 s**. Queue wait was 220 ms. This improved the prior official 0.99 s time by 12.1%. The entrant supplied these scores. The 0.99 s run reduced the previous best by 12.4%. The scorer marked the earlier `BB-BE7C95B8` as entered in the final with 3 ms queue wait. Its 1.13 s runtime was 32.7% lower than the previous 1.68 s best. Entries `BB-065C223B` and `BB-E8D93ABE` listed 41 ms and 105 ms of queue wait separately. Relative to `61e9ba6`, the 512-shard release decodes each field as its delimiter is encountered, raises the event and person shard count from 128 to 512, reserves identity storage from input size, and compares inline canonical IDs bytewise without a separate display-name vector. It also reserves Arrow builder capacity and uses unchecked numeric appends within that reservation. Its compiler flags, Dockerfile, global deduplication rules, session boundaries and attribution algorithm match the official baseline. Its official run was 0.03 s slower. Two submissions of the identical baseline pipeline differed by 0.02 s.
 
+## Partitioned C++ pipeline qualification
+
+The release sources at `faf1047c6cb00cc8099572f5e067d18076375571` decode batches of 64 rows, partition event revisions by ID, build a per-user click index, reconcile sessions across partition boundaries and write the two Parquet tables while processing the remaining people. The executable restarts on its general parser when an input exceeds the compact representation. The Linux build checks CPU features before entering each specialized instruction path.
+
+| Apple Silicon, eight workers, 20M events, seed 23 | Result |
+| --- | ---: |
+| Three timed processes after one warmup | 0.729 s, 0.623 s, 0.642 s |
+| Median elapsed time | 0.642 s |
+| Highest process RSS in the timed runs | 2,482 MiB |
+| CSV page residency immediately before each timed run | 100% |
+
+These measurements include process launch, Parquet output and exit. Each run used a fresh output directory. The Mac executed the portable event and click paths. A separate first-pass run under different cache conditions took 3.43 s and spent 3.03 s in the input stage. Its initial page residency was unmeasured. Native x86-64 timings and official scores require separate runs.
+
+Both the host executable and the statically linked linux/amd64 Docker image passed all 36 public fixtures and the additional catalog, long-line, identity and boundary tests. Docker ran the exact Git build with user 1000, eight vCPUs, a 7 GiB memory limit and read-only input. Its local image ID is `sha256:3de67ac7f30a553b0c080892736293c11df617a1a819c786c6291d4212b0d5f1`. The published seed-1 reference matched every value and key for 117,038 user-day and 27,400 campaign-day rows. Host and Docker 20M outputs each matched the validated implementation across all 2,226,509 user-day and 28,014 campaign-day rows, with zero duplicate keys.
+
+Across 54 additional runs against the 0.87-second implementation, all output rows and unique keys matched. All 36 independently salted fixture embeddings used the partitioned engine. A user spanning a 16,384-slot partition also stayed on that path with regular IDs and linked opaque aliases. Fourteen runs exercised the generic fallback through shuffled identity ordering, historical revisions or noncanonical catalogs. The release image repeated the three partition-boundary cases under a 1 GiB memory limit.
+
+The eight-worker Mac release also matched both complete seed-47 tables at 60M events and 15M clicks. It produced 6,684,549 user-day rows and 28,014 campaign-day rows with unique keys. Both logical-table SHA-256 fingerprints matched the independent control. Peak process RSS was 2,550.7 MiB. This run read 5,689,431,513 bytes from 114 input files held on read-only compressed disk images. Initial page residency was 4.12%. The process took 401.72 s with 343,235 major faults, 10.71 s of user CPU and 2.19 s of system CPU. The input and parsing stage took 400.99 s. The change in storage and residency rules out using these wall times to estimate scaling from the warm 20M run.
+
+The exact linux/amd64 image repeated the seed-47 comparison against the same logical input in ordinary APFS files shared into Docker Desktop. It wrote 81,767,451 Parquet bytes, matched every row and reproduced both fingerprints. With CPUs 0–7, a 7,168 MiB limit, swap disabled and user 1000, it peaked at 1,958.2 MiB process RSS and 7,144.7 MiB for the entire cgroup. The x86-emulated process completed in 40.618 s, including 38.921 s in input and parsing, with 8,119 major faults. The host disk-image run and the Docker file-share run use different storage paths. Neither supplies a native Intel score.
+
+A later Mac experiment used ordinary APFS files for both input sizes and sequentially read every CSV immediately before every timed process. At 20M the input totaled 1,917,888,312 CSV bytes and `mincore` confirmed 100% page residency before all six runs. The `faf1047` release took 0.632, 0.685, 0.638, 0.651, 0.637 and 0.636 s, with a 0.638 s median and 2,481.2 MiB peak RSS. A separate instrumented process measured 535 ms parsing, 51 ms in the first event-processing pass, 4 ms in the second and 16 ms finishing output. At 60M the same preload procedure yielded 51.49% and 49.34% initial residency for the two completed release observations. They took 6.227 and 6.175 s with 280,021 and 278,282 major faults. The run series stopped when disk space fell below 600 MiB. The measured residency and fault counts explain why these 60M times cannot establish the scaling of a fully cached run.
+
+Component tests also check the complete 1,804-byte inner click loop and its 59 ELF relocations, session state and attribution, union-find, bucket joining, worker ownership, all 32 Parquet key widths and file bytes across three output methods. The large Parquet test produced three files of 1,015,543 bytes each matching the oracle at every offset. Interpreter and emulation checks establish behavior and produce no native performance estimate.
+
+## Runtime and compiler trials
+
+At `b5f19ac6cc222f166ae9581a8cef9b87bb3c4263`, five Docker build arguments make the following experiments reproducible. All default to zero. The combined image sets each to `1`.
+
+| Build argument | Change |
+| --- | --- |
+| `PAIRED_CLICK_SORT` | Classify click lists and sort short lists using pairs of 256-bit vectors on capable CPUs. |
+| `CUSTOM_MEMORY` | Use small overlap-safe vector moves and REP string instructions. Static glibc resolves each entry once using a baseline-ISA resolver. |
+| `INTEL_LAYOUT` | Enable GCC whole-program LTO, Cascade Lake scheduling and 32-byte branch-boundary alignment. |
+| `V4_SIDECAR` | Package a separate x86-64-v4 ELF and select it after a CPU and OS feature check in the baseline executable. |
+| `DIRECT_DICT_LOOPS` | Reduce the values of dictionary keys directly and inline the 16-byte short-string copy when the complete input block is readable. |
+
+The combined linux/amd64 image has local image ID `sha256:8c82f79a929660bfe97636720735e658edf049cbca396641eb07e7048be8331f`. Under Docker Desktop x86 emulation, it passed the memory self-test, 36 fixtures, the additional edge cases and both published 1M tables. Another 54 patterned comparisons matched the qualified release. Both large outputs matched the independent control at every row and key and reproduced all four reference hashes.
+
+| Input | Emulated wall time | Process RSS | Cgroup peak | User-day rows | Campaign-day rows |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 20M events, seed 23 | 10.097 s | 905.1 MiB | 2,743.9 MiB | 2,226,509 | 28,014 |
+| 60M events, seed 47 | 23.801 s | 1,966.2 MiB | 7,168.0 MiB | 6,684,549 | 28,014 |
+
+Both runs used eight guest CPUs, a 7,168 MiB memory cap and disabled swap. The guest ran the baseline executable. The paired-sort tests separately exercised 2,064 guard-page cases, 65,536 masks and 192 mixed user groups in instruction emulation. GCC 12.2 static binaries passed 227,778 guarded memory checks per implementation with and without LTO. Both Parquet writer settings matched the complete byte oracle at four row counts for all three output methods. These checks establish correctness and memory use. The independent Docker runs used different input-cache states. A paired native AVX-512 Linux run is needed to rank the builds.
+
+On Apple Silicon, two executables from the same trial source differed only in `DIRECT_DICT_LOOPS`. Both passed the fixtures, the 1M references and the 20M and 60M independent table comparisons. The 20M trial rotated both with the qualified `faf1047` release for six timed processes per binary after a warmup. Initial page residency was 100% for every observation. The release median was 0.638 s, the trial-source control took 0.651 s and the writer alternative took 0.664 s. The writer won three of six same-round comparisons, with a median paired time ratio of 1.003. This supplies no repeatable full-process improvement on the Mac. The setting stays experimental for the Intel comparisons.
+
+At 60M even the sequential preload left 46.22–52.85% of input pages resident across the completed measurements of all three executables. The seven timed processes each incurred more than 271,000 major faults. The remaining repetitions stopped when free disk fell below 600 MiB. No 60M winner was selected from this partial experiment.
+
 ## Eight-row event decoding on native Intel
 
 The prototype transposes the verified CSV field boundaries of eight events. It identifies views and carts with nonempty products in one pass and then validates the original IDs and clocks. Purchases, other record shapes and irregular CSV retain their general parsers. Four pinned vCPUs, preloaded CSVs, fresh output directories and a fresh Docker process were used for each run.
