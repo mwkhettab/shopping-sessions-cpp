@@ -17,6 +17,17 @@ inline constexpr auto ordinal_newlines = [] {
   return out;
 }();
 
+__attribute__((target("avx2,bmi,bmi2,popcnt,pclmul"),
+               always_inline)) inline OrdinalMasks
+ordinal_masks_avx2(const char *p) {
+  auto a = row_mask32(p), b = row_mask32(p + 32);
+  auto join = [](unsigned x, unsigned y) {
+    return uint64_t(x) | (uint64_t(y) << 32);
+  };
+  auto lf = join(a.lf, b.lf);
+  return {join(a.comma, b.comma) | lf, join(a.quotes, b.quotes), lf};
+}
+
 __attribute__((target("avx512f,avx512bw"), always_inline)) inline OrdinalMasks
 ordinal_masks_wide(const char *p) {
   auto text = _mm512_loadu_si512(p);
@@ -95,63 +106,113 @@ inline void emit_marked_event(const MarkedEventFields &row, F &fn) {
   }
   fn(row);
 }
+inline void save_marked_positions(uint16_t *out, unsigned base,
+                                  uint64_t separators, uint64_t closed) {
+  while (separators) {
+    unsigned bit = std::countr_zero(separators);
+    *out++ = uint16_t(2 * (base + bit + 1) + ((closed >> bit) & 1));
+    separators &= separators - 1;
+  }
+}
+struct EightEventFields {
+  __m128i begins[6], widths[6], eligible;
+  // Each row contains the previous line end and the seven current ends. Every
+  // index stores twice the next start and the field's verified quote flag.
+  __attribute__((
+      target("avx2,bmi,bmi2,popcnt,pclmul"),
+      always_inline)) inline explicit EightEventFields(const uint16_t *cuts) {
+    __m128i pairs[8], quads[8], columns[8];
+    for (unsigned i = 0; i < 4; ++i) {
+      auto a =
+          _mm_loadu_si128(reinterpret_cast<const __m128i *>(cuts + 14 * i - 1));
+      auto b =
+          _mm_loadu_si128(reinterpret_cast<const __m128i *>(cuts + 14 * i + 6));
+      pairs[2 * i] = _mm_unpacklo_epi16(a, b);
+      pairs[2 * i + 1] = _mm_unpackhi_epi16(a, b);
+    }
+    for (unsigned i = 0; i < 2; ++i)
+      for (unsigned j = 0; j < 2; ++j) {
+        auto a = pairs[4 * i + j], b = pairs[4 * i + j + 2];
+        quads[4 * i + 2 * j] = _mm_unpacklo_epi32(a, b);
+        quads[4 * i + 2 * j + 1] = _mm_unpackhi_epi32(a, b);
+      }
+    for (unsigned i = 0; i < 4; ++i) {
+      columns[2 * i] = _mm_unpacklo_epi64(quads[i], quads[i + 4]);
+      columns[2 * i + 1] = _mm_unpackhi_epi64(quads[i], quads[i + 4]);
+    }
+    auto one = _mm_set1_epi16(1);
+    for (unsigned i = 0; i < 6; ++i) {
+      auto left = _mm_srli_epi16(columns[i], 1);
+      auto end = columns[i + 1], trim = _mm_and_si128(end, one);
+      begins[i] = _mm_add_epi16(left, trim);
+      auto raw =
+          _mm_sub_epi16(_mm_sub_epi16(_mm_srli_epi16(end, 1), one), left);
+      widths[i] = _mm_sub_epi16(raw, _mm_add_epi16(trim, trim));
+    }
+    auto short_id = [](__m128i width) {
+      return _mm_and_si128(_mm_cmpgt_epi16(width, _mm_set1_epi16(1)),
+                           _mm_cmpgt_epi16(_mm_set1_epi16(10), width));
+    };
+    eligible = _mm_and_si128(short_id(widths[0]), short_id(widths[1]));
+    eligible =
+        _mm_and_si128(eligible, _mm_cmpeq_epi16(widths[3], _mm_set1_epi16(20)));
+    eligible =
+        _mm_and_si128(eligible, _mm_cmpeq_epi16(widths[4], _mm_set1_epi16(4)));
+    eligible = _mm_and_si128(eligible,
+                             _mm_cmpgt_epi16(widths[5], _mm_setzero_si128()));
+  }
+  __attribute__((target("avx2,bmi,bmi2,popcnt,pclmul"),
+                 always_inline)) inline unsigned
+  common_kinds(const char *base) const {
+    auto valid = _mm256_cvtepi16_epi32(eligible);
+    auto words = _mm256_mask_i32gather_epi32(
+        _mm256_setzero_si256(), reinterpret_cast<const int *>(base),
+        _mm256_cvtepu16_epi32(begins[4]), valid, 1);
+    auto view = _mm256_cmpeq_epi32(words, _mm256_set1_epi32(0x77656976));
+    auto cart = _mm256_cmpeq_epi32(words, _mm256_set1_epi32(0x74726163));
+    return unsigned(
+        _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_or_si256(view, cart))));
+  }
+  static void save(uint16_t (&out)[8], __m128i v) {
+    _mm_storeu_si128(reinterpret_cast<__m128i *>(out), v);
+  }
+};
+
+template <class F>
+__attribute__((target("avx2,bmi,bmi2,popcnt,pclmul"))) inline void
+emit_event_batch(const char *base, const uint16_t *cuts, F &fn) {
+  EightEventFields fields(cuts);
+  unsigned mask = fields.common_kinds(base);
+  uint16_t id[8], user[8], ew[8], uw[8], ts[8], tw[8], arrival[8];
+  fields.save(id, fields.begins[0]);
+  fields.save(ew, fields.widths[0]);
+  fields.save(user, fields.begins[1]);
+  fields.save(uw, fields.widths[1]);
+  fields.save(ts, fields.begins[2]);
+  fields.save(tw, fields.widths[2]);
+  fields.save(arrival, fields.begins[3]);
+  for (unsigned i = 0; i < 8; ++i) {
+    if ((mask & (1u << i)) &&
+        fn.common(base + id[i], ew[i], base + user[i], uw[i],
+                  Str(base + ts[i], tw[i]), Str(base + arrival[i], 20)))
+      continue;
+    emit_marked_event(MarkedEventFields{base, cuts + 7 * i}, fn);
+  }
+}
+
 template <class F>
 __attribute__((
     target("avx2,bmi,bmi2,popcnt,pclmul,avx512f,avx512bw,avx512vbmi2"))) void
 marked_events_vbmi2(Str data, F &fn) {
-  constexpr unsigned Bytes = 1024, N = 7;
-  constexpr unsigned Words = Bytes / 64;
-  alignas(64) std::array<uint16_t, Bytes + 64> positions;
-  positions[0] = 0;
-  uint16_t *cuts = positions.data() + 1;
-  while (data.size() >= Bytes) {
-    const char *text = data.data();
-    std::array<OrdinalMasks, Words> masks;
-    for (unsigned k = 0; k < Words; ++k) {
-      masks[k] = ordinal_masks_wide(text + 64 * k);
-    }
-    unsigned words = Words;
-    while (words && !masks[words - 1].newlines)
-      --words;
-    if (!words) {
-      auto lf = data.find('\n', Bytes);
-      size_t take = lf == Str::npos ? data.size() : lf + 1;
-      scalar_rows<N>(data.substr(0, take), fn);
-      data.remove_prefix(take);
-      continue;
-    }
-    auto &last = masks[words - 1];
-    unsigned length = words * 64 - std::countl_zero(last.newlines);
-    uint64_t tail = mask_to(length - (words - 1) * 64);
-    last.separators &= tail;
-    last.quotes &= tail;
-    uint64_t inside = 0, previous = 1, invalid = 0;
-    unsigned nc = 0;
-    for (unsigned b = 0; b < words; ++b) {
-      auto [sep, q, lf] = masks[b];
-      unsigned count = std::popcount(sep);
-      uint64_t want = ordinal_newlines<N>[nc % N] & mask_to(count);
-      invalid |= _pext_u64(lf, sep) ^ want;
-      uint64_t closed = (q << 1) | (b ? (masks[b - 1].quotes >> 63) : 0);
-      uint64_t parity = quote_prefix(q) ^ inside;
-      uint64_t next = b + 1 < words ? (masks[b + 1].separators & 1) : 1;
-      invalid |= ((q & parity) & ~((sep << 1) | previous)) |
-                 ((q & ~parity) & ~((sep >> 1) | (next << 63))) |
-                 (sep & parity);
-      inside = uint64_t(0) - (parity >> 63);
-      previous = sep >> 63;
-      save_trimmed_positions(cuts + nc, 64 * b, sep, closed);
-
-      nc += count;
-    }
-    if (invalid || inside || nc % N) {
-      tiled_lines<N, 16>(data.substr(0, length), fn);
-    } else
-      for (unsigned i = 0; i < nc; i += N) {
-        emit_marked_event(MarkedEventFields{text, cuts + i}, fn);
-      }
-    data.remove_prefix(length);
-  }
-  tiled_lines<N, 16>(data, fn);
+  constexpr auto classify = ordinal_masks_wide;
+  constexpr auto save_positions = save_trimmed_positions;
+#include "marked_event_tile.inc"
+}
+template <class F>
+__attribute__((target("avx2,bmi,bmi2,popcnt,pclmul"))) void
+marked_events_avx2(Str data, F &fn) {
+  constexpr auto classify = ordinal_masks_avx2;
+  constexpr auto save_positions = save_marked_positions;
+#include "marked_event_tile.inc"
 }
 #endif

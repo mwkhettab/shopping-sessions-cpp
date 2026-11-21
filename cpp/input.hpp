@@ -161,6 +161,9 @@ template <size_t N, class F> void parse_rows(Str data, F &&callback) {
         marked_events_vbmi2(data, callback);
         return;
       }
+      marked_events_avx2(data, callback);
+      return;
+
     }
   }
 #endif
