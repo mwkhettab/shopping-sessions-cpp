@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from statistics import median
 
-def verify_images(root,area,best,run,note,env,scales):
+def verify_images(root,area,best,run,note,env,scales,release_control):
     meter=area/'image-meter'
     run('gcc','-O2','-static',root/'perf/native/meter.c','-o',meter)
     tags=['shopping-native:baseline','shopping-native:candidate']
@@ -33,14 +33,14 @@ def verify_images(root,area,best,run,note,env,scales):
     run('docker','build','--platform','linux/amd64','-t',tags[0],control)
     run('docker','build','--platform','linux/amd64','-t',tags[1],src)
     labels={tags[0]:'base',tags[1]:best}
-    released=area/'shipreader-pgo'
-    if released.is_dir() and best!='shipreader-pgo':
+    released=area/release_control
+    if released.is_dir() and best!=release_control:
         for f in ('build.sh','Dockerfile','.dockerignore'):
             shutil.copy2(root/'perf/native'/('image-pgo-'+f.lstrip('.')),released/f)
         (released/'perf').mkdir(exist_ok=True)
         shutil.copy2(root/'perf/native/train.py',released/'perf/train.py')
         tags.append('shopping-native:release')
-        labels[tags[-1]]='shipreader-pgo'
+        labels[tags[-1]]=release_control
         run('docker','build','--platform','linux/amd64','-t',tags[-1],released)
 
     fingerprint=subprocess.check_output(['docker','run','--rm','--platform','linux/amd64','--entrypoint','sha256sum',tags[1],'/app/shopping'],text=True).split()[0]
@@ -93,7 +93,7 @@ def verify_images(root,area,best,run,note,env,scales):
                     finally: subprocess.run(['sudo','-n','chmod','-R','a+rwX',out,scratch],check=True)
         if len(tags)==3:
             pairs=[a[0]/b[0]-1 for a,b in zip(totals[tags[1]],totals[tags[2]])]
-            note('Release image pairs '+scale,f'{best} vs shipreader. {sum(x<0 for x in pairs)}/{len(pairs)} faster and {median(pairs):.2%} median paired change.')
+            note('Release image pairs '+scale,f'{best} vs {release_control}. {sum(x<0 for x in pairs)}/{len(pairs)} faster and {median(pairs):.2%} median paired change.')
         for tag,obs in totals.items():
             note('Docker '+scale+' '+labels[tag],
                  f'median {median(x[0] for x in obs):.3f} s, runs {[x[0] for x in obs]}, peak RSS {max(x[1] for x in obs):.1f} MiB, cgroup {max(x[2] for x in obs):.1f} MiB, median including docker run {median(x[3] for x in obs):.3f} s.')

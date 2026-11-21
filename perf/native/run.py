@@ -34,6 +34,8 @@ def main():
     note('Hardware',f'{model}, {env["NCPU"]} workers, affinity {sorted(os.sched_getaffinity(0))}, AVX-512BW {"avx512bw" in flags}, VBMI2 {"avx512_vbmi2" in flags}.')
     note("Control","Official 0.99-second commit 33fb788bf962900617e8c0455d366f7f0a5d7eeb, byte-checked sources. A second independently trained build measures build variance.")
     candidates=(root/'perf/native/candidates.txt').read_text().split()
+    release_control=(root/'perf/native/release-control.txt').read_text().strip()
+    assert release_control in candidates
     if 'avx512bw' not in flags: candidates=[n for n in candidates if not n.startswith('v512')]
     binaries=[]
     area.joinpath('bin').mkdir(exist_ok=True)
@@ -52,6 +54,8 @@ def main():
                     with path.open('rb') as patch:
                         subprocess.run(['patch','-s','-p1'],cwd=src,stdin=patch,check=True)
             if name=='base': run('sha256sum','--check',root/'perf/native/official-099.sha256',cwd=src)
+            if name=='shipcolumns-pgo':
+                run('sha256sum','--check',root/'perf/native/production-columns.sha256',cwd=src)
             compiler=shutil.which('g++-12') or shutil.which('g++')
             if name in ('haswell','skylake'):
                 wrapper=src/'cxx'
@@ -84,7 +88,7 @@ def main():
             shutil.copytree(root/'tests',localtests,dirs_exist_ok=True)
             run(compiler,'-std=c++20','-O2',str(localtests/'input.cpp'),'-o',unit)
             run(unit)
-            if name.startswith(('index','boundsreader','fused','shipreader','mask','var','ord','cert','hotfuse','colfuse','adaptfuse','quotecmov','cut','hotanchors')):
+            if (src/'cpp/line_tile.hpp').is_file():
                 run(compiler,'-std=c++20','-O2','-fsanitize=undefined','-fno-sanitize-recover=all',
                     '-I',src/'cpp',root/'perf/native/mutated_rows.cpp','-o',unit)
                 run(unit)
@@ -111,9 +115,19 @@ def main():
                 run(compiler,'-std=c++20','-O2','-fsanitize=undefined','-fno-sanitize-recover=all','-I',src/'cpp',root/'perf/native/alias_quotient_test.cpp','-o',unit)
                 run(unit)
             if (src/'cpp/mixed_revision_reader.hpp').is_file():run(python,root/'perf/native/layout_oracle.py',binary)
+            if (src/'cpp/row_bounds.hpp').is_file():
+                run(compiler,'-std=c++20','-O2','-fsanitize=undefined','-fno-sanitize-recover=all','-I',src/'cpp',root/'perf/native/row_bounds_test.cpp','-o',unit)
+                run(unit)
+            if (src/'cpp/rev_columns.hpp').is_file() and 'claim_initial_slot' in (src/'cpp/rev_columns.hpp').read_text():
+                run(compiler,'-std=c++20','-O2','-fsanitize=undefined','-fno-sanitize-recover=all','-I',src/'cpp',root/'perf/native/issued_column_test.cpp','-o',unit)
+                run(unit)
+            for header,unitfile in [('shard_tile.hpp','shard_tile_test.cpp'),('timeline_reuse.hpp','reuse_region_test.cpp')]:
+                if (src/'cpp'/header).is_file():
+                    run(compiler,'-std=c++20','-O2','-pthread','-fsanitize=undefined','-fno-sanitize-recover=all','-I',src/'cpp',root/'perf/native'/unitfile,'-o',unit)
+                    run(unit)
             binaries.append(binary)
         except (subprocess.CalledProcessError,OSError) as exc:
-            if name=='base': raise
+            if name in ('base',release_control): raise
             note('Rejected '+name,repr(exc))
     if shutil.which('perf'):
         with tempfile.TemporaryDirectory(dir=area) as temp:
@@ -166,6 +180,11 @@ def main():
                     layout=re.search(r'SHOP_REVISION_LAYOUT (\d+) (\d+)',mixed.stderr)
                     if not layout:raise ValueError('missing storage calibration counters')
                     note('Revision storage '+b.name+' '+scale,f'{layout[1]} row revisions, {layout[2]} column revisions.')
+                elif (area/b.name/'cpp/timeline_reuse.hpp').is_file():
+                    reuse=subprocess.run([b,data,d],check=True,env=env|{'SHOP_RECYCLE_TRACE':'1'},capture_output=True,text=True)
+                    amounts=re.search(r'SHOP_TIMELINE_REUSE (\d+) (\d+)',reuse.stderr)
+                    if not amounts:raise ValueError('missing timeline capacity totals')
+                    note('Timeline storage '+b.name+' '+scale,f'{int(amounts[1]):,} resident bytes and {int(amounts[2]):,} new bytes.')
                 else:run(b,data,d)
                 run(python,root/'perf/native/compare_large.py',d,ref)
         import pyarrow.parquet as pq
@@ -196,11 +215,11 @@ def main():
         publish()
         # Request eviction only for this job's generated CSVs and record the
         # actual residency before the executable starts.
-        released=area/'bin/shipreader-pgo'
-        new=[b for b in binaries if b.name not in ('base','fin-slabkey-pgo','shipreader-pgo')]
+        released=area/'bin'/release_control
+        new=[b for b in binaries if b.name not in ('base','fin-slabkey-pgo','shipreader-pgo',release_control)]
         if released in binaries and new:
             challenger=min(new,key=lambda b:performance[b.name])
-            log=outcomes/(scale+'-shipreader-challenger.jsonl')
+            log=outcomes/(scale+'-release-challenger.jsonl')
             run(python,root/'perf/measure.py',data,released,challenger,'--runs','7' if scale=='practice' else '5',
                 '--warmup','1','--preload','--profile','--output-parent',area,'--log',log)
             pairs={}
@@ -240,12 +259,13 @@ def main():
         if scale in ('final', 'holdout'):
             from native_images import verify_images
             if scale=='final':
-                options=[b.name for b in binaries if b.name not in ('base','fin-slabkey-pgo')]
+                options=[b.name for b in binaries if b.name not in ('base','fin-slabkey-pgo','shipreader-pgo',release_control)]
+                if not options:raise ValueError('No verified challenger reached the final-scale comparison')
                 if options:
                     practice_winner=min(options,key=lambda n: (practice_times[n]/practice_times['base'])*(performance[n]/performance['base'])**2)
                 note('Image selection',practice_winner+' by the product of the 20M ratio and the squared first 60M ratio; seed 733 is held out.')
             scales = [('practice',5),('final',3)] if scale=='final' else [('holdout',3)]
-            verify_images(root,area,practice_winner,run,note,env,scales)
+            verify_images(root,area,practice_winner,run,note,env,scales,release_control)
             if scale=='final':
                 # This job generated these input files and finished all seed-47 comparisons.
                 shutil.rmtree(data)
@@ -263,14 +283,14 @@ def main():
             raise ValueError('different row, time or key digests: '+filepath.name)
     note('Cumulative input digests','The released reader and selected challenger matched all control digests.')
     from phase_pmu import collect as phase_counters
-    for label in dict.fromkeys(['shipreader-pgo',practice_winner]):
+    for label in dict.fromkeys([release_control,practice_winner]):
         if (area/'bin'/label).is_file():phase_counters(root,area,label,note,run,env)
     from extra_checks import scaling, race
     scaling(root,area,practice_winner,note,run,env)
     from long_location_oracle import verify as verify_long_locations
     locgen=area/'generate-skewed-alias'
     run('g++-12','-std=c++20','-O2',root/'perf/native/long_location_input.cpp','-o',locgen)
-    verify_long_locations(area,locgen,list(dict.fromkeys([area/'bin/shipreader-pgo',area/'bin'/practice_winner])),note)
+    verify_long_locations(area,locgen,list(dict.fromkeys([area/'bin'/release_control,area/'bin'/practice_winner])),note)
     for name in dict.fromkeys([practice_winner, *[b for b in candidates if b.startswith("pipe")]]):
         if (area / "bin" / name).is_file():
             race(root,area,name,note,run,env)

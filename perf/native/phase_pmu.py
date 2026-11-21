@@ -105,7 +105,17 @@ def collect(root, area, variant, note, run, env):
                     summary.append(f'{resources[0][i][0][:25]} {statistics.median(x[0] for x in d):.0f}/{statistics.median(x[1] for x in d):.0f} faults, {statistics.median(x[2] for x in d):.3f} sys core-s, {max(x[3] for x in d):.0f} MiB high water')
                 note('Per-stage resources '+variant+' '+scale,' / '.join(summary))
             (area/'results'/('phase-usage-'+variant+'-'+scale+'.json')).write_text(json.dumps(dict(ranges=ranges,resources=resources,duties=duties)))
-        for event, period in [('cycles',750001), ('instructions',1000003), ('branch-misses',7001), ('cache-misses',7001), ('cpu-clock',250001)]:
+        counters=[('cycles',750001),('instructions',1000003),('branch-misses',7001),('cache-misses',7001),('cpu-clock',250001)]
+        available=subprocess.run(['perf','list','--raw-dump'],env=env,capture_output=True,text=True)
+        names=set(available.stdout.lower().split())
+        for choices,period in [
+            (('l2_rqsts.rfo_miss','l2_rqsts.all_rfo'),10007),
+            (('resource_stalls.sb','cycle_activity.stalls_mem_any'),750001),
+            (('dtlb_store_misses.walk_completed','dtlb_store_misses.stlb_hit'),1009),
+        ]:
+            event=next((name for name in choices if name in names),None)
+            if event:counters.append((event,period))
+        for event, period in counters:
             samples = work/(event+'.data')
             cmd = ['sudo','-n','perf','record','-q','--clockid','mono','-e',event,'-c',str(period),'-o',str(samples),'--',*task]
             proc = subprocess.run(cmd, env=env, capture_output=True, text=True)
