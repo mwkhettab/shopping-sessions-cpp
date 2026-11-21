@@ -1,0 +1,263 @@
+--- a/cpp/flat_parquet.hpp
++++ b/cpp/flat_parquet.hpp
+@@ -285,59 +285,85 @@
+ }
+ } // namespace flat_parquet
+ 
+-inline void write_users(const fs::path &path,
+-                        const std::vector<UserDay> &data) {
+-  MEASURE(parquet_write);
+-  using namespace flat_parquet;
+-  static constexpr Column cols[] = {
+-      {"user_id", 6, 0}, {"day", 1, 6},        {"sessions", 2},
+-      {"events", 2},     {"revenue_cents", 2}, {"top_category", 6, 0, true}};
+-  File file(path, cols);
+-  std::span<const UserDay> rows(data);
+-  std::array<Bytes, 6> pages;
+-  while (!rows.empty()) {
+-    size_t n = batch(rows, [](auto &r) {
+-      return (r.user.indirect() ? r.user.view().size() : 9) +
+-             (r.category ? r.category->size() : 0);
+-    });
+-    for (auto &p : pages) {
+-      p.clear();
+-      p.reserve(n * 12);
+-    }
+-    auto defs = levels(pages[5], n);
+-    for (size_t i = 0; i < n; ++i) {
+-      const auto &r = rows[i];
+-      std::array<char, 9> scratch;
+-      plain_string(pages[0], r.user.user_text(scratch));
+-      little(pages[1], r.day);
+-      little(pages[2], r.sessions);
+-      little(pages[3], r.events);
+-      little(pages[4], r.revenue);
+-      if (r.category) {
+-        auto &value = pages[5][defs + i / 8];
+-        value = char(static_cast<unsigned char>(value) | (1u << (i % 8)));
+-        plain_string(pages[5], *r.category);
+-      }
+-    }
+-    file.group(n);
+-    Bytes packed;
+-    for (size_t col = 0; col < pages.size(); ++col) {
+-      if (cols[col].physical == 6)
+-        file.page(pages[col]);
+-      else {
+-        packed.clear();
+-        packed.reserve(n * 4);
+-        if (cols[col].physical == 1)
+-          delta_pack<int32_t>(packed, pages[col]);
+-        else
+-          delta_pack<int64_t>(packed, pages[col]);
+-        file.page(packed, 5);
+-      }
+-    }
+-    rows = rows.subspan(n);
+-  }
+-  file.close();
+-}
++class UserFile {
++  using Bytes = flat_parquet::Bytes;
++  static constexpr flat_parquet::Column columns[] = {
++      {"user_id", 6, 0}, {"day", 1, 6}, {"sessions", 2}, {"events", 2},
++      {"revenue_cents", 2}, {"top_category", 6, 0, true}};
++  static constexpr size_t max_rows = 16384;
++  static constexpr size_t max_text_bytes = 8u << 20;
++
++  flat_parquet::File file;
++  std::array<Bytes, 6> values;
++  Bytes definitions, encoded;
++  size_t rows{}, text_bytes{};
++  std::array<char, 9> inline_name;
++  Key previous_user{};
++  Str user_name;
++
++  void flush() {
++    if (!rows)
++      return;
++    MEASURE(parquet_write);
++    file.group(rows);
++    file.page(values[0]);
++    for (size_t column = 1; column < 5; ++column) {
++      encoded.clear();
++      if (column == 1)
++        flat_parquet::delta_pack<int32_t>(encoded, values[column]);
++      else
++        flat_parquet::delta_pack<int64_t>(encoded, values[column]);
++      file.page(encoded, 5);
++    }
++    // Optional string pages place definition levels before the present values.
++    encoded.clear();
++    const size_t first = flat_parquet::levels(encoded, rows);
++    std::memcpy(encoded.data() + first, definitions.data(), definitions.size());
++    encoded.append(values[5]);
++    file.page(encoded);
++    for (auto &column : values)
++      column.clear();
++    definitions.clear();
++    rows = text_bytes = 0;
++  }
++
++public:
++  explicit UserFile(const fs::path &path) : file(path, columns) {
++    for (auto &column : values)
++      column.reserve(max_rows * 8);
++    definitions.reserve(max_rows / 8);
++    encoded.reserve(max_rows * 4);
++  }
++
++  void append(const UserDay &row) {
++    if (previous_user.bits != row.user.bits) {
++      user_name = row.user.user_text(inline_name);
++      previous_user = row.user;
++    }
++    const size_t extra = user_name.size() + (row.category ? row.category->size() : 0);
++    if (rows && (rows == max_rows || extra > std::max(max_text_bytes, text_bytes) - text_bytes))
++      flush();
++    text_bytes += extra;
++    flat_parquet::plain_string(values[0], user_name);
++    flat_parquet::little(values[1], row.day);
++    flat_parquet::little(values[2], row.sessions);
++    flat_parquet::little(values[3], row.events);
++    flat_parquet::little(values[4], row.revenue);
++    if (rows % 8 == 0)
++      definitions.push_back(0);
++    if (row.category) {
++      definitions.back() = char(static_cast<unsigned char>(definitions.back()) | (1u << (rows % 8)));
++      flat_parquet::plain_string(values[5], *row.category);
++    }
++    ++rows;
++  }
++
++  void close() {
++    flush();
++    file.close();
++  }
++};
++
+ inline void write_campaigns(const fs::path &path,
+                             const std::vector<CampaignDay> &data) {
+   using namespace flat_parquet;
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -164,7 +164,7 @@
+   ScratchArray<ActiveCampaign> activity;
+   ScratchArray<int64_t> spend;
+   std::vector<int> active, purchased;
+-  std::vector<UserDay> users;
++  std::unique_ptr<UserFile> user_file;
+   Totals sparse;
+   std::vector<Counts> table;
+   int32_t first_day{};
+@@ -185,20 +185,7 @@
+       return sparse[{campaign, day}];
+     return table[size_t(day - first_day) * campaigns + campaign];
+   }
+-  void merge_into(Totals &merged) const {
+-    auto add = [&](int campaign, int32_t day, const Counts &c) {
+-      auto &dest = merged[{campaign, day}];
+-      dest.sessions += c.sessions;
+-      dest.purchases += c.purchases;
+-      dest.revenue += c.revenue;
+-      dest.assists += c.assists;
+-    };
+-    for (auto &[k, c] : sparse)
+-      add(k.first, k.second, c);
+-    for (size_t i = 0; i < table.size(); ++i)
+-      if (table[i].sessions || table[i].assists)
+-        add(i % campaigns, first_day + int32_t(i / campaigns), table[i]);
+-  }
++
+ };
+ 
+ template <class Layout>
+@@ -233,11 +220,11 @@
+       auto &v = result.spend[k];
+       if (v > best || (v == best && cat.categories[k] < *daily.category)) {
+         best = v;
+-        daily.category = cat.categories[k];
++        daily.category = &cat.categories[k];
+       }
+       v = 0;
+     }
+-    result.users.push_back(daily);
++    result.user_file->append(daily);
+     result.purchased.clear();
+   };
+   auto begin_session = [&](Time start) {
+@@ -769,23 +756,42 @@
+   resolve_revisions(workers, threads, anchor);
+   timer.mark("global event dedup and loser removal");
+   std::vector<Result> results(threads);
+-  for (auto &result : results)
+-    result.configure(window, cat, threads);
+-  process_people(workers, results, cat, threads, timer, layout);
+   fs::create_directories(output / "user_daily");
+   fs::create_directories(output / "campaign_daily");
+   parallel(results.size(), threads, [&](size_t i, unsigned) {
+-    write_users(output / "user_daily" /
+-                    ("part-" + std::to_string(i) + ".parquet"),
+-                results[i].users);
++    auto &result = results[i];
++    result.configure(window, cat, threads);
++    result.user_file = std::make_unique<UserFile>(
++        output / "user_daily" / ("part-" + std::to_string(i) + ".parquet"));
+   });
+-  Totals merged;
+-  for (auto &r : results)
+-    r.merge_into(merged);
++  process_people(workers, results, cat, threads, timer, layout);
++  parallel(results.size(), threads, [&](size_t i, unsigned) {
++    results[i].user_file->close();
++  });
+   std::vector<CampaignDay> campaigns;
+-  for (auto &[key, c] : merged)
+-    campaigns.push_back(
+-        {cat.campaigns[key.first], cat.channels[key.first], key.second, c});
++  auto append = [&](size_t id, int32_t day, const Counts &counts) {
++    campaigns.push_back({cat.campaigns[id], cat.channels[id], day, counts});
++  };
++  const auto &first = results.front();
++  if (first.table.empty()) {
++    Totals merged;
++    for (const auto &part : results)
++      for (const auto &[key, counts] : part.sparse)
++        merged[key].add(counts);
++    for (const auto &[key, counts] : merged)
++      append(key.first, key.second, counts);
++  } else {
++    for (size_t start = 0; start < first.table.size(); start += first.campaigns) {
++      const int32_t day = first.first_day + int32_t(start / first.campaigns);
++      for (size_t id = 0; id < first.campaigns; ++id) {
++        Counts counts;
++        for (const auto &part : results)
++          counts.add(part.table[start + id]);
++        if (counts.sessions || counts.assists)
++          append(id, day, counts);
++      }
++    }
++  }
+   write_campaigns(output / "campaign_daily" / "part-0.parquet", campaigns);
+   timer.mark("merge and Parquet output");
+ #ifdef SHOPPING_DIAGNOSTICS
+--- a/cpp/output.hpp
++++ b/cpp/output.hpp
+@@ -3,10 +3,16 @@
+   Key user;
+   int32_t day;
+   int64_t sessions, events, revenue;
+-  std::optional<Str> category;
++  const Str *category{};
+ };
+ struct Counts {
+   int64_t sessions{}, purchases{}, revenue{}, assists{};
++  void add(const Counts &other) {
++    sessions += other.sessions;
++    purchases += other.purchases;
++    revenue += other.revenue;
++    assists += other.assists;
++  }
+ };
+ struct CampaignDay {
+   Str campaign, channel;

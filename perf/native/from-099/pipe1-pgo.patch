@@ -1,0 +1,392 @@
+--- /dev/null
++++ b/cpp/demand_slab.hpp
+@@ -0,0 +1,75 @@
++#pragma once
++template<class T,size_t Block> struct DemandSlab {
++  static_assert(std::has_single_bit(Block) && std::is_trivially_destructible_v<T>);
++  std::array<size_t,shards> counts{};
++  std::array<T*,shards> current{};
++  std::array<std::vector<T*>,shards> blocks;
++  std::vector<T*> extra;
++  std::allocator<T> allocator;
++  void *mapping=MAP_FAILED;
++  size_t bytes{},capacity{},issued{};
++  static constexpr size_t growth=std::max<size_t>(1,65536/(sizeof(T)*Block));
++  DemandSlab()=default;
++  DemandSlab(const DemandSlab&)=delete;
++  void reserve(size_t hint) {
++    if(!hint)return;
++    capacity=(hint*shards+Block-1)/Block;bytes=capacity*Block*sizeof(T);
++    mapping=mmap(nullptr,bytes,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
++    if(mapping==MAP_FAILED){capacity=0;return;}
++#ifdef MADV_HUGEPAGE
++    madvise(mapping,bytes,MADV_HUGEPAGE);
++#endif
++  }
++  T *take(){
++    size_t i=issued++;
++    if(i<capacity)return reinterpret_cast<T*>(mapping)+i*Block;
++    auto offset=(i-capacity)%growth;
++    if(!offset){
++      auto *new_page=allocator.allocate(growth*Block);
++      try{extra.push_back(new_page);}catch(...){allocator.deallocate(new_page,growth*Block);throw;}
++    }
++    return extra.back()+offset*Block;
++  }
++  template<class... A> size_t append(size_t b,A&&...args) {
++    size_t i=counts[b]++,offset=i%Block;
++    if(!offset) {
++      auto *next=take();blocks[b].push_back(next);current[b]=next;
++    }
++    std::construct_at(current[b]+offset,std::forward<A>(args)...);
++    return i;
++  }
++  template<class...A>T *append_address(size_t b,A&&...args){
++    size_t i=append(b,std::forward<A>(args)...);
++    return current[b]+i%Block;
++  }
++  struct View {
++    DemandSlab &s;size_t b;
++    size_t size()const{return s.counts[b];}
++    size_t capacity()const{return s.blocks[b].size()*Block;}
++    T &operator[](size_t i)const{return s.blocks[b][i/Block][i%Block];}
++    void push_back(T v){s.append(b,std::move(v));}
++    template<class... A> void emplace_back(A&&...args){s.append(b,std::forward<A>(args)...);}
++    void release(){std::vector<T*>().swap(s.blocks[b]);}
++    struct Range {
++      DemandSlab &s;size_t b;
++      struct Iter {
++        const Range *r;size_t i;
++        auto operator*()const{
++          auto &s=r->s;
++          return std::span<T>(s.blocks[r->b][i],std::min<size_t>(Block,s.counts[r->b]-i*Block));
++        }
++        Iter &operator++(){++i;return *this;}
++        bool operator!=(const Iter &other)const{return i!=other.i;}
++      };
++      Iter begin()const{return {this,0};}Iter end()const{return {this,s.blocks[b].size()};}
++    };
++    Range spans()const{return {s,b};}
++  };
++  View operator[](size_t b){return {*this,b};}
++  void release(){
++    if(mapping!=MAP_FAILED){munmap(mapping,bytes);mapping=MAP_FAILED;}
++    for(auto *p:extra)allocator.deallocate(p,growth*Block);
++    extra.clear();
++  }
++  ~DemandSlab(){release();}
++};
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -20,13 +20,14 @@
+ };
+ template <class T> using Bins = std::array<std::vector<T>, shards>;
+ #include "partition_slab.hpp"
++#include "demand_slab.hpp"
++#include "pipelined_winners.hpp"
+ template <class Layout> struct ScanWorker {
+   using EventData = typename Layout::E;
+   using ClickData = typename Layout::C;
+-  using Candidate = RevisionIndex;
+-  std::vector<ExtendedRevision> extended;
+-  PartitionSlab<Candidate> candidates;
+-  PartitionSlab<std::pair<Key, EventData>> events;
++  using WinnerPipeline = PipelinedWinners<128>;
++  typename WinnerPipeline::Producer producer;
++  DemandSlab<std::pair<Key,EventData>,64> events;
+   PartitionSlab<std::pair<Key, ClickData>> clicks;
+   struct Vertex {
+     Key name;
+@@ -330,74 +331,6 @@
+     last = now;
+   }
+ };
+-template <class Layout>
+-void resolve_revisions(std::vector<ScanWorker<Layout>> &workers,
+-                       unsigned threads, Time anchor) {
+-  using Candidate = typename ScanWorker<Layout>::Candidate;
+-  parallel(shards, threads, [&](size_t b, [[maybe_unused]] unsigned t) {
+-    size_t count = 0;
+-    for (auto &w : workers)
+-      count += w.candidates[b].size();
+-    // The low hash bits selected this shard. Use the remaining bits
+-    // for open addressing and compare the original bytes on a hash match.
+-    size_t capacity = 1;
+-    while (capacity < count + count / 2)
+-      capacity *= 2;
+-    MEASURE(dedup);
+-    std::vector<uint64_t> best(capacity);
+-    auto seconds = [&](const Candidate &r, unsigned owner) {
+-      return r.ingest & 0x80000000u
+-                 ? workers[owner].extended[r.location].seconds
+-                 : Time(r.ingest) - Time(1u << 30) + anchor;
+-    };
+-    auto discard = [&](const Candidate &r, unsigned owner) {
+-      auto &w = workers[owner];
+-      uint64_t location =
+-          r.ingest & 0x80000000u ? w.extended[r.location].location : r.location;
+-      if (location) {
+-        --location;
+-        w.events[location % shards][location / shards].first.bits = 0;
+-      }
+-    };
+-    for (unsigned owner = 0; owner < workers.size(); ++owner) {
+-      auto &refs = workers[owner].candidates[b];
+-      // Reserve zero for an empty slot. Six low bits identify one of at most
+-      // 64 input workers, and the remaining bits locate its immutable revision.
+-      for (size_t i = 0; i < refs.size(); ++i) {
+-        auto &r = refs[i];
+-        size_t at = (r.id.hash() / shards) & (capacity - 1);
+-        for (;;) {
+-          auto code = best[at];
+-          if (!code) {
+-            best[at] = 1 + (i << 6) + owner;
+-            break;
+-          }
+-          auto old_owner = unsigned((code - 1) & 63);
+-          auto &old = workers[old_owner].candidates[b][(code - 1) >> 6];
+-          if (old.id == r.id) {
+-#ifdef SHOPPING_DIAGNOSTICS
+-            ++workers[t].duplicates;
+-#endif
+-            bool before = (r.ingest | old.ingest) & 0x80000000u
+-                              ? seconds(r, owner) < seconds(old, old_owner)
+-                              : r.ingest < old.ingest;
+-            if (before) {
+-              discard(old, old_owner);
+-              best[at] = 1 + (i << 6) + owner;
+-            } else
+-              discard(r, owner);
+-            break;
+-          }
+-          at = (at + 1) & (capacity - 1);
+-        }
+-      }
+-    }
+-    for (auto &w : workers)
+-      w.candidates[b].release();
+-  });
+-  for (auto &w : workers)
+-    w.candidates.release();
+-}
+ template <class Layout>
+ void process_people(std::vector<ScanWorker<Layout>> &workers,
+                     std::vector<Result> &results, const Catalog &cat,
+@@ -639,11 +572,12 @@
+ void run_layout(const fs::path &data, const fs::path &output, unsigned threads,
+                 Input &input, Window window, Catalog &cat, Timer &timer,
+                 Layout layout) {
+-  using Candidate = RevisionIndex;
+   using Worker = ScanWorker<Layout>;
+   auto links = input.parts(data / "links");
+   timer.mark("catalogs and link mapping");
+-  std::vector<Worker> workers(threads);
++  unsigned consumers=std::min<unsigned>(1,threads/2);
++  unsigned readers=threads-consumers;
++  std::vector<Worker> workers(readers);
+   auto events = input.parts(data / "events");
+   timer.mark("map event files");
+   auto clicks = input.parts(data / "clicks");
+@@ -664,9 +598,8 @@
+   };
+   auto event_count = estimate(events), click_count = estimate(clicks);
+   auto hint = [&](size_t count, size_t row_bytes, size_t budget) {
+-    return std::min(count + count / 8, budget / row_bytes) / threads / shards;
+-  };
+-  auto rev_hint = hint(event_count, sizeof(Candidate), size_t(1536) << 20);
++    return std::min(count + count / 8, budget / row_bytes) / readers / shards;
++  };
+   auto event_hint =
+       hint(event_count, sizeof(std::pair<Key, typename Layout::E>),
+            size_t(1536) << 20);
+@@ -674,13 +607,12 @@
+       hint(click_count, sizeof(std::pair<Key, typename Layout::C>),
+            size_t(768) << 20);
+   for (auto &w : workers) {
+-    w.candidates.reserve(rev_hint);
+     w.events.reserve(event_hint);
+     w.clicks.reserve(click_hint);
+   }
+-  const Time anchor = window.start / 1000;
++  typename Worker::WinnerPipeline winners(consumers,event_count);
+   parallel(
+-      links.size() + events.size() + clicks.size(), threads,
++      links.size() + events.size() + clicks.size(), readers,
+       [&](size_t job, unsigned t) {
+         if (job < links.size()) {
+           auto &w = workers[t];
+@@ -728,46 +660,14 @@
+ #endif
+           Key user = e.ts == bad ? Key{} : workers[t].pool.encode(r[1], 'u');
+           auto &w = workers[t];
+-          uint64_t location = 0;
+-          if (user.bits) {
+-            size_t b = user.hash() % shards;
+-            auto &rows = w.events[b];
+-            location = uint64_t(rows.size()) * shards + b + 1;
+-            rows.emplace_back(Key{user.bits}, layout.pack(e));
+-          }
+-          Time seconds = ingest / 1000;
+-          Time relative = seconds - anchor;
+-          // Bias signed seconds into 31 bits. The high bit selects the overflow
+-          // vector.
+-          uint64_t when = uint64_t(relative) + (uint64_t{1} << 30);
+-          Candidate ref{id, 0, 0};
+-          if (when < 0x80000000ULL && location <= UINT32_MAX) {
+-            ref.ingest = uint32_t(when);
+-            ref.location = uint32_t(location);
+-          } else {
+-            if (w.extended.size() > UINT32_MAX)
+-              throw std::length_error("revision index exhausted");
+-            ref.ingest = 0x80000000u;
+-            ref.location = uint32_t(w.extended.size());
+-            w.extended.push_back({seconds, location});
+-          }
+-          w.candidates[bucket(id)].push_back(ref);
++          Key *event=nullptr;
++          if(user.bits)event=&w.events.append_address(user.hash()%shards,Key{user.bits},layout.pack(e))->first;
++          winners.push(w.producer,{id,ingest,event});
+         });
+       });
+-  timer.mark("concurrent input, raw user partition and revision index");
+-#ifdef SHOPPING_DIAGNOSTICS
+-  size_t revision_count = 0, revision_capacity = 0;
+-  for (const auto &worker : workers)
+-    for (const auto &bin : worker.candidates) {
+-      revision_count += bin.size();
+-      revision_capacity += bin.capacity();
+-    }
+-  std::cerr << "revision storage " << revision_count * sizeof(Candidate)
+-            << " used bytes, " << revision_capacity * sizeof(Candidate)
+-            << " capacity bytes\n";
+-#endif
+-  resolve_revisions(workers, threads, anchor);
+-  timer.mark("global event dedup and loser removal");
++  parallel(workers.size(),readers,[&](size_t i,unsigned){winners.flush(workers[i].producer);});
++  winners.finish();
++  timer.mark("concurrent input, partition and global revision resolution");
+   std::vector<Result> results(threads);
+   for (auto &result : results)
+     result.configure(window, cat, threads);
+--- /dev/null
++++ b/cpp/pipelined_winners.hpp
+@@ -0,0 +1,119 @@
++#pragma once
++#include <condition_variable>
++
++template<unsigned BatchSize> class PipelinedWinners {
++public:
++  struct Revision {Key id;Time ingest;Key *event;};
++private:
++  struct Batch {
++    unsigned bucket{};
++    std::vector<Revision> rows;
++    Batch(){rows.reserve(BatchSize);}
++  };
++  using Packet=std::unique_ptr<Batch>;
++  struct Table {
++    std::vector<Revision> slots;
++    size_t used{};
++    static size_t locate(const std::vector<Revision> &table,Key id){
++      size_t at=(id.hash()/shards)&(table.size()-1);
++      while(table[at].id.bits && !(table[at].id==id))at=(at+1)&(table.size()-1);
++      return at;
++    }
++    void accept(const Revision &r,size_t initial){
++      if(slots.empty())slots.resize(initial);
++      if(used*10>=slots.size()*7) {
++        std::vector<Revision> grown(slots.size()*2);
++        for(auto &v:slots)if(v.id.bits)grown[locate(grown,v.id)]=v;
++        slots.swap(grown);
++      }
++      auto &old=slots[locate(slots,r.id)];
++      if(!old.id.bits){old=r;++used;return;}
++      if(r.ingest<old.ingest){if(old.event)old.event->bits=0;old=r;}
++      else if(r.event)r.event->bits=0;
++    }
++  };
++  struct Lane {
++    std::mutex mutex;
++    std::condition_variable changed;
++    bool done{};
++    std::vector<Packet> queue,free;
++  };
++  std::array<Table,shards> tables;
++  std::vector<std::unique_ptr<Lane>> lanes;
++  std::vector<std::jthread> reducers;
++  size_t initial;
++  bool serial;
++  std::mutex errors;
++  std::exception_ptr failure;
++  void stop(){
++    for(auto &p:lanes){
++      {std::lock_guard lock(p->mutex);p->done=true;}
++      p->changed.notify_all();
++    }
++  }
++  void reduce(Lane &lane){
++    try {
++      std::vector<Packet> work;
++      for(;;){
++        {
++          std::unique_lock lock(lane.mutex);
++          lane.changed.wait(lock,[&]{return lane.done||!lane.queue.empty();});
++          if(lane.queue.empty())break;
++          work.swap(lane.queue);
++        }
++        lane.changed.notify_all();
++        for(auto &batch:work) {
++          auto &table=tables[batch->bucket];
++          for(auto &r:batch->rows)table.accept(r,initial);
++          batch->rows.clear();
++        }
++        {
++          std::lock_guard lock(lane.mutex);
++          for(auto &p:work)if(lane.free.size()<128)lane.free.push_back(std::move(p));
++        }
++        work.clear();
++      }
++    }catch(...) {
++      {std::lock_guard lock(errors);if(!failure)failure=std::current_exception();}
++      stop();
++    }
++  }
++  Packet publish(Packet batch){
++    auto &lane=*lanes[batch->bucket%lanes.size()];
++    Packet empty;
++    {
++      std::unique_lock lock(lane.mutex);
++      lane.changed.wait(lock,[&]{return lane.done||lane.queue.size()<64;});
++      if(lane.done)throw std::runtime_error("revision consumer stopped");
++      lane.queue.emplace_back(std::move(batch));
++      if(!lane.free.empty()){empty=std::move(lane.free.back());lane.free.pop_back();}
++    }
++    lane.changed.notify_all();
++    return empty;
++  }
++public:
++  struct Producer {std::array<Packet,shards> current;};
++  PipelinedWinners(unsigned n,size_t estimated):initial(std::bit_ceil(std::clamp<size_t>(estimated/shards+estimated/shards/2,16,65536))),serial(n==0){
++    for(unsigned i=0;i<n;++i)lanes.push_back(std::make_unique<Lane>());
++    try{for(auto &p:lanes)reducers.emplace_back([this,lane=p.get()]{reduce(*lane);});}
++    catch(...){stop();throw;}
++  }
++  ~PipelinedWinners(){stop();reducers.clear();}
++  void push(Producer &p,Revision r) {
++    auto b=unsigned(r.id.hash()%shards);
++    if(serial){tables[b].accept(r,initial);return;}
++    auto &batch=p.current[b];
++    if(!batch)batch=std::make_unique<Batch>();
++    batch->bucket=b;batch->rows.push_back(r);
++    if(batch->rows.size()==BatchSize)batch=publish(std::move(batch));
++  }
++  void flush(Producer &p){
++    if(serial)return;
++    for(auto &batch:p.current)if(batch&&!batch->rows.empty())publish(std::move(batch));
++  }
++  void finish(){
++    stop();reducers.clear();
++    if(failure)std::rethrow_exception(failure);
++    for(auto &tab:tables)std::vector<Revision>().swap(tab.slots);
++  }
++};

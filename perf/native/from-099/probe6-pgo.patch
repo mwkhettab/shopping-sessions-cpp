@@ -1,0 +1,14 @@
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -364,6 +364,11 @@
+       // Reserve zero for an empty slot. Six low bits identify one of at most
+       // 64 input workers, and the remaining bits locate its immutable revision.
+       for (size_t i = 0; i < refs.size(); ++i) {
++        constexpr size_t distance=6;
++        if(refs.size()-i>distance){
++          const auto &future=refs[i+distance];
++          __builtin_prefetch(best.data()+((future.id.hash()/shards)&(capacity-1)),1,2);
++        }
+         auto &r = refs[i];
+         size_t at = (r.id.hash() / shards) & (capacity - 1);
+         for (;;) {

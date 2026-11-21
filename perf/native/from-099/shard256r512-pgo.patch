@@ -1,0 +1,95 @@
+--- a/cpp/input.hpp
++++ b/cpp/input.hpp
+@@ -427,7 +427,7 @@
+     return {reinterpret_cast<uintptr_t>(&other.back()) | 1};
+   }
+ };
+-constexpr size_t shards = 512;
++constexpr size_t shards=256,revision_shards=512;
+ template <class F> void parallel(size_t jobs, unsigned threads, F &&f) {
+   std::atomic<size_t> next{0};
+   std::exception_ptr error;
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -6,7 +6,7 @@
+ #include <regex>
+ #include <span>
+ 
+-size_t bucket(Key k) { return k.hash() % shards; }
++size_t bucket(Key k) { return k.hash() % revision_shards; }
+ #include "event_layout.hpp"
+ struct RevisionIndex {
+   Key id;
+@@ -25,7 +25,7 @@
+   using ClickData = typename Layout::C;
+   using Candidate = RevisionIndex;
+   std::vector<ExtendedRevision> extended;
+-  PartitionSlab<Candidate> candidates;
++  PartitionSlab<Candidate,revision_shards> candidates;
+   PartitionSlab<std::pair<Key, EventData>> events;
+   PartitionSlab<std::pair<Key, ClickData>> clicks;
+   struct Vertex {
+@@ -334,7 +334,7 @@
+ void resolve_revisions(std::vector<ScanWorker<Layout>> &workers,
+                        unsigned threads, Time anchor) {
+   using Candidate = typename ScanWorker<Layout>::Candidate;
+-  parallel(shards, threads, [&](size_t b, [[maybe_unused]] unsigned t) {
++  parallel(revision_shards, threads, [&](size_t b, [[maybe_unused]] unsigned t) {
+     size_t count = 0;
+     for (auto &w : workers)
+       count += w.candidates[b].size();
+@@ -365,7 +365,7 @@
+       // 64 input workers, and the remaining bits locate its immutable revision.
+       for (size_t i = 0; i < refs.size(); ++i) {
+         auto &r = refs[i];
+-        size_t at = (r.id.hash() / shards) & (capacity - 1);
++        size_t at = (r.id.hash() / revision_shards) & (capacity - 1);
+         for (;;) {
+           auto code = best[at];
+           if (!code) {
+@@ -663,10 +663,10 @@
+     return sampled ? size_t(double(total) * count / sampled) : 0;
+   };
+   auto event_count = estimate(events), click_count = estimate(clicks);
+-  auto hint = [&](size_t count, size_t row_bytes, size_t budget) {
+-    return std::min(count + count / 8, budget / row_bytes) / threads / shards;
+-  };
+-  auto rev_hint = hint(event_count, sizeof(Candidate), size_t(1536) << 20);
++  auto hint = [&](size_t count, size_t row_bytes, size_t budget,size_t parts=shards) {
++    return std::min(count + count / 8, budget / row_bytes) / threads / parts;
++  };
++  auto rev_hint = hint(event_count, sizeof(Candidate), size_t(1536) << 20,revision_shards);
+   auto event_hint =
+       hint(event_count, sizeof(std::pair<Key, typename Layout::E>),
+            size_t(1536) << 20);
+--- a/cpp/partition_slab.hpp
++++ b/cpp/partition_slab.hpp
+@@ -20,8 +20,8 @@
+   void push_back(T v) { emplace_back(v); }
+   void release() { std::vector<T>().swap(tail); }
+ };
+-template <class T> struct PartitionSlab {
+-  std::array<PartitionBucket<T>, shards> buckets;
++template <class T,size_t Parts=shards> struct PartitionSlab {
++  std::array<PartitionBucket<T>, Parts> buckets;
+   void *region = MAP_FAILED;
+   size_t bytes{};
+   PartitionSlab() = default;
+@@ -31,7 +31,7 @@
+       return;
+     size_t page = 4096;
+     size_t stride = (count * sizeof(T) + page - 1) / page * page;
+-    bytes = stride * shards;
++    bytes = stride * Parts;
+     region = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+     if (region == MAP_FAILED)
+@@ -39,7 +39,7 @@
+ #ifdef MADV_HUGEPAGE
+     madvise(region, bytes, MADV_HUGEPAGE);
+ #endif
+-    for (size_t i = 0; i < shards; ++i) {
++    for (size_t i = 0; i < Parts; ++i) {
+       buckets[i].data =
+           reinterpret_cast<T *>(static_cast<char *>(region) + i * stride);
+       buckets[i].limit = stride / sizeof(T);

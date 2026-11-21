@@ -1,0 +1,205 @@
+--- /dev/null
++++ b/cpp/hot_slab.hpp
+@@ -0,0 +1,52 @@
++#pragma once
++template<class T,bool Starts,bool Color> struct HotSlab {
++  static_assert(std::is_trivially_destructible_v<T>);
++  std::array<size_t,shards> counts{};
++  std::conditional_t<Starts,std::array<T*,shards>,std::array<T*,0>> starts{};
++  std::array<std::vector<T>,shards> spill;
++  void *region=MAP_FAILED;
++  size_t bytes{},stride{},cap{};
++  HotSlab()=default;
++  HotSlab(const HotSlab&)=delete;
++  T *begin_at(size_t b) const {
++    if constexpr(Starts)return starts[b];
++    else {
++      if(!cap)return nullptr;
++      return reinterpret_cast<T*>(static_cast<char*>(region)+b*stride+(Color?((b*13)&63)*64:0));
++    }
++  }
++  void reserve(size_t n) {
++    if(!n)return;
++    constexpr size_t page=4096;
++    size_t usable=(n*sizeof(T)+page-1)/page*page;
++    stride=usable+(Color?page:0);
++    bytes=stride*shards;
++    region=mmap(nullptr,bytes,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
++    if(region==MAP_FAILED)return;
++    cap=usable/sizeof(T);
++#ifdef MADV_HUGEPAGE
++    madvise(region,bytes,MADV_HUGEPAGE);
++#endif
++    if constexpr(Starts)for(size_t b=0;b<shards;++b)
++      starts[b]=reinterpret_cast<T*>(static_cast<char*>(region)+b*stride+(Color?((b*13)&63)*64:0));
++  }
++  template<class...A> size_t append(size_t b,A&&...args) {
++    size_t i=counts[b]++;
++    if(i<cap)std::construct_at(begin_at(b)+i,std::forward<A>(args)...);
++    else spill[b].emplace_back(std::forward<A>(args)...);
++    return i;
++  }
++  struct View {
++    HotSlab &s;size_t b;
++    size_t size()const{return s.counts[b];}
++    size_t capacity()const{return s.cap+s.spill[b].capacity();}
++    auto spans()const{return std::array{std::span<T>(s.begin_at(b),std::min(s.cap,size())),std::span<T>(s.spill[b])};}
++    T &operator[](size_t i)const{return i<s.cap?s.begin_at(b)[i]:s.spill[b][i-s.cap];}
++    void push_back(T value){s.append(b,std::move(value));}
++    template<class...A> void emplace_back(A&&...args){s.append(b,std::forward<A>(args)...);}
++    void release(){std::vector<T>().swap(s.spill[b]);}
++  };
++  View operator[](size_t b){return {*this,b};}
++  void release(){if(region!=MAP_FAILED){munmap(region,bytes);region=MAP_FAILED;cap=0;}}
++  ~HotSlab(){release();}
++};
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -8,9 +8,10 @@
+ 
+ size_t bucket(Key k) { return k.hash() % shards; }
+ #include "event_layout.hpp"
+-struct RevisionIndex {
+-  Key id;
+-  uint32_t ingest, location;
++template<class E> struct UnifiedRevision {
++  Key id,user;
++  E event;
++  uint32_t ingest,extra;
+ };
+ // Extended entries preserve the full ingest second and row position when
+ // either falls outside the compact index. Invalid revisions have location 0.
+@@ -20,14 +21,15 @@
+ };
+ template <class T> using Bins = std::array<std::vector<T>, shards>;
+ #include "partition_slab.hpp"
++#include "hot_slab.hpp"
+ template <class Layout> struct ScanWorker {
+   using EventData = typename Layout::E;
+   using ClickData = typename Layout::C;
+-  using Candidate = RevisionIndex;
++  using Candidate = UnifiedRevision<EventData>;
+   std::vector<ExtendedRevision> extended;
+   PartitionSlab<Candidate> candidates;
+-  PartitionSlab<std::pair<Key, EventData>> events;
+-  PartitionSlab<std::pair<Key, ClickData>> clicks;
++  HotSlab<std::pair<Key,EventData>,true,false> events;
++  HotSlab<std::pair<Key,ClickData>,true,false> clicks;
+   struct Vertex {
+     Key name;
+     Vertex *parent, *next;
+@@ -347,17 +349,8 @@
+     std::vector<uint64_t> best(capacity);
+     auto seconds = [&](const Candidate &r, unsigned owner) {
+       return r.ingest & 0x80000000u
+-                 ? workers[owner].extended[r.location].seconds
++                 ? workers[owner].extended[r.extra].seconds
+                  : Time(r.ingest) - Time(1u << 30) + anchor;
+-    };
+-    auto discard = [&](const Candidate &r, unsigned owner) {
+-      auto &w = workers[owner];
+-      uint64_t location =
+-          r.ingest & 0x80000000u ? w.extended[r.location].location : r.location;
+-      if (location) {
+-        --location;
+-        w.events[location % shards][location / shards].first.bits = 0;
+-      }
+     };
+     for (unsigned owner = 0; owner < workers.size(); ++owner) {
+       auto &refs = workers[owner].candidates[b];
+@@ -382,16 +375,21 @@
+                               ? seconds(r, owner) < seconds(old, old_owner)
+                               : r.ingest < old.ingest;
+             if (before) {
+-              discard(old, old_owner);
++              old.user.bits=0;
+               best[at] = 1 + (i << 6) + owner;
+             } else
+-              discard(r, owner);
++              r.user.bits=0;
+             break;
+           }
+           at = (at + 1) & (capacity - 1);
+         }
+       }
+     }
++    auto emit=[&](const Candidate &r){
++      if(r.user.bits)workers[t].events[r.user.hash()%shards].emplace_back(r.user,r.event);
++    };
++    for(auto &w:workers)for(auto part:w.candidates[b].spans())
++      for(auto &r:part)emit(r);
+     for (auto &w : workers)
+       w.candidates[b].release();
+   });
+@@ -639,8 +637,8 @@
+ void run_layout(const fs::path &data, const fs::path &output, unsigned threads,
+                 Input &input, Window window, Catalog &cat, Timer &timer,
+                 Layout layout) {
+-  using Candidate = RevisionIndex;
+   using Worker = ScanWorker<Layout>;
++  using Candidate=typename Worker::Candidate;
+   auto links = input.parts(data / "links");
+   timer.mark("catalogs and link mapping");
+   std::vector<Worker> workers(threads);
+@@ -666,7 +664,7 @@
+   auto hint = [&](size_t count, size_t row_bytes, size_t budget) {
+     return std::min(count + count / 8, budget / row_bytes) / threads / shards;
+   };
+-  auto rev_hint = hint(event_count, sizeof(Candidate), size_t(1536) << 20);
++  auto rev_hint = hint(event_count, sizeof(Candidate), size_t(3072) << 20);
+   auto event_hint =
+       hint(event_count, sizeof(std::pair<Key, typename Layout::E>),
+            size_t(1536) << 20);
+@@ -728,33 +726,20 @@
+ #endif
+           Key user = e.ts == bad ? Key{} : workers[t].pool.encode(r[1], 'u');
+           auto &w = workers[t];
+-          uint64_t location = 0;
+-          if (user.bits) {
+-            size_t b = user.hash() % shards;
+-            auto &rows = w.events[b];
+-            location = uint64_t(rows.size()) * shards + b + 1;
+-            rows.emplace_back(Key{user.bits}, layout.pack(e));
+-          }
+-          Time seconds = ingest / 1000;
+-          Time relative = seconds - anchor;
+-          // Bias signed seconds into 31 bits. The high bit selects the overflow
+-          // vector.
+-          uint64_t when = uint64_t(relative) + (uint64_t{1} << 30);
+-          Candidate ref{id, 0, 0};
+-          if (when < 0x80000000ULL && location <= UINT32_MAX) {
+-            ref.ingest = uint32_t(when);
+-            ref.location = uint32_t(location);
+-          } else {
+-            if (w.extended.size() > UINT32_MAX)
+-              throw std::length_error("revision index exhausted");
+-            ref.ingest = 0x80000000u;
+-            ref.location = uint32_t(w.extended.size());
+-            w.extended.push_back({seconds, location});
++          Time seconds=ingest/1000;
++          uint64_t when=uint64_t(seconds-anchor)+(uint64_t{1}<<30);
++          Candidate ref{id,user,user.bits?layout.pack(e):typename Layout::E{},0,0};
++          if(when<0x80000000ULL)ref.ingest=uint32_t(when);
++          else {
++            if(w.extended.size()>UINT32_MAX)throw std::length_error("revision index exhausted");
++            ref.ingest=0x80000000u;
++            ref.extra=uint32_t(w.extended.size());
++            w.extended.push_back({seconds,0});
+           }
+           w.candidates[bucket(id)].push_back(ref);
+         });
+       });
+-  timer.mark("concurrent input, raw user partition and revision index");
++  timer.mark("concurrent input and unified revision records");
+ #ifdef SHOPPING_DIAGNOSTICS
+   size_t revision_count = 0, revision_capacity = 0;
+   for (const auto &worker : workers)
+@@ -767,7 +752,7 @@
+             << " capacity bytes\n";
+ #endif
+   resolve_revisions(workers, threads, anchor);
+-  timer.mark("global event dedup and loser removal");
++  timer.mark("global event dedup and partition of winners");
+   std::vector<Result> results(threads);
+   for (auto &result : results)
+     result.configure(window, cat, threads);

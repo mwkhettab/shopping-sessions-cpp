@@ -83,6 +83,7 @@ def main():
             run(python,root/'verify.py',binary,area/'dev','--starter',area/'starter-pyspark','--answer',area/'dev-answer')
             run(python,root/'perf/native/random_rules.py',binary)
             run(python,root/'perf/native/interval_oracle.py',binary)
+            run(python,root/'perf/native/page_oracle.py',binary)
             binaries.append(binary)
         except (subprocess.CalledProcessError,OSError) as exc:
             if name=='base': raise
@@ -207,7 +208,9 @@ def main():
     collect(root,area,'base',note,run,env)
     from extra_checks import scaling, race
     scaling(root,area,practice_winner,note,run,env)
-    race(root,area,practice_winner,note,run,env)
+    for name in dict.fromkeys([practice_winner, *[b for b in candidates if b.startswith("pipe")]]):
+        if (area / "bin" / name).is_file():
+            race(root,area,name,note,run,env)
 
 published=0
 def publish():

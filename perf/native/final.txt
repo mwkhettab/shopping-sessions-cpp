@@ -1,1 +1,1 @@
-base fin-slabkey-pgo streamout-pgo streamdense-pgo @best
+base fin-slabkey-pgo releasecampaign-pgo releasewriter-pgo pagelines-pgo @best

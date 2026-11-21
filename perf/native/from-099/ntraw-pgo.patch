@@ -1,0 +1,104 @@
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -20,14 +20,15 @@
+ };
+ template <class T> using Bins = std::array<std::vector<T>, shards>;
+ #include "partition_slab.hpp"
++#include "writecombine.hpp"
+ template <class Layout> struct ScanWorker {
+   using EventData = typename Layout::E;
+   using ClickData = typename Layout::C;
+   using Candidate = RevisionIndex;
+   std::vector<ExtendedRevision> extended;
+   PartitionSlab<Candidate> candidates;
+-  PartitionSlab<std::pair<Key, EventData>> events;
+-  PartitionSlab<std::pair<Key, ClickData>> clicks;
++  BufferedSlab<RawRecord<EventData>,true,1> events;
++  BufferedSlab<RawRecord<ClickData>,true,1> clicks;
+   struct Vertex {
+     Key name;
+     Vertex *parent, *next;
+@@ -709,7 +710,7 @@
+ #ifdef SHOPPING_DIAGNOSTICS
+             ++workers[t].valid_clicks;
+ #endif
+-            workers[t].clicks[alias.hash() % shards].emplace_back(
++            workers[t].clicks.append(alias.hash()%shards,
+                 Key{alias.bits},
+                 layout.click(workers[t].pool.encode(r[0], 'k'), ts, c));
+           });
+@@ -731,9 +732,8 @@
+           uint64_t location = 0;
+           if (user.bits) {
+             size_t b = user.hash() % shards;
+-            auto &rows = w.events[b];
+-            location = uint64_t(rows.size()) * shards + b + 1;
+-            rows.emplace_back(Key{user.bits}, layout.pack(e));
++            size_t i=w.events.append(b,Key{user.bits},layout.pack(e));
++            location=uint64_t(i)*shards+b+1;
+           }
+           Time seconds = ingest / 1000;
+           Time relative = seconds - anchor;
+@@ -754,6 +754,7 @@
+           w.candidates[bucket(id)].push_back(ref);
+         });
+       });
++  parallel(workers.size(),threads,[&](size_t i,unsigned){auto &w=workers[i];w.events.finish();w.clicks.finish();});
+   timer.mark("concurrent input, raw user partition and revision index");
+ #ifdef SHOPPING_DIAGNOSTICS
+   size_t revision_count = 0, revision_capacity = 0;
+--- /dev/null
++++ b/cpp/writecombine.hpp
+@@ -0,0 +1,52 @@
++#pragma once
++#include <numeric>
++template<class E> struct RawRecord {
++  Key first;E second;
++};
++template<class T,bool Stream,size_t Lines> struct BufferedSlab {
++  static_assert(std::is_trivially_copyable_v<T>);
++  static constexpr size_t n=Lines*(64/std::gcd(size_t(64),sizeof(T)));
++  struct alignas(64) Line {std::array<T,n> entries;};
++  std::array<size_t,shards> issued{};
++  std::array<Line,shards> pending;
++  PartitionSlab<T> target;
++  void reserve(size_t count){target.reserve(count);}
++  void flush(size_t bucket,size_t length){
++    auto &v=target[bucket];auto *src=pending[bucket].entries.data();
++    auto available=v.limit-v.used;
++    size_t count=std::min(length,available);
++    if(count){
++      T *dst=v.data+v.used;
++#ifdef __SSE2__
++      if constexpr(Stream){
++        if(count==n && (uintptr_t(dst)%16)==0){
++          std::uninitialized_default_construct_n(dst,n);
++          auto *in=reinterpret_cast<const unsigned char*>(src);
++          auto *out=reinterpret_cast<unsigned char*>(dst);
++          for(size_t j=0;j<n*sizeof(T);j+=16)
++            _mm_stream_si128(reinterpret_cast<__m128i*>(out+j),_mm_loadu_si128(reinterpret_cast<const __m128i*>(in+j)));
++        }else std::uninitialized_copy_n(src,count,dst);
++      }else
++#endif
++        std::uninitialized_copy_n(src,count,dst);
++      v.used+=count;
++    }
++    if(count<length)v.tail.insert(v.tail.end(),src+count,src+length);
++  }
++  template<class... A> size_t append(size_t b,A&&...args){
++    size_t i=issued[b]++,at=i%n;
++    pending[b].entries[at]=T{std::forward<A>(args)...};
++    if(at+1==n)flush(b,n);
++    return i;
++  }
++  void finish(){
++    for(size_t b=0;b<shards;++b)if(issued[b]%n)flush(b,issued[b]%n);
++#ifdef __SSE2__
++    if constexpr(Stream)_mm_sfence();
++#endif
++  }
++  auto &operator[](size_t b){return target[b];}
++  const auto &operator[](size_t b)const{return target[b];}
++  auto begin()const{return target.begin();}auto end()const{return target.end();}
++  void release(){target.release();}
++};
