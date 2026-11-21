@@ -1,0 +1,514 @@
+--- a/cpp/flat_parquet.hpp
++++ b/cpp/flat_parquet.hpp
+@@ -66,6 +66,7 @@
+ struct Page {
+   uint64_t offset, bytes;
+   int encoding;
++  uint64_t dictionary=UINT64_MAX;
+ };
+ struct Group {
+   size_t rows{};
+@@ -78,7 +79,7 @@
+   std::ofstream stream;
+   std::span<const Column> columns;
+   std::vector<Group> groups;
+-  uint64_t position{}, total_rows{};
++  uint64_t position{}, total_rows{}, dictionary_start=UINT64_MAX;
+   void write(Str bytes) {
+     stream.write(bytes.data(), std::streamsize(bytes.size()));
+     position += bytes.size();
+@@ -94,6 +95,18 @@
+   void group(size_t n) {
+     groups.emplace_back().rows = n;
+     total_rows += n;
++  }
++  void dictionary(Str data,size_t entries) {
++    if(data.size()>INT32_MAX || !entries || entries>INT32_MAX || dictionary_start!=UINT64_MAX)
++      throw std::length_error("invalid Parquet dictionary");
++    Bytes header;
++    Fields page{header};
++    page.integer(1,2);page.integer(2,data.size());page.integer(3,data.size());
++    page.field(7,Struct);
++    Fields content{header};
++    content.integer(1,entries);content.integer(2,0);
++    content.finish();page.finish();
++    dictionary_start=position;write(header);write(data);
+   }
+   void page(Str data, int encoding = 0) {
+     if (data.size() > INT32_MAX)
+@@ -113,7 +126,9 @@
+     dh.finish();
+     ph.finish();
+     uint64_t bytes = header.size() + data.size();
+-    g.pages.push_back({position, bytes, encoding});
++    if(dictionary_start!=UINT64_MAX)bytes+=position-dictionary_start;
++    g.pages.push_back({position, bytes, encoding,dictionary_start});
++    dictionary_start=UINT64_MAX;
+     g.bytes += bytes;
+     write(header);
+     write(data);
+@@ -155,8 +170,9 @@
+         chunk.field(3, Struct);
+         Fields md{footer};
+         md.integer(1, c.physical);
+-        md.sequence(2, c.optional ? 2 : 1, I32);
++        md.sequence(2, 1+unsigned(c.optional)+unsigned(p.dictionary!=UINT64_MAX), I32);
+         varint(footer, unsigned(p.encoding) * 2);
++        if(p.dictionary!=UINT64_MAX)varint(footer,0);
+         if (c.optional)
+           varint(footer, 6);
+         md.sequence(3, 1, String);
+@@ -166,6 +182,7 @@
+         md.integer(6, p.bytes, I64);
+         md.integer(7, p.bytes, I64);
+         md.integer(9, p.offset, I64);
++        if(p.dictionary!=UINT64_MAX)md.integer(11,p.dictionary,I64);
+         md.finish();
+         chunk.finish();
+       }
+@@ -300,13 +317,26 @@
+   std::array<char, 9> inline_name;
+   Key previous_user{};
+   Str user_name;
++  std::vector<uint16_t> name_runs;
+ 
+   void flush() {
+     if (!rows)
+       return;
+     MEASURE(parquet_write);
+     file.group(rows);
+-    file.page(values[0]);
++    // All of one person's days are emitted together. A new row group starts
++    // a fresh dictionary, even if the previous page ended with this person.
++    file.dictionary(values[0],name_runs.size());
++    encoded.clear();
++    unsigned bits=std::max(1u,unsigned(std::bit_width(name_runs.size()-1)));
++    encoded.push_back(char(bits));
++    for(size_t i=0;i<name_runs.size();++i) {
++      flat_parquet::varint(encoded,uint32_t(name_runs[i])*2);
++      encoded.push_back(char(i));
++      if(bits>8)encoded.push_back(char(i>>8));
++    }
++    file.page(encoded,8);
++    name_runs.clear();
+     for (size_t column = 1; column < 5; ++column) {
+       encoded.clear();
+       if (column == 1)
+@@ -336,7 +366,8 @@
+   }
+ 
+   void append(const UserDay &row) {
+-    if (previous_user.bits != row.user.bits) {
++    const bool same_person=previous_user.bits==row.user.bits;
++    if (!same_person) {
+       user_name = row.user.user_text(inline_name);
+       previous_user = row.user;
+     }
+@@ -346,7 +377,10 @@
+                  extra > std::max(max_text_bytes, text_bytes) - text_bytes))
+       flush();
+     text_bytes += extra;
+-    flat_parquet::plain_string(values[0], user_name);
++    if(!rows || !same_person){
++      flat_parquet::plain_string(values[0],user_name);
++      name_runs.push_back(1);
++    }else ++name_runs.back();
+     flat_parquet::little(values[1], row.day);
+     flat_parquet::little(values[2], row.sessions);
+     flat_parquet::little(values[3], row.events);
+--- a/cpp/input.hpp
++++ b/cpp/input.hpp
+@@ -148,8 +148,38 @@
+ #include "csv_x86.hpp"
+ #include "line_csv.hpp"
+ #include "line_tile.hpp"
++#include "marked_events.hpp"
++#if defined(SHOPPING_X86_CSV) && defined(__x86_64__)
++// Training runs exercise the available backends separately. A cap can only
++// lower the detected instruction set; every backend still checks its ISA.
++inline unsigned event_reader_limit() {
++  static const unsigned limit = std::getenv("SHOP_TRAIN_BASE_READER") ? 1 :
++                                std::getenv("SHOP_TRAIN_BW_READER") ? 2 : 3;
++  return limit;
++}
++#endif
+ template <size_t N, class F> void parse_rows(Str data, F &&callback) {
+ #ifdef SHOPPING_X86_CSV
++#ifdef __x86_64__
++  if constexpr (N == 7) {
++    if (wide_csv_supported() && __builtin_cpu_supports("bmi2") &&
++        __builtin_cpu_supports("pclmul")) {
++      if (__builtin_cpu_supports("avx512f") &&
++          __builtin_cpu_supports("avx512bw") &&
++          __builtin_cpu_supports("avx512vbmi2") && event_reader_limit() >= 3) {
++        marked_events_vbmi2(data, callback);
++        return;
++      }
++      if (__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") && event_reader_limit() >= 2) {
++        marked_events_bw(data, callback);
++        return;
++      }
++      marked_events_avx2(data, callback);
++      return;
++
++    }
++  }
++#endif
+   if (N == 7 && wide_csv_supported()) {
+     tiled_lines<N, 16>(data, callback);
+     return;
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -6,9 +6,10 @@
+ #include <regex>
+ #include <span>
+ 
+-template <class Generic, class Common> struct EventCallbacks {
++template <class Generic, class Common, class Rich> struct EventCallbacks {
+   Generic generic;
+   Common common;
++  Rich rich;
+   template <class Row> void operator()(const Row &row) { generic(row); }
+ };
+ size_t bucket(Key k) { return k.hash() % shards; }
+@@ -818,7 +819,48 @@
+                    Event{good ? ts : bad, 0, 0}, ingest);
+                return true;
+              };
+-             auto callbacks = EventCallbacks{generic_event, common_event};
++             auto rich_event = [&](const char *id, unsigned id_width,
++                                   const char *user, unsigned user_width,
++                                   Str event_time, Str arrival, Str type,
++                                   Str product, Str price) {
++               if constexpr (sizeof(uintptr_t) != 8 ||
++                             std::endian::native != std::endian::little)
++                 return false;
++               if (id[0] != 'e' || user[0] != 'u')
++                 return false;
++               auto load = [](const char *p, unsigned n) {
++                 const uint64_t mask = UINT64_MAX >> (8 * (9 - n));
++                 return little_word(p + 1) & mask;
++               };
++               auto event_word = load(id, id_width),
++                    user_word = load(user, user_width);
++               if ((event_word | user_word) >> 63 || !id[id_width - 1] ||
++                   !user[user_width - 1])
++                 return false;
++               Time ingest = ingest_time(arrival);
++               bool purchase = type == "purchase";
++               Time cents = purchase ? number(price, 10000000) : 0;
++               bool useful =
++                   !product.empty() && ((purchase && cents >= 1) ||
++                                        type == "cart" || type == "view");
++               Time ts = useful ? timestamp(event_time) : bad;
++               bool good = useful && ts >= window.start && ts < window.end &&
++                           ingest - ts <= day_ms;
++#ifdef SHOPPING_DIAGNOSTICS
++               ++workers[t].revisions;
++               workers[t].valid_events += good;
++#endif
++               put(Key{uintptr_t(permute_key(event_word) << 1)},
++                   good ? Key{uintptr_t(permute_key(user_word) << 1)} : Key{},
++                   Event{good ? ts : bad, good && purchase ? int32_t(cents) : 0,
++                         good && purchase
++                             ? std::max(0, cat.product.find(product))
++                             : 0},
++                   ingest);
++               return true;
++             };
++             auto callbacks =
++                 EventCallbacks{generic_event, common_event, rich_event};
+              rows<7>(events[job].body(), callbacks);
+            });
+   timer.mark("concurrent input, raw user partition and revision index");
+--- /dev/null
++++ b/cpp/marked_event_tile.inc
+@@ -0,0 +1,60 @@
++// Shared by the x86 target-specific entry points in marked_events.hpp.
++  constexpr unsigned Bytes = 2048, N = 7;
++  constexpr unsigned Words = Bytes / 64;
++  alignas(64) std::array<uint16_t, Bytes + 64> positions;
++  positions[0] = 0;
++  uint16_t *cuts = positions.data() + 1;
++  while (data.size() >= Bytes) {
++    const char *text = data.data();
++    std::array<OrdinalMasks, Words> masks;
++    for (unsigned k = 0; k < Words; ++k) {
++      masks[k] = classify(text + 64 * k);
++    }
++    unsigned words = Words;
++    while (words && !masks[words - 1].newlines)
++      --words;
++    if (!words) {
++      auto lf = data.find('\n', Bytes);
++      size_t take = lf == Str::npos ? data.size() : lf + 1;
++      scalar_rows<N>(data.substr(0, take), fn);
++      data.remove_prefix(take);
++      continue;
++    }
++    auto &last = masks[words - 1];
++    unsigned length = words * 64 - std::countl_zero(last.newlines);
++    uint64_t tail = mask_to(length - (words - 1) * 64);
++    last.separators &= tail;
++    last.quotes &= tail;
++    uint64_t inside = 0, previous = 1, invalid = 0;
++    unsigned nc = 0;
++    for (unsigned b = 0; b < words; ++b) {
++      auto [sep, q, lf] = masks[b];
++      unsigned count = std::popcount(sep);
++      uint64_t want = ordinal_newlines<N>[nc % N] & mask_to(count);
++      invalid |= _pext_u64(lf, sep) ^ want;
++      uint64_t closed = (q << 1) | (b ? (masks[b - 1].quotes >> 63) : 0);
++      uint64_t parity = quote_prefix(q) ^ inside;
++      uint64_t next = b + 1 < words ? (masks[b + 1].separators & 1) : 1;
++      invalid |= ((q & parity) & ~((sep << 1) | previous)) |
++                 ((q & ~parity) & ~((sep >> 1) | (next << 63))) |
++                 (sep & parity);
++      inside = uint64_t(0) - (parity >> 63);
++      previous = sep >> 63;
++      save_positions(cuts + nc, 64 * b, sep, closed);
++
++      nc += count;
++    }
++    if (invalid || inside || nc % N) {
++      tiled_lines<N, 16>(data.substr(0, length), fn);
++    } else {
++      unsigned i=0;
++      if constexpr (requires { fn.common(text, 2u, text, 2u, Str{}, Str{}); }) {
++        for (; nc-i >= 8*N; i+=8*N)
++          emit_event_batch(text, cuts+i, fn);
++      }
++      for (; i < nc; i+=N)
++        emit_marked_event(MarkedEventFields{text,cuts+i},fn);
++    }
++    data.remove_prefix(length);
++  }
++  tiled_lines<N, 16>(data, fn);
+--- /dev/null
++++ b/cpp/marked_events.hpp
+@@ -0,0 +1,225 @@
++#pragma once
++#if defined(SHOPPING_X86_CSV) && defined(__x86_64__)
++// A certified tile has seven fields per row and quotes only in matching
++// pairs at field boundaries. Reject the complete tile before emitting rows
++// when either check fails. The scalar grammar handles long or irregular input.
++struct OrdinalMasks {
++  uint64_t separators, quotes, newlines;
++};
++
++template <size_t N>
++inline constexpr auto ordinal_newlines = [] {
++  std::array<uint64_t, N> out{};
++  for (unsigned phase = 0; phase < N; ++phase)
++    for (unsigned bit = 0; bit < 64; ++bit)
++      if ((phase + bit + 1) % N == 0)
++        out[phase] |= uint64_t{1} << bit;
++  return out;
++}();
++
++__attribute__((target("avx2,bmi,bmi2,popcnt,pclmul"),
++               always_inline)) inline OrdinalMasks
++ordinal_masks_avx2(const char *p) {
++  auto a = row_mask32(p), b = row_mask32(p + 32);
++  auto join = [](unsigned x, unsigned y) {
++    return uint64_t(x) | (uint64_t(y) << 32);
++  };
++  auto lf = join(a.lf, b.lf);
++  return {join(a.comma, b.comma) | lf, join(a.quotes, b.quotes), lf};
++}
++
++__attribute__((target("avx512f,avx512bw"), always_inline)) inline OrdinalMasks
++ordinal_masks_wide(const char *p) {
++  auto text = _mm512_loadu_si512(p);
++  uint64_t lf = _mm512_cmpeq_epi8_mask(text, _mm512_set1_epi8('\n'));
++  return {lf | _mm512_cmpeq_epi8_mask(text, _mm512_set1_epi8(',')),
++          _mm512_cmpeq_epi8_mask(text, _mm512_set1_epi8('"')), lf};
++}
++
++__attribute__((target("avx2,pclmul"), always_inline)) inline uint64_t
++quote_prefix(uint64_t q) {
++  auto value = _mm_cvtsi64_si128(std::bit_cast<int64_t>(q));
++  return uint64_t(
++      _mm_cvtsi128_si64(_mm_clmulepi64_si128(value, _mm_set1_epi64x(-1), 0)));
++}
++
++// Each word encodes twice the position just after a separator, plus one if
++// its field ends in a quote. A certified field then has the same flag at
++// its opening and closing ends, even for an empty quoted value.
++struct MarkedEventFields {
++  const char *data;
++  std::array<uint16_t, 8> begins, lengths;
++  MarkedEventFields(const char *text, const uint16_t *cuts) : data(text) {
++    auto words = _mm_loadu_si128(reinterpret_cast<const __m128i *>(cuts - 1));
++    auto end = _mm_srli_si128(words, 2), begin = _mm_srli_epi16(words, 1);
++    auto ones = _mm_set1_epi16(1), trim = _mm_and_si128(end, ones);
++    auto width =
++        _mm_sub_epi16(_mm_sub_epi16(_mm_srli_epi16(end, 1), ones), begin);
++    _mm_storeu_si128(reinterpret_cast<__m128i *>(begins.data()),
++                     _mm_add_epi16(begin, trim));
++    _mm_storeu_si128(reinterpret_cast<__m128i *>(lengths.data()),
++                     _mm_sub_epi16(width, _mm_add_epi16(trim, trim)));
++  }
++  Str operator[](size_t i) const { return {data + begins[i], lengths[i]}; }
++  operator std::array<Str, 7>() const {
++    constexpr size_t N = 7;
++    std::array<Str, N> values;
++    for (size_t i = 0; i < N; ++i)
++      values[i] = (*this)[i];
++    return values;
++  }
++};
++__attribute__((target("avx512f,avx512bw,avx512vbmi2"),
++               always_inline)) inline void
++save_trimmed_positions(uint16_t *out, unsigned base, uint64_t separators,
++                       uint64_t closed) {
++  alignas(64) static constexpr auto sequence = [] {
++    std::array<uint8_t, 64> values{};
++    for (unsigned i = 0; i < 64; ++i)
++      values[i] = uint8_t(2 * i);
++    return values;
++  }();
++  auto base_offsets = _mm512_load_si512(sequence.data());
++  auto marked = _mm512_mask_add_epi8(base_offsets, closed, base_offsets,
++                                     _mm512_set1_epi8(1));
++  auto packed = _mm512_maskz_compress_epi8(separators, marked);
++  auto origin = _mm512_set1_epi16(short(2 * (base + 1)));
++  auto lower = _mm512_cvtepu8_epi16(_mm512_castsi512_si256(packed));
++  _mm512_storeu_si512(out, _mm512_add_epi16(lower, origin));
++  if (std::popcount(separators) > 32) {
++    auto high = _mm512_shuffle_i64x2(packed, packed, 0xee);
++    auto upper = _mm512_cvtepu8_epi16(_mm512_castsi512_si256(high));
++    _mm512_storeu_si512(out + 32, _mm512_add_epi16(upper, origin));
++  }
++}
++template <class F>
++inline void emit_marked_event(const MarkedEventFields &row, F &fn) {
++  if constexpr (requires {
++                  fn.rich(row[0].data(), 0u, row[1].data(), 0u, row[2], row[3],
++                          row[4], row[5], row[6]);
++                }) {
++    Str id = row[0], user = row[1], arrival = row[3];
++    if (id.size() - 2 <= 7 && user.size() - 2 <= 7 && arrival.size() == 20 &&
++        fn.rich(id.data(), unsigned(id.size()), user.data(),
++                unsigned(user.size()), row[2], arrival, row[4], row[5], row[6]))
++      return;
++  }
++  fn(row);
++}
++inline void save_marked_positions(uint16_t *out, unsigned base,
++                                  uint64_t separators, uint64_t closed) {
++  while (separators) {
++    unsigned bit = std::countr_zero(separators);
++    *out++ = uint16_t(2 * (base + bit + 1) + ((closed >> bit) & 1));
++    separators &= separators - 1;
++  }
++}
++struct EightEventFields {
++  __m128i begins[6], widths[6], eligible;
++  // Each row contains the previous line end and the seven current ends. Every
++  // index stores twice the next start and the field's verified quote flag.
++  __attribute__((
++      target("avx2,bmi,bmi2,popcnt,pclmul"),
++      always_inline)) inline explicit EightEventFields(const uint16_t *cuts) {
++    __m128i pairs[8], quads[8], columns[8];
++    for (unsigned i = 0; i < 4; ++i) {
++      auto a =
++          _mm_loadu_si128(reinterpret_cast<const __m128i *>(cuts + 14 * i - 1));
++      auto b =
++          _mm_loadu_si128(reinterpret_cast<const __m128i *>(cuts + 14 * i + 6));
++      pairs[2 * i] = _mm_unpacklo_epi16(a, b);
++      pairs[2 * i + 1] = _mm_unpackhi_epi16(a, b);
++    }
++    for (unsigned i = 0; i < 2; ++i)
++      for (unsigned j = 0; j < 2; ++j) {
++        auto a = pairs[4 * i + j], b = pairs[4 * i + j + 2];
++        quads[4 * i + 2 * j] = _mm_unpacklo_epi32(a, b);
++        quads[4 * i + 2 * j + 1] = _mm_unpackhi_epi32(a, b);
++      }
++    for (unsigned i = 0; i < 4; ++i) {
++      columns[2 * i] = _mm_unpacklo_epi64(quads[i], quads[i + 4]);
++      columns[2 * i + 1] = _mm_unpackhi_epi64(quads[i], quads[i + 4]);
++    }
++    auto one = _mm_set1_epi16(1);
++    for (unsigned i = 0; i < 6; ++i) {
++      auto left = _mm_srli_epi16(columns[i], 1);
++      auto end = columns[i + 1], trim = _mm_and_si128(end, one);
++      begins[i] = _mm_add_epi16(left, trim);
++      auto raw =
++          _mm_sub_epi16(_mm_sub_epi16(_mm_srli_epi16(end, 1), one), left);
++      widths[i] = _mm_sub_epi16(raw, _mm_add_epi16(trim, trim));
++    }
++    auto short_id = [](__m128i width) {
++      return _mm_and_si128(_mm_cmpgt_epi16(width, _mm_set1_epi16(1)),
++                           _mm_cmpgt_epi16(_mm_set1_epi16(10), width));
++    };
++    eligible = _mm_and_si128(short_id(widths[0]), short_id(widths[1]));
++    eligible =
++        _mm_and_si128(eligible, _mm_cmpeq_epi16(widths[3], _mm_set1_epi16(20)));
++    eligible =
++        _mm_and_si128(eligible, _mm_cmpeq_epi16(widths[4], _mm_set1_epi16(4)));
++    eligible = _mm_and_si128(eligible,
++                             _mm_cmpgt_epi16(widths[5], _mm_setzero_si128()));
++  }
++  __attribute__((target("avx2,bmi,bmi2,popcnt,pclmul"),
++                 always_inline)) inline unsigned
++  common_kinds(const char *base) const {
++    auto valid = _mm256_cvtepi16_epi32(eligible);
++    auto words = _mm256_mask_i32gather_epi32(
++        _mm256_setzero_si256(), reinterpret_cast<const int *>(base),
++        _mm256_cvtepu16_epi32(begins[4]), valid, 1);
++    auto view = _mm256_cmpeq_epi32(words, _mm256_set1_epi32(0x77656976));
++    auto cart = _mm256_cmpeq_epi32(words, _mm256_set1_epi32(0x74726163));
++    return unsigned(
++        _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_or_si256(view, cart))));
++  }
++  static void save(uint16_t (&out)[8], __m128i v) {
++    _mm_storeu_si128(reinterpret_cast<__m128i *>(out), v);
++  }
++};
++
++template <class F>
++__attribute__((target("avx2,bmi,bmi2,popcnt,pclmul"))) inline void
++emit_event_batch(const char *base, const uint16_t *cuts, F &fn) {
++  EightEventFields fields(cuts);
++  unsigned mask = fields.common_kinds(base);
++  uint16_t id[8], user[8], ew[8], uw[8], ts[8], tw[8], arrival[8];
++  fields.save(id, fields.begins[0]);
++  fields.save(ew, fields.widths[0]);
++  fields.save(user, fields.begins[1]);
++  fields.save(uw, fields.widths[1]);
++  fields.save(ts, fields.begins[2]);
++  fields.save(tw, fields.widths[2]);
++  fields.save(arrival, fields.begins[3]);
++  for (unsigned i = 0; i < 8; ++i) {
++    if ((mask & (1u << i)) &&
++        fn.common(base + id[i], ew[i], base + user[i], uw[i],
++                  Str(base + ts[i], tw[i]), Str(base + arrival[i], 20)))
++      continue;
++    emit_marked_event(MarkedEventFields{base, cuts + 7 * i}, fn);
++  }
++}
++
++template <class F>
++__attribute__((
++    target("avx2,bmi,bmi2,popcnt,pclmul,avx512f,avx512bw,avx512vbmi2"))) void
++marked_events_vbmi2(Str data, F &fn) {
++  constexpr auto classify = ordinal_masks_wide;
++  constexpr auto save_positions = save_trimmed_positions;
++#include "marked_event_tile.inc"
++}
++template <class F>
++__attribute__((target("avx2,bmi,bmi2,popcnt,pclmul"))) void
++marked_events_avx2(Str data, F &fn) {
++  constexpr auto classify = ordinal_masks_avx2;
++  constexpr auto save_positions = save_marked_positions;
++#include "marked_event_tile.inc"
++}
++template <class F>
++__attribute__((target("avx2,bmi,bmi2,popcnt,pclmul,avx512f,avx512bw"))) void
++marked_events_bw(Str data, F &fn) {
++  constexpr auto classify = ordinal_masks_wide;
++  constexpr auto save_positions = save_marked_positions;
++#include "marked_event_tile.inc"
++}
++#endif
