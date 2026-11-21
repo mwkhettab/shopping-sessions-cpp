@@ -165,6 +165,10 @@ jobs:
             --source "$GITHUB_WORKSPACE/.acceptance/candidate" --revision "$SHIPPING_SHA" \
             --variant "$SHIPPING_VARIANT" --release "$area/accept-binaries/candidate/shopping" \
             --output "$area/results/native-code-paths"
+      - name: Verify the shipping image objects on row boundaries and repairs
+        if: always() && steps.qualify.outcome == 'success'
+        run: |
+          python3 perf/native/finalist_rows.py .acceptance/candidate "$RUNNER_TEMP/shopping-trials/accept-binaries/candidate/shopping"
       - name: Publish instruction coverage
         if: always()
         run: |

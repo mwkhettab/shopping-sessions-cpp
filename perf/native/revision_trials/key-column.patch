@@ -1,0 +1,82 @@
+--- a/cpp/pipeline/model.hpp
++++ b/cpp/pipeline/model.hpp
+@@ -57,6 +57,7 @@
+     u16 *utab{};
+     std::atomic<u64> *claim{};
+     u32 *csr_off{};
++    mutable u64 *click_keys{};
+     std::array<u64,2> *csr{};
+     std::size_t csr_cap{};
+     std::vector<std::size_t> csr_base;
+--- a/cpp/pipeline/links_part.hpp
++++ b/cpp/pipeline/links_part.hpp
+@@ -71,6 +71,12 @@
+     std::size_t at=0;p.base.reserve(g.nub+1);
+     for(std::size_t ub=0;ub<g.nub;++ub){p.base.push_back(at);for(std::size_t th=0;th<g.nt;++th)at+=g.t(th).us.count(ub);}
+     p.base.push_back(at);if(at>=UINT32_MAX)sys::fallback("too many clicks");if(at+16>g.csr_cap)sys::fallback("CSR capacity");
++#if defined(__x86_64__)
++    if constexpr (requires { g.click_keys; }) {
++        if (at && parse::routing_x64())
++            g.click_keys=reinterpret_cast<u64*>(sys::anon((at+16)*sizeof(u64)));
++    }
++#endif
+     for(std::size_t ub=0;ub<g.nub;++ub){
+         if(p.base[ub+1]-p.base[ub]>std::max<std::size_t>(at/HEAVY_DIV,1<<17)){
+             auto h=std::make_unique<Heavy>(ub);h->cnt.resize(g.nt);h->links.resize(g.nt);p.heavy.push_back(std::move(h));
+--- a/cpp/pipeline/links_sort.hpp
++++ b/cpp/pipeline/links_sort.hpp
+@@ -185,6 +185,12 @@
+     } for(unsigned j=0;j<4;++j)lens[j].resize(ns[j]);
+ }
+ #endif
++template<class G> inline void copy_click_keys(const G& g,std::size_t lo,std::size_t hi) {
++    if constexpr (requires { g.click_keys; }) {
++        if (g.click_keys)
++            for (auto i=lo;i<hi;++i) g.click_keys[i]=g.csr[i][0];
++    }
++}
+ template<class G> inline void sort_users(const G& g,const u32* off,std::size_t ua,std::size_t ub,Scratch& sc) {
+     auto& lists=sc.lens;
+ #if defined(__x86_64__)
+@@ -193,5 +199,6 @@
+     {for(auto& l:lists){l.clear();l.reserve(ub-ua+16);}for(auto u=ua;u<ub;++u){const auto n=off[u+1]-off[u];if(n>=2)lists[n==2?0:n<=8?1:n<=16?2:3].push_back(u32(u));}}
+     for(unsigned cat=0;cat<4;++cat){const std::size_t stride=(cat==1 || cat==2)?8:1;
+         const auto& l=lists[cat];for(std::size_t phase=0;phase<stride;++phase)for(auto i=phase;i<l.size();i+=stride){const u32 u=l[i],a=off[u],n=off[u+1]-a;sort_from(g,g.csr+a,std::span<Click>(g.csr+a,n),sc);}}
+-}
+-}
++    copy_click_keys(g,off[ua],off[ub]);
++}
++}
+--- a/cpp/pipeline/links.hpp
++++ b/cpp/pipeline/links.hpp
+@@ -49,7 +49,13 @@
+     if(!READY.load())prelude(g,false);
+     if(!done(g))sys::run_par(g.nt,[&](std::size_t tid){auto& t=g.t(tid);Scratch sc;for(;;){if(job(g,t,sc))continue;if(done(g))break;sys::spin_loop();}});
+     sys::lap("st2b");odd_events(g);
+-    DEFER_RAW.store(false);for(auto s:deferred)raw_ties(g,s);deferred.clear();
++    DEFER_RAW.store(false);
++    for(auto s:deferred) {
++        raw_ties(g,s);
++        const auto lo=std::size_t(s.data()-g.csr);
++        copy_click_keys(g,lo,lo+s.size());
++    }
++    deferred.clear();
+     auto p=std::move(plan);
+     if(g.ccap && g.cpart){std::size_t end=0;g.csr_base.clear();g.csr_base.reserve(g.nub+1);
+         for(auto [lo,hi]:p->range){if(hi>lo){if(lo<end)sys::fallback("click index order");end=hi;}g.csr_base.push_back(std::min(lo,end));}g.csr_base.push_back(end);g.ncsr=end;
+--- a/cpp/pipeline/events_fast.hpp
++++ b/cpp/pipeline/events_fast.hpp
+@@ -415,7 +415,12 @@
+                 const auto off=std::size_t(p-g.csr);
+                 padded=off<=g.csr_cap && g.csr_cap-off>=16;
+             }
+-            if (padded) {
++            const u64* keys=nullptr;
++            if constexpr (requires { g.click_keys; })
++                if (g.click_keys) keys=g.click_keys+(p-g.csr);
++            if (keys) {
++                ka=get512(keys);kb=get512(keys+8);
++            } else if (padded) {
+                 ka=_mm512_permutex2var_epi64(get512(p),even64(),get512(p+4));
+                 kb=_mm512_permutex2var_epi64(get512(p+8),even64(),get512(p+12));
+             } else {

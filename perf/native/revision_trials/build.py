@@ -86,6 +86,9 @@ def build(source_archive, name, changes, output):
                 cpp_tests.append("edge_packets")
             if "batched-walk" in changes:
                 cpp_tests.append("session_runs")
+            if "key-column" in changes:
+                shutil.copy2(HERE/"column_keys.cpp", tree/"tests/pipeline")
+                cpp_tests.append("column_keys")
             for test in cpp_tests:
                 exe = tree / test
                 subprocess.run(["g++-12", "-std=c++20", "-O2", "-pthread", "-Wno-ignored-attributes",
