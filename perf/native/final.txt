@@ -1,1 +1,1 @@
-base fin-slabkey-pgo shipreader-pgo shipcolumns-pgo varrev-pgo claimwrite32-pgo varcoltags-pgo varcolissue-pgo reusecolumns-pgo @best
+base fin-slabkey-pgo shipreader-pgo shipcolumns-pgo varrev-pgo varcoltags-pgo ordwide-pgo ordkilocol-pgo ordpairkilo-pgo destslab-pgo destcolumns-pgo @best

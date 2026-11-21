@@ -125,6 +125,17 @@ def main():
                 if (src/'cpp'/header).is_file():
                     run(compiler,'-std=c++20','-O2','-pthread','-fsanitize=undefined','-fno-sanitize-recover=all','-I',src/'cpp',root/'perf/native'/unitfile,'-o',unit)
                     run(unit)
+            if name.startswith(('qword','qcompute','qbytes','qbroad','ordbyte','ordhalf','ordkilo','orddouble','ordavx2','ordpair')):
+                run(compiler,'-std=c++20','-O2','-fsanitize=undefined','-fno-sanitize-recover=all','-I',src/'cpp',root/'perf/native/compact_prefix_test.cpp','-o',unit)
+                run(unit)
+            if name=='ordkilo-pgo' and 'avx2' in flags and 'bmi2' in flags and 'pclmulqdq' in flags:
+                run(compiler,'-std=c++20','-O2','-fsanitize=undefined','-fno-sanitize-recover=all','-I',src/'cpp',root/'perf/native/ordinal16_test.cpp','-o',unit)
+                run(unit)
+            if (src/'cpp/paired_chunk_reader.hpp').is_file():
+                run(compiler,'-std=c++20','-O2','-fsanitize=undefined','-fno-sanitize-recover=all','-I',src/'cpp',root/'perf/native/paired_chunk_test.cpp','-o',unit)
+                run(unit)
+            if name.startswith('dest'):
+                run(python,root/'perf/native/dest_oracle.py',binary)
             binaries.append(binary)
         except (subprocess.CalledProcessError,OSError) as exc:
             if name in ('base',release_control): raise
@@ -275,7 +286,7 @@ def main():
     from population_stats import collect as population_profile
     population_profile(root,area,note,run,env)
     from input_profile import collect
-    for label in dict.fromkeys(['base','shipreader-pgo',practice_winner]):
+    for label in dict.fromkeys(['base',release_control,practice_winner]):
         if (area/'bin'/label).is_file():collect(root,area,label,note,run,env)
     baseline_digests=json.loads((outcomes/'input-probe-base.json').read_text())['digests']
     for filepath in outcomes.glob('input-probe-*.json'):
@@ -291,7 +302,7 @@ def main():
     locgen=area/'generate-skewed-alias'
     run('g++-12','-std=c++20','-O2',root/'perf/native/long_location_input.cpp','-o',locgen)
     verify_long_locations(area,locgen,list(dict.fromkeys([area/'bin'/release_control,area/'bin'/practice_winner])),note)
-    for name in dict.fromkeys([practice_winner, *[b for b in candidates if b.startswith("pipe")]]):
+    for name in dict.fromkeys([practice_winner, *[b for b in candidates if (b.startswith("pipe") or b in ("destslab-pgo","destpages-pgo"))]]):
         if (area / "bin" / name).is_file():
             race(root,area,name,note,run,env)
 
