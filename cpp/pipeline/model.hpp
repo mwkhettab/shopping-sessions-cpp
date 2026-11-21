@@ -50,7 +50,7 @@ struct G {
     const u8 *region{};
     std::vector<FileInfo> files;
     std::vector<Chunk> queue;
-    std::atomic<std::size_t> qnext{};
+    mutable std::atomic<std::size_t> qnext{};
     std::size_t ev_bytes{},row_cap{},nb{},nub{};
     sys::Arena ev_arena,us_arena;
     std::vector<std::unique_ptr<TState>> workers;
@@ -67,7 +67,7 @@ struct G {
     std::vector<u32> cxu;
     std::unordered_map<u32,std::vector<u64>> extra;
     std::vector<OddEv> odd_kept;
-    std::atomic<std::size_t> next{};
+    mutable std::atomic<std::size_t> next{};
     std::atomic_bool st2b_done{};
 
     TState& t(std::size_t tid) const { return *workers[tid]; }

@@ -5,10 +5,23 @@
 
 namespace pipeline::links {
 using Click=std::array<u64,2>;
+// Slots beyond the written count serve as output space for compress stores.
+// Default-initialize these trivial values without clearing every scratch page.
+template<class T> struct ScratchAlloc:std::allocator<T> {
+    using value_type=T;
+    template<class U> struct rebind {using other=ScratchAlloc<U>;};
+    ScratchAlloc()=default;
+    template<class U> ScratchAlloc(const ScratchAlloc<U>&) noexcept {}
+    template<class U,class... A> void construct(U* p,A&&... a) {
+        if constexpr(sizeof...(a)==0) ::new (static_cast<void*>(p)) U;
+        else std::construct_at(p,std::forward<A>(a)...);
+    }
+};
+template<class T> using ScratchVec=std::vector<T,ScratchAlloc<T>>;
 struct Scratch {
-    std::vector<Click> tmp;
-    std::vector<u64> lk;
-    std::array<std::vector<u32>,4> lens;
+    ScratchVec<Click> tmp;
+    ScratchVec<u64> lk;
+    std::array<ScratchVec<u32>,4> lens;
 };
 inline constexpr unsigned IDX_SH=18;
 inline constexpr u64 IDX_BITS=0xffffffffu & ~((1u<<IDX_SH)-1);
@@ -147,7 +160,7 @@ template<class G> inline void radix_split(const G& g,std::span<Click> s,Click* t
 template<class G> inline void lsd_sort(const G& g,std::span<Click> s,Scratch& sc) {
     std::array<std::array<u32,256>,4> h{};
     for(const auto& c:s) {const auto k=u32(c[0]>>32);for(unsigned d=0;d<4;++d)++h[d][(k>>(8*d))&255];}
-    sc.tmp.resize(s.size()+16);auto *src=s.data(),*dst=sc.tmp.data();const auto k=s[0][0]>>32;
+    sc.tmp.clear();sc.tmp.resize(s.size()+16);auto *src=s.data(),*dst=sc.tmp.data();const auto k=s[0][0]>>32;
     for(unsigned d=0;d<4;++d){if(h[d][(k>>(8*d))&255]==s.size())continue;
         std::array<u32,256> pos;u32 at=0;for(unsigned b=0;b<256;++b){pos[b]=at;at+=h[d][b];}
         for(std::size_t i=0;i<s.size();++i){const auto& c=src[i];dst[pos[(c[0]>>(32+8*d))&255]++]=c;}std::swap(src,dst);
@@ -159,11 +172,11 @@ template<class G> inline void sort_from(const G& g,const Click* src,std::span<Cl
     if(src!=s.data())std::copy_n(src,n,s.begin());
     if(n>=LSD_MIN){lsd_sort(g,s,sc);return;}
     auto bits=std::clamp<unsigned>(std::bit_width(n/SPLIT_PER),1,11);auto top=std::clamp<unsigned>(std::bit_width(std::max<u64>(g.clen,1)),11,32);
-    sc.tmp.resize(n+16);radix_split(g,s,sc.tmp.data(),top-bits,bits,true);
+    sc.tmp.clear();sc.tmp.resize(n+16);radix_split(g,s,sc.tmp.data(),top-bits,bits,true);
 }
 #if defined(__x86_64__)
-PIPELINE_ROUTING_X64 inline void classify_users(const u32 *off,std::size_t a,std::size_t b,std::array<std::vector<u32>,4>& lens) {
-    std::array<std::size_t,4> ns{};for(auto& l:lens)l.resize(b-a+16);
+PIPELINE_ROUTING_X64 inline void classify_users(const u32 *off,std::size_t a,std::size_t b,std::array<ScratchVec<u32>,4>& lens) {
+    std::array<std::size_t,4> ns{};for(auto& l:lens){l.clear();l.resize(b-a+16);}
     const auto iota=_mm512_setr_epi32(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15);
     for(std::size_t i=a;i<b;i+=16){auto live=__mmask16((1u<<std::min<std::size_t>(16,b-i))-1);
         auto n=_mm512_sub_epi32(_mm512_maskz_loadu_epi32(live,off+i+1),_mm512_maskz_loadu_epi32(live,off+i));auto uv=_mm512_add_epi32(iota,_mm512_set1_epi32(i));
