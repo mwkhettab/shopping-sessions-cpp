@@ -95,7 +95,7 @@ template<class G,class T> struct Ctx {
         if(r.uid<=keyrec::MASK && u<g.ucap && alias<NALIAS) {
             if(g.ccap) {
                 if(r.cid<=keyrec::MASK) if(auto c=keyrec::unscramble(r.cid,g.ckey);c<g.ccap) {
-                    if(g.cpart) t.us.push(u>>UB,c|((u&(UBSIZE-1))<<43),key|alias);
+                    if(g.cpart) t.us.push_indexed(u>>UB,c|((u&(UBSIZE-1))<<43),key|alias);
                     else ckix::store_one(out.pd,g.csr,c,key|alias,u);
                     return;
                 }
@@ -117,7 +117,8 @@ template<class G,class T> struct Ctx {
             const CkP p{g.cbase,g.clen,g.ukey,g.ucap,g.ckey,g.ccap,tb.camp.data(),tb.crange,t.us.lines_ptr()};
             const auto masks=tb.crange ? (g.ccap ? ck_vec<true,true>(cb,out,n,p) : ck_vec<true,false>(cb,out,n,p))
                                        : (g.ccap ? ck_vec<false,true>(cb,out,n,p) : ck_vec<false,false>(cb,out,n,p));
-            t.us.push_many(masks.regular,n,out.ob.data(),out.lp.data(),out.rec.data());
+            if(g.ccap)t.us.push_indexed_many(masks.regular,n,out.ob.data(),out.lp.data(),out.rec.data());
+            else t.us.push_many(masks.regular,n,out.ob.data(),out.lp.data(),out.rec.data());
             special=masks.special;
         }
         for(auto m=special;m;m&=m-1) ck_one(cb.row(std::countr_zero(m)));

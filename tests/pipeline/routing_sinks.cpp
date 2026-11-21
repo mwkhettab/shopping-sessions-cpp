@@ -10,6 +10,8 @@ struct TestPart {
     std::array<u8,64> buf{};
     const u8* lines_ptr() const {return buf.data();}
     void push(u64 b,u64 w0,u64 w1) {rows.push_back({b,w0,w1});}
+    void push_indexed(u64 b,u64 w0,u64 w1){push(b,w0,w1);}
+    void push_indexed_many(u64 m,std::size_t n,const u64* b,const u64* p,const std::array<u64,2>* r){push_many(m,n,b,p,r);}
     void push_many(u64 mask,std::size_t,const u64* bs,const u64* ptr,const std::array<u64,2>* rec) {
         for(;mask;mask&=mask-1) {auto i=std::countr_zero(mask);assert(ptr[i]==std::uintptr_t(lines_ptr())+bs[i]*64);push(bs[i],rec[i][0],rec[i][1]);}
     }

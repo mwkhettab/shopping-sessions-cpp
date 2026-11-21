@@ -51,6 +51,7 @@ class Part {
     u8* block_end_{};
     bool populate_{};
     std::vector<u64> pend_;
+    std::vector<std::pair<std::size_t,std::size_t>> ordinal_bounds_;
 
     explicit Part(std::size_t nb)
         : lines_(nb), fill_(nb + 64), cur_(nb, LINK_OFF),
@@ -168,11 +169,28 @@ public:
         }
     }
 
-    inline void push_many(u64 mask, std::size_t n, const u64* buckets, const u64* line_pointers,
-                          const std::array<u64, 2>* records) {
+    void prepare_ordinals() {
+        if (ordinal_bounds_.empty()) ordinal_bounds_.assign(head_.size(),{SIZE_MAX,0});
+    }
+    const auto ordinal_range(std::size_t b) const {
+        return ordinal_bounds_.empty() ? std::pair<std::size_t,std::size_t>{SIZE_MAX,0} : ordinal_bounds_[b];
+    }
+    inline void note_ordinal(std::size_t b,u64 word) {
+        const auto ordinal=std::size_t(u32(word));
+        auto& range=ordinal_bounds_[b];
+        range.first=std::min(range.first,ordinal);
+        range.second=std::max(range.second,ordinal+1);
+    }
+    inline void push_indexed(std::size_t b,u64 w0,u64 w1) {
+        prepare_ordinals();note_ordinal(b,w0);push(b,w0,w1);
+    }
+    template<bool Indexed> inline void push_packet(u64 mask,std::size_t n,const u64* buckets,const u64* line_pointers,
+                                                  const std::array<u64,2>* records) {
+        if constexpr(Indexed) prepare_ordinals();
         std::size_t pending = 0;
         auto row = [&](std::size_t i) {
             const auto b = std::size_t(buckets[i]);
+            if constexpr(Indexed) note_ordinal(b,records[i][0]);
             unsigned offset = fill_[b];
             if (offset == 64) {
                 flush_full(pending);
@@ -199,6 +217,14 @@ public:
         flush_lines(pending);
     }
 
+    inline void push_many(u64 mask,std::size_t n,const u64* buckets,const u64* line_pointers,
+                          const std::array<u64,2>* records) {
+        push_packet<false>(mask,n,buckets,line_pointers,records);
+    }
+    inline void push_indexed_many(u64 mask,std::size_t n,const u64* buckets,const u64* line_pointers,
+                                  const std::array<u64,2>* records) {
+        push_packet<true>(mask,n,buckets,line_pointers,records);
+    }
     void finish() {
         for (std::size_t b = 0; b < head_.size(); ++b) {
             const auto bytes = fill_[b];

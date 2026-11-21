@@ -3,12 +3,12 @@
 
 namespace pipeline::links {
 template<class G> inline bool piece_ix(const G& g,std::size_t a,std::size_t b,i64 prev,u32 u0,u32* start) {
-    u64 xa=(u64(a)*keyrec::A)&keyrec::MASK,key=g.ckey&keyrec::MASK;u32 dummy{};bool bad=false;
+    u64 xa=(u64(a)*keyrec::A)&keyrec::MASK,key=g.ckey&keyrec::MASK;bool bad=false;
     auto csr=g.csr;if(b>a && !(csr[a][1]&ckix::VALID))return false;
     for(auto i=a;i<b;++i){auto& row=csr[i];const auto w=row[1];
         if(!(w&ckix::VALID))row=csr[i-1];
         else{const auto u=i64(u32(w));const auto ul=u32(u)-u0;bad|=(u<prev || ul>=UBSIZE);
-            auto *s=u!=prev ? start+(ul&(UBSIZE-1)) : &dummy;*s=u32(i);prev=u;auto x=xa^key;row[1]=((x^(x>>17))*keyrec::B)&keyrec::MASK;}
+            if(u!=prev)std::atomic_ref<u32>(start[ul&(UBSIZE-1)]).store(u32(i),std::memory_order_relaxed);prev=u;auto x=xa^key;row[1]=((x^(x>>17))*keyrec::B)&keyrec::MASK;}
         xa=(xa+keyrec::A)&keyrec::MASK;
     }
     return !bad;
@@ -70,6 +70,14 @@ template<class G> inline void compact_and_sort(const G& g,Scratch& sc,std::size_
 }
 template<class G> inline void prelude_a(const G& g) {
     auto& p=*plan;p.cand.resize(g.nub);p.range.resize(g.nub);
+    // The index shares one array across concurrently compacted user buckets.
+    // Prove disjoint ownership before any job can modify a bucket's slots.
+    std::size_t previous_end=0;
+    for(std::size_t ub=0;ub<g.nub;++ub){
+        Range bound{SIZE_MAX,0};
+        for(std::size_t th=0;th<g.nt;++th){auto [lo,hi]=g.t(th).us.ordinal_range(ub);bound.first=std::min(bound.first,lo);bound.second=std::max(bound.second,hi);}
+        if(bound.first<bound.second){if(bound.first<previous_end || bound.second>g.ccap)sys::fallback("click index order");previous_end=bound.second;}
+    }
     for(std::size_t tid=0;tid<g.nt;++tid){auto& t=g.t(tid);for(auto [a,b]:t.gen_edges){mark_complex(g,a);mark_complex(g,b);}
         for(std::size_t i=0;i<t.odd_clicks.size();){const auto c=t.odd_clicks[i];if(!(c[0]&RAW))if(auto user=g.normal(c[0])){
             auto [u,a]=*user;p.cand[u>>UB].push_back({u,a,c[1],c[2]});t.odd_clicks[i]=t.odd_clicks.back();t.odd_clicks.pop_back();continue;
