@@ -1,5 +1,15 @@
 name: Native x64 benchmark
 on:
+  workflow_dispatch:
+    inputs:
+      peer_run_id:
+        description: Optional run ID for an additional comparison artifact
+        required: false
+        type: string
+      peer_artifact:
+        description: Optional artifact containing a release executable or a Docker build context
+        required: false
+        type: string
   push:
     branches: [bench/native-x64-trials]
     paths-ignore:
@@ -10,6 +20,7 @@ on:
       - perf/native/run.py
 permissions:
   contents: read
+  actions: read
 jobs:
   compare:
     strategy:
@@ -38,6 +49,28 @@ jobs:
         if: steps.hardware.outputs.run == 'yes'
         with:
           persist-credentials: false
+      - name: Check out the C++ release under test
+        if: steps.hardware.outputs.run == 'yes'
+        uses: actions/checkout@v4
+        with:
+          ref: faf1047c6cb00cc8099572f5e067d18076375571
+          path: .acceptance/candidate
+          persist-credentials: false
+      - name: Check out the officially scored C++ baseline
+        if: steps.hardware.outputs.run == 'yes'
+        uses: actions/checkout@v4
+        with:
+          ref: 4db76beed31640ddf4b414ed19deba5ebc660b81
+          path: .acceptance/baseline
+          persist-credentials: false
+      - name: Read optional comparison artifact
+        if: steps.hardware.outputs.run == 'yes' && (inputs.peer_run_id || vars.NATIVE_PEER_RUN_ID) && (inputs.peer_artifact || vars.NATIVE_PEER_ARTIFACT)
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.peer_run_id || vars.NATIVE_PEER_RUN_ID }}
+          name: ${{ inputs.peer_artifact || vars.NATIVE_PEER_ARTIFACT }}
+          path: ${{ runner.temp }}/shopping-peer
       - uses: actions/setup-python@v5
         if: steps.hardware.outputs.run == 'yes'
         with:
@@ -63,15 +96,36 @@ jobs:
           if ! command -v g++-12; then sudo apt-get -qq update && sudo apt-get install -y g++-12; fi
           lscpu
           df -h .
-      - name: Validate and measure fresh processes
+      - name: Validate release images and compare native processes
         if: steps.hardware.outputs.run == 'yes'
-        run: "$RUNNER_TEMP/shopping-python/bin/python perf/native/ordinal_final_native.py"
+        shell: bash
+        env:
+          PEER_RUN_ID: ${{ inputs.peer_run_id || vars.NATIVE_PEER_RUN_ID }}
+          PEER_ARTIFACT: ${{ inputs.peer_artifact || vars.NATIVE_PEER_ARTIFACT }}
+          CXX: g++-12
+        run: |
+          set -eu
+          peer="$RUNNER_TEMP/shopping-peer"
+          extra=()
+          if [[ -n "$PEER_RUN_ID" || -n "$PEER_ARTIFACT" ]]; then
+            if [[ -z "$PEER_RUN_ID" || -z "$PEER_ARTIFACT" ]]; then
+              echo "Both peer_run_id and peer_artifact are required to load an optional job artifact."
+              exit 2
+            elif [[ -f "$peer/Dockerfile" ]]; then
+              extra+=(--peer-source "$peer")
+            elif [[ -f "$peer/source/Dockerfile" ]]; then
+              extra+=(--peer-source "$peer/source")
+            elif [[ -f "$peer/pipeline" ]]; then
+              extra+=(--peer-binary "$peer/pipeline")
+            else
+              echo "The comparison artifact needs a pipeline executable or a Dockerfile build context."
+              exit 2
+            fi
+          fi
+          "$RUNNER_TEMP/shopping-python/bin/python" perf/native/port_acceptance.py --candidate-source "$GITHUB_WORKSPACE/.acceptance/candidate" --release-generated-practice "${extra[@]}"
       - uses: actions/upload-artifact@v4
         if: always() && steps.hardware.outputs.run == 'yes'
         with:
           name: native-observations-${{ matrix.lane }}
           path: ${{ runner.temp }}/shopping-trials/results/
-          retention-days: 3
-      - name: Publish final source samples and image verification
-        if: always() && steps.hardware.outputs.run == 'yes'
-        run: python3 perf/native/publish_profile.py "$RUNNER_TEMP/shopping-trials/results/"
+          retention-days: 7

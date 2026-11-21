@@ -3,7 +3,7 @@ from pathlib import Path
 import sys
 import polars as pl
 import os
-root = Path(os.environ['RUNNER_TEMP'])/'shopping-trials'
+root = Path(os.environ["SHOPPING_TRIALS_DIR"]) if "SHOPPING_TRIALS_DIR" in os.environ else Path(os.environ["RUNNER_TEMP"])/"shopping-trials"
 sys.path.insert(0,str(root/"starter-pyspark/scripts"))
 from run_fixtures import SCHEMAS
 

@@ -1,0 +1,22 @@
+{
+  "20M": {
+    "campaign_daily": {
+      "rows": 28014,
+      "sha256": "06af5b867b87f7b3fc3f280dcbc6701baa3f58e9b86e5fb8ca4204fe17d724ae"
+    },
+    "user_daily": {
+      "rows": 2226509,
+      "sha256": "3c642b72d8329719bd9fda3d7390f7dc310ceaba3fd3ed1ee9fcfc8ffb42dc4d"
+    }
+  },
+  "60M": {
+    "campaign_daily": {
+      "rows": 28014,
+      "sha256": "80bb84a47b78265391d41ce50ebaffb39ef5d3c99ef74f444a54d6455f26871a"
+    },
+    "user_daily": {
+      "rows": 6684549,
+      "sha256": "7c8451f20ca4cd0f26b66395af501b4b49f12c1920487b376ebcefa1ccd8538e"
+    }
+  }
+}

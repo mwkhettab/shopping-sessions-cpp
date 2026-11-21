@@ -20,11 +20,13 @@ p.add_argument("--output-parent", type=Path, default=None)
 p.add_argument("--log", type=Path, required=True)
 p.add_argument("--profile", action="store_true")
 p.add_argument("--residency", action="store_true", help="sample mapped CSV page residency before and after each run")
-p.add_argument("--preload", action="store_true", help="sequentially read input outside each timed interval")
+cache = p.add_mutually_exclusive_group()
+cache.add_argument("--preload", action="store_true", help="sequentially read input outside each timed interval")
+cache.add_argument("--evict", action="store_true", help="ask Linux to drop the input files' clean cache pages before each sample")
 args = p.parse_args()
 if args.runs < 1 or args.warmup < 0:
     p.error("--runs must be positive and --warmup must be nonnegative")
-files = sorted(args.input.rglob("*.csv")) if args.residency or args.preload else []
+files = sorted(args.input.rglob("*.csv")) if args.residency or args.preload or args.evict else []
 
 def resident_fraction():
     mincore = ctypes.CDLL(None, use_errno=True).mincore
@@ -61,6 +63,10 @@ with args.log.open("x") as log:
                     with path.open("rb", buffering=0) as fd:
                         while fd.readinto(block):
                             pass
+            if args.evict:
+                for path in files:
+                    with path.open("rb", buffering=0) as fd:
+                        os.posix_fadvise(fd.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
             before = resident_fraction() if args.residency else None
             with tempfile.TemporaryDirectory(dir=args.output_parent) as out:
                 with tempfile.TemporaryFile(mode="w+") as err:

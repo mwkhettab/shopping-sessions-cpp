@@ -10,11 +10,12 @@ static double elapsed(void) {
   clock_gettime(CLOCK_MONOTONIC, &t);
   return t.tv_sec + t.tv_nsec * 1e-9;
 }
-int main(void) {
+int main(int argc, char **argv) {
   double start = elapsed();
   pid_t pid = fork();
   if (pid == 0) {
-    execl("/app/shopping", "/app/shopping", (char *)0);
+    if (argc > 1) execv(argv[1], argv + 1);
+    else execl("/app/shopping", "/app/shopping", (char *)0);
     _exit(127);
   }
   struct rusage usage;
