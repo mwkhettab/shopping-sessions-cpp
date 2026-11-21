@@ -123,28 +123,35 @@ def verify_development(tag, exe, image, area, results, env, candidate_source):
             exec_logged([sys.executable, kit/"scripts/compare.py", out, area/"dev-answer"], log, env)
 
 
-def in_container(image, entry, meter, cpus, memory_mib, data, out):
+def container_options(cpus, memory_mib, data, out, scratch, application_workers=None):
+    ncpu = len(cpus.split(","))
+    workers = ncpu if application_workers is None else application_workers
+    return ["--platform", "linux/amd64", "--network", "none", "--read-only", "--user", "1000:1000",
+            "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "4096", "--cpuset-cpus", cpus, "--cpus", str(ncpu),
+            "--memory", f"{memory_mib}m", "--memory-swap", f"{memory_mib}m", "--tmpfs", "/tmp:rw,mode=1777,size=64m",
+            "-v", f"{data.resolve()}:/data:ro", "-v", f"{out.resolve()}:/output", "-v", f"{scratch.resolve()}:/scratch",
+            "-e", "HOME=/scratch", "-e", "DATA_DIR=/data", "-e", "OUTPUT_DIR=/output", "-e", "SCRATCH_DIR=/scratch",
+            "-e", f"MEM_GB={memory_mib // 1024}", "-e", f"NCPU={workers}"]
+
+
+def release_output(folders):
+    # A different runner UID may need access to directories the image created as UID 1000.
+    for folder in folders:
+        if any(not os.access(base, os.W_OK) for base, _, _ in os.walk(folder)):
+            subprocess.run(["sudo", "-n", "chmod", "-R", "a+rwX", "--", folder], check=True)
+
+
+def in_container(image, entry, meter, cpus, memory_mib, data, out, application_workers=None):
     out.mkdir(parents=True, exist_ok=True)
     out.chmod(0o777)
     with tempfile.TemporaryDirectory(dir=out.parent) as scratch:
         os.chmod(scratch, 0o777)
-        ncpu = len(cpus.split(","))
-        cmd = ["docker", "run", "--rm", "--platform", "linux/amd64", "--network", "none", "--read-only",
-               "--user", "1000:1000", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
-               "--cpuset-cpus", cpus, "--cpus", str(ncpu), "--memory", str(memory_mib) + "m",
-               "--memory-swap", str(memory_mib) + "m", "--tmpfs", "/tmp:rw,mode=1777,size=64m",
-               "-v", str(data.resolve()) + ":/data:ro", "-v", str(out.resolve()) + ":/output",
-               "-v", str(Path(scratch).resolve()) + ":/scratch", "-v", str(meter.resolve()) + ":/meter:ro",
-               "-e", "HOME=/scratch", "-e", "DATA_DIR=/data", "-e", "OUTPUT_DIR=/output",
-               "-e", "SCRATCH_DIR=/scratch", "-e", "NCPU=" + str(ncpu), "--entrypoint", "/meter", image, entry]
+        options = container_options(cpus, memory_mib, data, out, Path(scratch), application_workers)
+        cmd = ["docker", "run", "--rm", *options, "-v", f"{meter.resolve()}:/meter:ro", "--entrypoint", "/meter", image, entry]
         try:
             return subprocess.run(cmd).returncode
         finally:
-            # The image writes as UID 1000. Hosted runners can use a different UID,
-            # in which case user-owned temporary-directory cleanup needs write access.
-            for folder in (out, Path(scratch)):
-                if any(not os.access(base, os.W_OK) for base, _, _ in os.walk(folder)):
-                    subprocess.run(["sudo", "-n", "chmod", "-R", "a+rwX", "--", folder], check=True)
+            release_output((out, Path(scratch)))
 
 
 def launcher(item, exe, meter, cpus, memory):
@@ -218,20 +225,25 @@ def paired(scale, data, bins, area, results, env, warm_count, cold_count):
     return summary
 
 
+def generate_parts(generator, seed, count, clicks, out, log, env):
+    for part in range(3):
+        exec_logged([generator, "--threads", "4", "--seed", str(seed), "--events", str(count),
+                     "--clicks", str(clicks), "--output", out], log, dict(env, PART_CLASSES="3", PART_CLASS=str(part)))
+
+
 def generate_final(area, results, env):
     # Use the existing bounded generator experiment that makes identical shuffled
     # parts. Compare the small generation byte for byte before scaling it.
     gen = area / "generator"
     log = results / "seed47-generation.log"
-    args = [gen / "target/release/generate", "--threads", "4"]
+    generator = gen / "target/release/generate"
     exec_logged(["patch", "-p1", "-i", NATIVE / "generator-memory.patch"], log, env, cwd=gen)
     exec_logged(["cargo", "build", "--release", "--locked", "--offline"], log, env, cwd=gen)
     for seed, count, clicks, out in [(1, 1000000, 250000, "dev-check"), (47, 60000000, 15000000, "final")]:
-        for part in range(3):
-            exec_logged([*args, "--seed", str(seed), "--events", str(count), "--clicks", str(clicks),
-                         "--output", area / out], log, dict(env, PART_CLASSES="3", PART_CLASS=str(part)))
+        generate_parts(generator, seed, count, clicks, area / out, log, env)
         if seed == 1:
             exec_logged(["diff", "-qr", area / "dev", area / "dev-check"], log, env)
+    return sha(generator)
 
 
 def main():
@@ -256,9 +268,15 @@ def main():
     p.add_argument("--final", type=Path)
     p.add_argument("--release-generated-practice", action="store_true",
                    help="reclaim this job's generated practice CSVs before generating seed 47")
+    p.add_argument("--release-generated-final", action="store_true",
+                   help="reclaim this job's generated seed-47 input after its comparisons")
     p.add_argument("--warm-20", type=int, default=7)
     p.add_argument("--warm-60", type=int, default=3)
     p.add_argument("--cold-runs", type=int, default=3)
+    p.add_argument("--container-lifetime-pairs", type=int, default=0,
+                   help="measure the two unmodified release images from Docker start to exit")
+    p.add_argument("--input-policy-rounds", type=int, default=0,
+                   help="compare four input policies in fresh processes on the exact candidate executable")
     p.add_argument("--cpus", type=int, default=8)
     p.add_argument("--memory-mib", type=int, default=12288)
     p.add_argument("--skip-kernel-test", action="store_true", help="for exercising the harness with existing binaries")
@@ -267,6 +285,10 @@ def main():
         p.error("supply --runtime-source and distinct --runtime-builds together")
     if min(args.cpus, args.warm_20, args.warm_60, args.cold_runs, args.memory_mib) < 1:
         p.error("CPU, memory and iteration values must be positive")
+    if args.container_lifetime_pairs < 0 or args.input_policy_rounds < 0 or args.input_policy_rounds == 1:
+        p.error("lifecycle samples must be nonnegative and input policies need at least two rounds")
+    if args.container_lifetime_pairs and (args.candidate_binary or args.baseline_binary):
+        p.error("container lifetime measurement requires candidate and baseline release images")
     if platform.system() != "Linux" or platform.machine() not in ("x86_64", "amd64"):
         p.error("the acceptance experiment requires x86-64 Linux")
     area = args.area.resolve()
@@ -389,7 +411,7 @@ def main():
                 if args.final:
                     raise FileNotFoundError(args.final)
                 mark("generate seed 47")
-                generate_final(area, results, env)
+                state["checked_generator_sha256"] = generate_final(area, results, env)
             if not (data / "manifest.json").is_file():
                 raise FileNotFoundError(data / "manifest.json")
             mark(scale + " verify")
@@ -420,10 +442,25 @@ def main():
             mark(scale + " profiles and pairs")
             state["timings"][scale] = paired(scale, data, bins, area, results, env,
                                                args.warm_20 if scale == "20M" else args.warm_60, args.cold_runs)
+            if args.container_lifetime_pairs:
+                from port_lifetime import paired_lifetime
+                mark(scale + " fresh container lifetimes")
+                state.setdefault("lifetimes", {})[scale] = paired_lifetime(state["implementations"], data, area, results,
+                                                                           cpu_list, args.memory_mib, scale, args.container_lifetime_pairs)
+            if args.input_policy_rounds:
+                mark(scale + " input policy comparisons")
+                folder = results / (scale + "-input-settings")
+                exec_logged([sys.executable, NATIVE/"port_input_settings.py", "--exe", bins["candidate"], "--oracle", bins["baseline"],
+                             "--input", data, "--tools", ROOT, "--output", folder, "--scale", scale, "--rounds", str(args.input_policy_rounds)],
+                            results / (scale + "-input-settings.log"), env)
+                state.setdefault("input_policies", {})[scale] = json.loads((folder / "summary.json").read_text())
             runner_temp = os.environ.get("RUNNER_TEMP")
             if (scale == "20M" and args.release_generated_practice and not args.practice and runner_temp
                     and area == (Path(runner_temp) / "shopping-trials").resolve()):
                 shutil.rmtree(area/"practice")
+            if (scale == "60M" and args.release_generated_final and "checked_generator_sha256" in state
+                    and runner_temp and area == (Path(runner_temp) / "shopping-trials").resolve()):
+                shutil.rmtree(area/"final")
         state["status"] = "passed"
         mark("finished")
     except BaseException as exc:
@@ -441,7 +478,8 @@ def main():
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 9 and sys.argv[1] == "container":
-        _, _, image, entry, meter, cpus, memory, data, out = sys.argv
-        sys.exit(in_container(image, entry, Path(meter), cpus, int(memory), Path(data), Path(out)))
+    if len(sys.argv) in (9, 10) and sys.argv[1] == "container":
+        _, _, image, entry, meter, cpus, memory, data, out, *workers = sys.argv
+        sys.exit(in_container(image, entry, Path(meter), cpus, int(memory), Path(data), Path(out),
+                              int(workers[0]) if workers else None))
     main()

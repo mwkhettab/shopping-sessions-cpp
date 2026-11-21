@@ -1,0 +1,106 @@
+name: Native shipping image and held-out 60M
+on:
+  push:
+    branches: [bench/native-x64-trials]
+    paths: [perf/native/finalist.json]
+permissions:
+  contents: read
+jobs:
+  qualify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 95
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Read selected revision
+        id: image
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, re
+          data = json.load(open('perf/native/finalist.json'))
+          if not re.fullmatch(r'[0-9a-f]{40}', data['commit']) or not re.fullmatch(r'[a-z-]+', data['variant']):
+              raise ValueError('Expected a full release SHA and a build variant')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              for key in ('commit', 'variant'):
+                  print(f'{key}={data[key]}', file=output)
+          PY
+      - name: Check out selected shipping sources
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.image.outputs.commit }}
+          path: .acceptance/candidate
+          persist-credentials: false
+      - name: Check out the scored control
+        uses: actions/checkout@v4
+        with:
+          ref: 4db76beed31640ddf4b414ed19deba5ebc660b81
+          path: .acceptance/baseline
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Prepare generator, fixtures and references
+        run: bash perf/native/prepare-port-runner.sh
+      - name: Verify the release images and time fresh containers
+        id: qualify
+        env:
+          CXX: g++-12
+        run: |
+          "$RUNNER_TEMP/shopping-python/bin/python" perf/native/port_acceptance.py \
+            --candidate-source "$GITHUB_WORKSPACE/.acceptance/candidate" \
+            --release-generated-practice --release-generated-final \
+            --warm-20 3 --warm-60 3 --cold-runs 1 --container-lifetime-pairs 5 --input-policy-rounds 5
+      - name: Publish native measurements and qualification
+        if: always()
+        run: |
+          results="$RUNNER_TEMP/shopping-trials/results"
+          if test -f "$results/port-acceptance/status.json"; then python3 perf/native/publish_profile.py "$results"; fi
+      - name: Compare mapped input and buffered reads
+        if: steps.qualify.outcome == 'success'
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          path = Path(os.environ['RUNNER_TEMP'])/'shopping-trials/results/port-acceptance/status.json'
+          for scale, trial in json.loads(path.read_text())['input_policies'].items():
+              print(f'::notice file=BENCHMARKS.md,line=1,title={scale} input policies::{json.dumps(trial, sort_keys=True)}')
+          PY
+      - name: Check held-out seed 733 with eight application workers
+        if: steps.qualify.outcome == 'success'
+        env:
+          SHIPPING_SHA: ${{ steps.image.outputs.commit }}
+        run: |
+          "$RUNNER_TEMP/shopping-python/bin/python" perf/native/holdout_shipping.py --shipping-commit "$SHIPPING_SHA"
+      - name: Exercise native SIMD and parked-worker retry paths
+        if: always() && steps.qualify.outcome == 'success'
+        env:
+          CXX: g++-12
+          SHIPPING_SHA: ${{ steps.image.outputs.commit }}
+          SHIPPING_VARIANT: ${{ steps.image.outputs.variant }}
+        run: |
+          area="$RUNNER_TEMP/shopping-trials"
+          "$RUNNER_TEMP/shopping-python/bin/python" perf/native/native_code_paths.py \
+            --source "$GITHUB_WORKSPACE/.acceptance/candidate" --revision "$SHIPPING_SHA" \
+            --variant "$SHIPPING_VARIANT" --release "$area/accept-binaries/candidate/shopping" \
+            --output "$area/results/native-code-paths"
+      - name: Publish instruction coverage
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          p = Path(os.environ['RUNNER_TEMP'])/'shopping-trials/results/native-code-paths/status.json'
+          if p.is_file():
+              r=json.loads(p.read_text())
+              print('::notice file=BENCHMARKS.md,line=1,title=Native instruction coverage::' +
+                    json.dumps({'status':r['status'],'features':r['features'],'checks':{k:v['status'] for k,v in r['checks'].items()}},sort_keys=True))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: shipping-image-measurements
+          path: ${{ runner.temp }}/shopping-trials/results/
+          retention-days: 7
