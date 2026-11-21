@@ -1,0 +1,148 @@
+--- /dev/null
++++ b/cpp/journal.hpp
+@@ -0,0 +1,50 @@
++#pragma once
++template<class T,size_t Page> class InputJournal {
++  static_assert(std::has_single_bit(Page) && std::is_trivially_destructible_v<T>);
++  std::vector<T*> pages;
++  std::allocator<T> allocator;
++  size_t count{};
++public:
++  InputJournal()=default;
++  InputJournal(const InputJournal&)=delete;
++  ~InputJournal(){for(auto *p:pages)if(p)allocator.deallocate(p,Page);}
++  template<class...A> size_t append(A&&...args){
++    size_t at=count%Page;
++    if(!at){
++      T *next=allocator.allocate(Page);
++      try{pages.push_back(next);}catch(...){allocator.deallocate(next,Page);throw;}
++    }
++    std::construct_at(pages.back()+at,std::forward<A>(args)...);return count++;
++  }
++  T &operator[](size_t i){return pages[i/Page][i%Page];}
++  template<class F> void consume(F emit){
++    size_t remaining=count;
++    for(auto &p:pages){
++      size_t n=std::min<size_t>(Page,remaining);emit(std::span<T>(p,n));remaining-=n;
++      allocator.deallocate(p,Page);p=nullptr;
++    }
++    count=0;pages.clear();
++  }
++};
++template<size_t Page,class T,class Shard>
++void partition_journal(InputJournal<T,Page> &input,PartitionSlab<T> &output,Shard get){
++#ifdef SHOPPING_SORT_JOURNAL
++  std::vector<T> ordered(Page);
++  std::vector<uint16_t> tag(Page);
++  input.consume([&](std::span<T> rows){
++    std::array<unsigned,shards> counts{},ends;
++    for(size_t i=0;i<rows.size();++i) {
++      unsigned b=get(rows[i]);tag[i]=uint16_t(b);if(b<shards)++counts[b];
++    }
++    unsigned offset=0;
++    for(size_t b=0;b<shards;++b){ends[b]=offset;offset+=counts[b];}
++    for(size_t i=0;i<rows.size();++i)if(tag[i]<shards)ordered[ends[tag[i]]++]=rows[i];
++    for(size_t b=0;b<shards;++b)if(counts[b])
++      output[b].append_many(std::span<const T>(ordered.data()+ends[b]-counts[b],counts[b]));
++  });
++#else
++  input.consume([&](std::span<T> rows){
++    for(auto &r:rows){unsigned b=get(r);if(b<shards)output[b].push_back(r);}
++  });
++#endif
++}
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -20,13 +20,18 @@
+ };
+ template <class T> using Bins = std::array<std::vector<T>, shards>;
+ #include "partition_slab.hpp"
++#define SHOPPING_SORT_JOURNAL 1
++#include "journal.hpp"
+ template <class Layout> struct ScanWorker {
+   using EventData = typename Layout::E;
+   using ClickData = typename Layout::C;
+   using Candidate = RevisionIndex;
+   std::vector<ExtendedRevision> extended;
++  InputJournal<Candidate,8192> revlog;
+   PartitionSlab<Candidate> candidates;
++  InputJournal<std::pair<Key,EventData>,8192> rawlog;
+   PartitionSlab<std::pair<Key, EventData>> events;
++  InputJournal<std::pair<Key,ClickData>,8192> clicklog;
+   PartitionSlab<std::pair<Key, ClickData>> clicks;
+   struct Vertex {
+     Key name;
+@@ -356,7 +361,7 @@
+           r.ingest & 0x80000000u ? w.extended[r.location].location : r.location;
+       if (location) {
+         --location;
+-        w.events[location % shards][location / shards].first.bits = 0;
++        w.rawlog[location].first.bits=0;
+       }
+     };
+     for (unsigned owner = 0; owner < workers.size(); ++owner) {
+@@ -709,7 +714,7 @@
+ #ifdef SHOPPING_DIAGNOSTICS
+             ++workers[t].valid_clicks;
+ #endif
+-            workers[t].clicks[alias.hash() % shards].emplace_back(
++            workers[t].clicklog.append(
+                 Key{alias.bits},
+                 layout.click(workers[t].pool.encode(r[0], 'k'), ts, c));
+           });
+@@ -730,10 +735,7 @@
+           auto &w = workers[t];
+           uint64_t location = 0;
+           if (user.bits) {
+-            size_t b = user.hash() % shards;
+-            auto &rows = w.events[b];
+-            location = uint64_t(rows.size()) * shards + b + 1;
+-            rows.emplace_back(Key{user.bits}, layout.pack(e));
++            location=1+w.rawlog.append(Key{user.bits},layout.pack(e));
+           }
+           Time seconds = ingest / 1000;
+           Time relative = seconds - anchor;
+@@ -751,10 +753,15 @@
+             ref.location = uint32_t(w.extended.size());
+             w.extended.push_back({seconds, location});
+           }
+-          w.candidates[bucket(id)].push_back(ref);
++          w.revlog.append(ref);
+         });
+       });
+   timer.mark("concurrent input, raw user partition and revision index");
++  parallel(threads,threads,[&](size_t i,unsigned){auto &w=workers[i];
++    partition_journal(w.revlog,w.candidates,[](const auto &r){return unsigned(r.id.hash()%shards);});
++    partition_journal(w.clicklog,w.clicks,[](const auto &r){return unsigned(r.first.hash()%shards);});
++  });
++  timer.mark("bulk input partitions");
+ #ifdef SHOPPING_DIAGNOSTICS
+   size_t revision_count = 0, revision_capacity = 0;
+   for (const auto &worker : workers)
+@@ -768,6 +775,11 @@
+ #endif
+   resolve_revisions(workers, threads, anchor);
+   timer.mark("global event dedup and loser removal");
++  parallel(threads,threads,[&](size_t i,unsigned){
++    auto &w=workers[i];
++    partition_journal(w.rawlog,w.events,[](const auto &r){return r.first.bits?unsigned(r.first.hash()%shards):unsigned(shards);});
++  });
++  timer.mark("bulk partition of winning events");
+   std::vector<Result> results(threads);
+   for (auto &result : results)
+     result.configure(window, cat, threads);
+--- a/cpp/partition_slab.hpp
++++ b/cpp/partition_slab.hpp
+@@ -16,6 +16,12 @@
+       std::construct_at(data + used++, std::forward<Args>(args)...);
+     else
+       tail.emplace_back(std::forward<Args>(args)...);
++  }
++  void append_many(std::span<const T> batch) {
++    size_t n=std::min(limit-used,batch.size());
++    if(n)std::uninitialized_copy_n(batch.data(),n,data+used);
++    used+=n;
++    if(n<batch.size())tail.insert(tail.end(),batch.begin()+n,batch.end());
+   }
+   void push_back(T v) { emplace_back(v); }
+   void release() { std::vector<T>().swap(tail); }

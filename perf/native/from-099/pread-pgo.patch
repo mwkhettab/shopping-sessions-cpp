@@ -1,0 +1,132 @@
+--- /dev/null
++++ b/cpp/chunk_reader.hpp
+@@ -0,0 +1,33 @@
++#pragma once
++struct ChunkReader {
++  std::vector<char> buffer;
++  int fd=-1;
++  const fs::path *path{};
++  ChunkReader()=default;
++  ChunkReader(const ChunkReader&)=delete;
++  ~ChunkReader(){if(fd>=0)close(fd);}
++  template<class Pool> Str read(const InputChunk &chunk,Pool &pool) {
++    Str source=chunk.body();pool.original=nullptr;
++    if(source.size()<8192||source.size()>(2u<<20)||!chunk.path)return source;
++    if(buffer.size()<source.size())buffer.resize(source.size());
++#ifdef SHOPPING_PREAD
++    if(path!=chunk.path){
++      if(fd>=0)close(fd);
++      fd=open(chunk.path->c_str(),O_RDONLY);path=chunk.path;
++    }
++    if(fd<0)return source;
++    size_t done=0;
++    auto offset=source.data()-chunk.file.data();
++    while(done<source.size()){
++      auto n=pread(fd,buffer.data()+done,source.size()-done,off_t(offset)+off_t(done));
++      if(n<0 && errno==EINTR)continue;
++      if(n<=0)return source;
++      done+=size_t(n);
++    }
++#else
++    std::memcpy(buffer.data(),source.data(),source.size());
++#endif
++    pool.original=source.data();pool.mirror=buffer.data();
++    return {buffer.data(),source.size()};
++  }
++};
+--- a/cpp/input.hpp
++++ b/cpp/input.hpp
+@@ -33,6 +33,7 @@
+ struct InputChunk {
+   Str file;
+   size_t begin, end;
++  const fs::path *path{};
+   size_t size() const { return end - begin; }
+   Str body() const {
+     size_t first = begin;
+@@ -56,6 +57,7 @@
+ };
+ struct Input {
+   std::vector<Str> mappings;
++  std::deque<fs::path> paths;
+   ~Input() {
+     for (auto s : mappings)
+       munmap(const_cast<char *>(s.data()), s.size());
+@@ -86,9 +88,10 @@
+     for (auto &file : fs::directory_iterator(dir)) {
+       if (file.path().extension() != ".csv")
+         continue;
+-      Str data = map(file.path());
++      paths.push_back(file.path());
++      Str data = map(paths.back());
+       for (size_t off = 0; off < data.size(); off += block)
+-        chunks.push_back({data, off, std::min(data.size(), off + block)});
++        chunks.push_back({data, off, std::min(data.size(), off + block),&paths.back()});
+     }
+     return chunks;
+   }
+@@ -408,6 +411,7 @@
+ };
+ struct KeyPool {
+   std::deque<BorrowedKey> other;
++  const char *original{},*mirror{};
+   Key encode(Str s, char prefix) {
+     if constexpr (sizeof(uintptr_t) == 8 &&
+                   std::endian::native == std::endian::little) {
+@@ -422,7 +426,9 @@
+           return {uintptr_t(permute_key(n) << 1)};
+       }
+     }
+-    other.push_back({s,std::hash<Str>{}(s)});
++    auto hash=std::hash<Str>{}(s);
++    if(original)s=Str(original+(s.data()-mirror),s.size());
++    other.push_back({s,hash});
+     static_assert(alignof(Str) >= 4);
+     return {reinterpret_cast<uintptr_t>(&other.back()) | 1};
+   }
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -20,6 +20,8 @@
+ };
+ template <class T> using Bins = std::array<std::vector<T>, shards>;
+ #include "partition_slab.hpp"
++#define SHOPPING_PREAD 1
++#include "chunk_reader.hpp"
+ template <class Layout> struct ScanWorker {
+   using EventData = typename Layout::E;
+   using ClickData = typename Layout::C;
+@@ -38,6 +40,7 @@
+   std::vector<std::array<Vertex *, 2>> edges;
+   Bins<std::pair<Key, size_t>> endpoints;
+   KeyPool pool;
++  ChunkReader reader;
+ #ifdef SHOPPING_DIAGNOSTICS
+   size_t revisions{}, valid_events{}, duplicates{}, valid_clicks{};
+ #endif
+@@ -684,7 +687,7 @@
+       [&](size_t job, unsigned t) {
+         if (job < links.size()) {
+           auto &w = workers[t];
+-          rows<2>(links[job].body(), [&](auto &r) {
++          rows<2>(workers[t].reader.read(links[job],workers[t].pool), [&](auto &r) {
+             if (r[0].empty() || r[1].empty())
+               return;
+             size_t index = w.edges.size() * 2;
+@@ -698,7 +701,7 @@
+         }
+         job -= links.size();
+         if (job >= events.size()) {
+-          rows<4>(clicks[job - events.size()].body(), [&](auto &r) {
++          rows<4>(workers[t].reader.read(clicks[job - events.size()],workers[t].pool), [&](auto &r) {
+             if (r[0].empty() || r[1].empty())
+               return;
+             Time ts = timestamp(r[3]);
+@@ -715,7 +718,7 @@
+           });
+           return;
+         }
+-        rows<7>(events[job].body(), [&](auto &r) {
++        rows<7>(workers[t].reader.read(events[job],workers[t].pool), [&](auto &r) {
+           if (r[0].empty())
+             return;
+           Time ingest = ingest_time(r[3]);

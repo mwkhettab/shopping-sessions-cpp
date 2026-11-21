@@ -1,0 +1,46 @@
+--- a/cpp/input.hpp
++++ b/cpp/input.hpp
+@@ -51,6 +51,13 @@
+       size_t lf = file.find('\n', end);
+       last = lf == Str::npos ? file.size() : lf + 1;
+     }
++#ifdef MADV_POPULATE_READ
++    if(last-first>=65536) {
++      static const size_t page=size_t(sysconf(_SC_PAGESIZE));
++      size_t aligned=first/page*page;
++      madvise(const_cast<char*>(file.data()+aligned),last-aligned,MADV_POPULATE_READ);
++    }
++#endif
+     return file.substr(first, last - first);
+   }
+ };
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -673,11 +673,10 @@
+   auto click_hint =
+       hint(click_count, sizeof(std::pair<Key, typename Layout::C>),
+            size_t(768) << 20);
+-  for (auto &w : workers) {
+-    w.candidates.reserve(rev_hint);
+-    w.events.reserve(event_hint);
+-    w.clicks.reserve(click_hint);
+-  }
++  parallel(threads,threads,[&](size_t t,unsigned){
++    auto &w=workers[t];
++    w.candidates.reserve(rev_hint);w.events.reserve(event_hint);w.clicks.reserve(click_hint);
++  });
+   const Time anchor = window.start / 1000;
+   parallel(
+       links.size() + events.size() + clicks.size(), threads,
+--- a/cpp/partition_slab.hpp
++++ b/cpp/partition_slab.hpp
+@@ -39,6 +39,9 @@
+ #ifdef MADV_HUGEPAGE
+     madvise(region, bytes, MADV_HUGEPAGE);
+ #endif
++#ifdef MADV_POPULATE_WRITE
++    if(bytes>=2u<<20)madvise(region,bytes,MADV_POPULATE_WRITE);
++#endif
+     for (size_t i = 0; i < shards; ++i) {
+       buckets[i].data =
+           reinterpret_cast<T *>(static_cast<char *>(region) + i * stride);

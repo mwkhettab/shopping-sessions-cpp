@@ -1,0 +1,138 @@
+--- /dev/null
++++ b/cpp/demand_slab.hpp
+@@ -0,0 +1,71 @@
++#pragma once
++template<class T,size_t Block> struct DemandSlab {
++  static_assert(std::has_single_bit(Block) && std::is_trivially_destructible_v<T>);
++  std::array<size_t,shards> counts{};
++  std::array<T*,shards> current{};
++  std::array<std::vector<T*>,shards> blocks;
++  std::vector<T*> extra;
++  std::allocator<T> allocator;
++  void *mapping=MAP_FAILED;
++  size_t bytes{},capacity{},issued{};
++  static constexpr size_t growth=std::max<size_t>(1,65536/(sizeof(T)*Block));
++  DemandSlab()=default;
++  DemandSlab(const DemandSlab&)=delete;
++  void reserve(size_t hint) {
++    if(!hint)return;
++    capacity=(hint*shards+Block-1)/Block;bytes=capacity*Block*sizeof(T);
++    mapping=mmap(nullptr,bytes,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
++    if(mapping==MAP_FAILED){capacity=0;return;}
++#ifdef MADV_HUGEPAGE
++    madvise(mapping,bytes,MADV_HUGEPAGE);
++#endif
++  }
++  T *take(){
++    size_t i=issued++;
++    if(i<capacity)return reinterpret_cast<T*>(mapping)+i*Block;
++    auto offset=(i-capacity)%growth;
++    if(!offset){
++      auto *new_page=allocator.allocate(growth*Block);
++      try{extra.push_back(new_page);}catch(...){allocator.deallocate(new_page,growth*Block);throw;}
++    }
++    return extra.back()+offset*Block;
++  }
++  template<class... A> size_t append(size_t b,A&&...args) {
++    size_t i=counts[b]++,offset=i%Block;
++    if(!offset) {
++      auto *next=take();blocks[b].push_back(next);current[b]=next;
++    }
++    std::construct_at(current[b]+offset,std::forward<A>(args)...);
++    return i;
++  }
++  struct View {
++    DemandSlab &s;size_t b;
++    size_t size()const{return s.counts[b];}
++    size_t capacity()const{return s.blocks[b].size()*Block;}
++    T &operator[](size_t i)const{return s.blocks[b][i/Block][i%Block];}
++    void push_back(T v){s.append(b,std::move(v));}
++    template<class... A> void emplace_back(A&&...args){s.append(b,std::forward<A>(args)...);}
++    void release(){std::vector<T*>().swap(s.blocks[b]);}
++    struct Range {
++      DemandSlab &s;size_t b;
++      struct Iter {
++        const Range *r;size_t i;
++        auto operator*()const{
++          auto &s=r->s;
++          return std::span<T>(s.blocks[r->b][i],std::min<size_t>(Block,s.counts[r->b]-i*Block));
++        }
++        Iter &operator++(){++i;return *this;}
++        bool operator!=(const Iter &other)const{return i!=other.i;}
++      };
++      Iter begin()const{return {this,0};}Iter end()const{return {this,s.blocks[b].size()};}
++    };
++    Range spans()const{return {s,b};}
++  };
++  View operator[](size_t b){return {*this,b};}
++  void release(){
++    if(mapping!=MAP_FAILED){munmap(mapping,bytes);mapping=MAP_FAILED;}
++    for(auto *p:extra)allocator.deallocate(p,growth*Block);
++    extra.clear();
++  }
++  ~DemandSlab(){release();}
++};
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -20,14 +20,15 @@
+ };
+ template <class T> using Bins = std::array<std::vector<T>, shards>;
+ #include "partition_slab.hpp"
++#include "demand_slab.hpp"
+ template <class Layout> struct ScanWorker {
+   using EventData = typename Layout::E;
+   using ClickData = typename Layout::C;
+   using Candidate = RevisionIndex;
+   std::vector<ExtendedRevision> extended;
+-  PartitionSlab<Candidate> candidates;
+-  PartitionSlab<std::pair<Key, EventData>> events;
+-  PartitionSlab<std::pair<Key, ClickData>> clicks;
++  DemandSlab<Candidate,64> candidates;
++  DemandSlab<std::pair<Key,EventData>,64> events;
++  DemandSlab<std::pair<Key,ClickData>,64> clicks;
+   struct Vertex {
+     Key name;
+     Vertex *parent, *next;
+@@ -360,11 +361,12 @@
+       }
+     };
+     for (unsigned owner = 0; owner < workers.size(); ++owner) {
+-      auto &refs = workers[owner].candidates[b];
++      auto &&refs = workers[owner].candidates[b];
+       // Reserve zero for an empty slot. Six low bits identify one of at most
+       // 64 input workers, and the remaining bits locate its immutable revision.
+-      for (size_t i = 0; i < refs.size(); ++i) {
+-        auto &r = refs[i];
++      size_t issued=0;
++      for(auto part:refs.spans())for(auto &r:part) {
++        size_t i=issued++;
+         size_t at = (r.id.hash() / shards) & (capacity - 1);
+         for (;;) {
+           auto code = best[at];
+@@ -731,9 +733,8 @@
+           uint64_t location = 0;
+           if (user.bits) {
+             size_t b = user.hash() % shards;
+-            auto &rows = w.events[b];
+-            location = uint64_t(rows.size()) * shards + b + 1;
+-            rows.emplace_back(Key{user.bits}, layout.pack(e));
++            auto ordinal=w.events.append(b,Key{user.bits},layout.pack(e));
++            location=uint64_t(ordinal)*shards+b+1;
+           }
+           Time seconds = ingest / 1000;
+           Time relative = seconds - anchor;
+@@ -757,11 +758,9 @@
+   timer.mark("concurrent input, raw user partition and revision index");
+ #ifdef SHOPPING_DIAGNOSTICS
+   size_t revision_count = 0, revision_capacity = 0;
+-  for (const auto &worker : workers)
+-    for (const auto &bin : worker.candidates) {
+-      revision_count += bin.size();
+-      revision_capacity += bin.capacity();
+-    }
++  for(auto &worker:workers)for(size_t b=0;b<shards;++b){
++    auto bin=worker.candidates[b];revision_count+=bin.size();revision_capacity+=bin.capacity();
++  }
+   std::cerr << "revision storage " << revision_count * sizeof(Candidate)
+             << " used bytes, " << revision_capacity * sizeof(Candidate)
+             << " capacity bytes\n";

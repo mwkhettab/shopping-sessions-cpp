@@ -1,0 +1,140 @@
+--- a/cpp/input.hpp
++++ b/cpp/input.hpp
+@@ -290,7 +290,7 @@
+       return -1;
+   return (h * 60 + m) * 60 + s;
+ }
+-inline Time midnight(const char *p) {
++inline Time civil_day(const char *p) {
+   struct CachedDay {
+     uint64_t prefix{};
+     uint16_t suffix{};
+@@ -318,9 +318,10 @@
+   int era = (y >= 0 ? y : y - 399) / 400, year = y - era * 400;
+   int days = era * 146097 + year * 365 + year / 4 - year / 100 +
+              (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1 - 719468;
+-  hit = {prefix, suffix, days * day_ms};
++  hit = {prefix, suffix, days};
+   return hit.result;
+ }
++inline Time midnight(const char *p) {auto day=civil_day(p);return day==bad?bad:day*day_ms;}
+ inline Time timestamp(Str s) {
+   if (s.size() == 13) {
+     auto first = little_word(s.data()), last = little_word(s.data() + 5);
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -124,12 +124,14 @@
+       throw std::runtime_error("invalid manifest window");
+   }
+ };
++#define SHOPPING_SHARED_DATE 1
++#define SHOPPING_TWIN_SIMD 1
++#include "twin_clock.hpp"
+ template <class Row>
+-Event validate(const Row &r, Time ingest, const Catalog &catalog, Window w) {
++Event validate_at(const Row &r, Time ts, Time ingest, const Catalog &catalog, Window w) {
+   Event drop{bad, 0, 0};
+   if (r[1].empty() || r[5].empty())
+     return drop;
+-  Time ts = timestamp(r[2]);
+   if (ts < w.start || ts >= w.end || ingest - ts > day_ms)
+     return drop;
+   if (r[4] == "view" || r[4] == "cart")
+@@ -141,6 +143,7 @@
+     return drop;
+   return {ts, int32_t(price), std::max(0, catalog.product.find(r[5]))};
+ }
++template<class Row> Event validate(const Row &r,Time ingest,const Catalog &cat,Window w){return validate_at(r,timestamp(r[2]),ingest,cat,w);}
+ using Totals = std::map<std::pair<int, int32_t>, Counts>;
+ int32_t utc_day(Time ts) { return int32_t(ts / day_ms - (ts % day_ms < 0)); }
+ template <class T> struct ScratchArray {
+@@ -718,10 +721,10 @@
+         rows<7>(events[job].body(), [&](auto &r) {
+           if (r[0].empty())
+             return;
+-          Time ingest = ingest_time(r[3]);
++          auto clocks=event_clocks(r[2],r[3]);
+           // Invalid revisions still take part in earliest-ingest selection.
+           Key id = workers[t].pool.encode(r[0], 'e');
+-          Event e = validate(r, ingest, cat, window);
++          Event e=validate_at(r,clocks.event,clocks.ingest,cat,window);
+ #ifdef SHOPPING_DIAGNOSTICS
+           ++workers[t].revisions;
+           workers[t].valid_events += e.ts != bad;
+@@ -735,7 +738,7 @@
+             location = uint64_t(rows.size()) * shards + b + 1;
+             rows.emplace_back(Key{user.bits}, layout.pack(e));
+           }
+-          Time seconds = ingest / 1000;
++          Time seconds=clocks.seconds;
+           Time relative = seconds - anchor;
+           // Bias signed seconds into 31 bits. The high bit selects the overflow
+           // vector.
+--- /dev/null
++++ b/cpp/twin_clock.hpp
+@@ -0,0 +1,65 @@
++#pragma once
++struct EventClocks {Time event,ingest,seconds;};
++#ifdef SHOPPING_TWIN_SIMD
++#ifdef SHOPPING_X86_CSV
++__attribute__((target("ssse3"))) inline uint64_t clock_pair(const char *event,const char *arrival) {
++  auto raw=_mm_set_epi64x(std::bit_cast<int64_t>(little_word(arrival)),std::bit_cast<int64_t>(little_word(event)));
++  auto digits=_mm_shuffle_epi8(_mm_sub_epi8(raw,_mm_set1_epi8('0')),
++                 _mm_setr_epi8(0,1,3,4,6,7,-1,-1,8,9,11,12,14,15,-1,-1));
++  auto values=_mm_maddubs_epi16(digits,_mm_set1_epi16(0x010a));
++  auto partial=_mm_madd_epi16(values,_mm_setr_epi16(3600,60,1,0,3600,60,1,0));
++  auto total=_mm_hadd_epi32(partial,partial);
++  uint64_t result=uint64_t(_mm_cvtsi128_si64(total));
++  auto valid_digits=_mm_cmpeq_epi8(digits,_mm_min_epu8(digits,_mm_set1_epi8(9)));
++  auto high=_mm_cmpgt_epi16(values,_mm_setr_epi16(23,59,59,100,23,59,59,100));
++  if((_mm_movemask_epi8(valid_digits)&63)!=63||(_mm_movemask_epi8(high)&63)||event[2]!=':'||event[5]!=':')
++    result|=UINT32_MAX;
++  return result;
++}
++#endif
++#endif
++inline EventClocks event_clocks(Str instant,Str arrival) {
++  if(arrival.size()!=20) {
++    Time ingest=ingest_time(arrival);
++    return {timestamp(instant),ingest,ingest/1000};
++  }
++  const char *a=arrival.data();
++  Time ad=civil_day(a);
++  if(ad==bad)return {timestamp(instant),bad,bad/1000};
++  int arrival_sec,event_sec=0;
++  bool iso=(instant.size()==20||instant.size()==25)&&instant[4]=='-';
++  const char *e=instant.data();
++#ifdef SHOPPING_TWIN_SIMD
++#ifdef SHOPPING_X86_CSV
++  if(iso&&__builtin_cpu_supports("ssse3")) {
++    uint64_t clocks=clock_pair(e+11,a+11);
++    event_sec=std::bit_cast<int32_t>(uint32_t(clocks));
++    arrival_sec=int(clocks>>32);
++  } else
++#endif
++#endif
++  {
++    arrival_sec=clock_seconds<false>(a+11);
++    if(iso)event_sec=clock_seconds<true>(e+11);
++  }
++  Time seconds=ad*86400+arrival_sec;
++  Time time=bad;
++  if(!iso)time=timestamp(instant);
++  else if(event_sec>=0 && e[10]=='T') {
++    bool valid=true;
++    if(instant.size()==25){
++      int h=pair_digits(e+20),m=pair_digits(e+23);
++      valid=(e[19]=='+'||e[19]=='-')&&e[22]==':'&&unsigned(h)<=23&&unsigned(m)<=59;
++      if(valid)event_sec-=(h*3600+m*60)*(e[19]=='+'?1:-1);
++    } else valid=e[19]=='Z';
++    if(valid) {
++#ifdef SHOPPING_SHARED_DATE
++      Time ed=(little_word(e)==little_word(a)&&e[8]==a[8]&&e[9]==a[9])?ad:civil_day(e);
++#else
++      Time ed=civil_day(e);
++#endif
++      if(ed!=bad)time=(ed*86400+event_sec)*1000;
++    }
++  }
++  return {time,seconds*1000,seconds};
++}

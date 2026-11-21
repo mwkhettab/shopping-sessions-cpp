@@ -1,0 +1,112 @@
+--- /dev/null
++++ b/cpp/hot_slab.hpp
+@@ -0,0 +1,52 @@
++#pragma once
++template<class T,bool Starts,bool Color> struct HotSlab {
++  static_assert(std::is_trivially_destructible_v<T>);
++  std::array<size_t,shards> counts{};
++  std::conditional_t<Starts,std::array<T*,shards>,std::array<T*,0>> starts{};
++  std::array<std::vector<T>,shards> spill;
++  void *region=MAP_FAILED;
++  size_t bytes{},stride{},cap{};
++  HotSlab()=default;
++  HotSlab(const HotSlab&)=delete;
++  T *begin_at(size_t b) const {
++    if constexpr(Starts)return starts[b];
++    else {
++      if(!cap)return nullptr;
++      return reinterpret_cast<T*>(static_cast<char*>(region)+b*stride+(Color?((b*13)&63)*64:0));
++    }
++  }
++  void reserve(size_t n) {
++    if(!n)return;
++    constexpr size_t page=4096;
++    size_t usable=(n*sizeof(T)+page-1)/page*page;
++    stride=usable+(Color?page:0);
++    bytes=stride*shards;
++    region=mmap(nullptr,bytes,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
++    if(region==MAP_FAILED)return;
++    cap=usable/sizeof(T);
++#ifdef MADV_HUGEPAGE
++    madvise(region,bytes,MADV_HUGEPAGE);
++#endif
++    if constexpr(Starts)for(size_t b=0;b<shards;++b)
++      starts[b]=reinterpret_cast<T*>(static_cast<char*>(region)+b*stride+(Color?((b*13)&63)*64:0));
++  }
++  template<class...A> size_t append(size_t b,A&&...args) {
++    size_t i=counts[b]++;
++    if(i<cap)std::construct_at(begin_at(b)+i,std::forward<A>(args)...);
++    else spill[b].emplace_back(std::forward<A>(args)...);
++    return i;
++  }
++  struct View {
++    HotSlab &s;size_t b;
++    size_t size()const{return s.counts[b];}
++    size_t capacity()const{return s.cap+s.spill[b].capacity();}
++    auto spans()const{return std::array{std::span<T>(s.begin_at(b),std::min(s.cap,size())),std::span<T>(s.spill[b])};}
++    T &operator[](size_t i)const{return i<s.cap?s.begin_at(b)[i]:s.spill[b][i-s.cap];}
++    void push_back(T value){s.append(b,std::move(value));}
++    template<class...A> void emplace_back(A&&...args){s.append(b,std::forward<A>(args)...);}
++    void release(){std::vector<T>().swap(s.spill[b]);}
++  };
++  View operator[](size_t b){return {*this,b};}
++  void release(){if(region!=MAP_FAILED){munmap(region,bytes);region=MAP_FAILED;cap=0;}}
++  ~HotSlab(){release();}
++};
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -20,14 +20,15 @@
+ };
+ template <class T> using Bins = std::array<std::vector<T>, shards>;
+ #include "partition_slab.hpp"
++#include "hot_slab.hpp"
+ template <class Layout> struct ScanWorker {
+   using EventData = typename Layout::E;
+   using ClickData = typename Layout::C;
+   using Candidate = RevisionIndex;
+   std::vector<ExtendedRevision> extended;
+-  PartitionSlab<Candidate> candidates;
+-  PartitionSlab<std::pair<Key, EventData>> events;
+-  PartitionSlab<std::pair<Key, ClickData>> clicks;
++  HotSlab<Candidate,true,false> candidates;
++  HotSlab<std::pair<Key,EventData>,true,false> events;
++  HotSlab<std::pair<Key,ClickData>,true,false> clicks;
+   struct Vertex {
+     Key name;
+     Vertex *parent, *next;
+@@ -360,7 +361,7 @@
+       }
+     };
+     for (unsigned owner = 0; owner < workers.size(); ++owner) {
+-      auto &refs = workers[owner].candidates[b];
++      auto &&refs = workers[owner].candidates[b];
+       // Reserve zero for an empty slot. Six low bits identify one of at most
+       // 64 input workers, and the remaining bits locate its immutable revision.
+       for (size_t i = 0; i < refs.size(); ++i) {
+@@ -731,9 +732,8 @@
+           uint64_t location = 0;
+           if (user.bits) {
+             size_t b = user.hash() % shards;
+-            auto &rows = w.events[b];
+-            location = uint64_t(rows.size()) * shards + b + 1;
+-            rows.emplace_back(Key{user.bits}, layout.pack(e));
++            auto ordinal=w.events.append(b,Key{user.bits},layout.pack(e));
++            location=uint64_t(ordinal)*shards+b+1;
+           }
+           Time seconds = ingest / 1000;
+           Time relative = seconds - anchor;
+@@ -757,11 +757,9 @@
+   timer.mark("concurrent input, raw user partition and revision index");
+ #ifdef SHOPPING_DIAGNOSTICS
+   size_t revision_count = 0, revision_capacity = 0;
+-  for (const auto &worker : workers)
+-    for (const auto &bin : worker.candidates) {
+-      revision_count += bin.size();
+-      revision_capacity += bin.capacity();
+-    }
++  for(auto &worker:workers)for(size_t b=0;b<shards;++b){
++    auto bin=worker.candidates[b];revision_count+=bin.size();revision_capacity+=bin.capacity();
++  }
+   std::cerr << "revision storage " << revision_count * sizeof(Candidate)
+             << " used bytes, " << revision_capacity * sizeof(Candidate)
+             << " capacity bytes\n";

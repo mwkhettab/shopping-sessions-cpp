@@ -1,0 +1,179 @@
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -164,7 +164,8 @@
+   ScratchArray<ActiveCampaign> activity;
+   ScratchArray<int64_t> spend;
+   std::vector<int> active, purchased;
+-  std::vector<UserDay> users;
++  std::unique_ptr<UserPageWriter> writer;
++  void emit(const UserDay &row){writer->append(row);}
+   Totals sparse;
+   std::vector<Counts> table;
+   int32_t first_day{};
+@@ -233,11 +234,11 @@
+       auto &v = result.spend[k];
+       if (v > best || (v == best && cat.categories[k] < *daily.category)) {
+         best = v;
+-        daily.category = cat.categories[k];
++        daily.category = &cat.categories[k];
+       }
+       v = 0;
+     }
+-    result.users.push_back(daily);
++    result.emit(daily);
+     result.purchased.clear();
+   };
+   auto begin_session = [&](Time start) {
+@@ -769,23 +770,40 @@
+   resolve_revisions(workers, threads, anchor);
+   timer.mark("global event dedup and loser removal");
+   std::vector<Result> results(threads);
+-  for (auto &result : results)
+-    result.configure(window, cat, threads);
+-  process_people(workers, results, cat, threads, timer, layout);
+-  fs::create_directories(output / "user_daily");
+-  fs::create_directories(output / "campaign_daily");
+-  parallel(results.size(), threads, [&](size_t i, unsigned) {
+-    write_users(output / "user_daily" /
+-                    ("part-" + std::to_string(i) + ".parquet"),
+-                results[i].users);
++  fs::create_directories(output/"user_daily");
++  fs::create_directories(output/"campaign_daily");
++  parallel(results.size(),threads,[&](size_t i,unsigned) {
++    auto &result=results[i];
++    result.configure(window,cat,threads);
++    result.writer=std::make_unique<UserPageWriter>(output/"user_daily"/("part-"+std::to_string(i)+".parquet"));
+   });
+-  Totals merged;
+-  for (auto &r : results)
+-    r.merge_into(merged);
++  process_people(workers,results,cat,threads,timer,layout);
++  parallel(results.size(),threads,[&](size_t i,unsigned) {
++    results[i].writer->close();
++  });
+   std::vector<CampaignDay> campaigns;
+-  for (auto &[key, c] : merged)
+-    campaigns.push_back(
+-        {cat.campaigns[key.first], cat.channels[key.first], key.second, c});
++  auto append=[&](size_t id,int32_t day,const Counts &c){
++    campaigns.push_back({cat.campaigns[id],cat.channels[id],day,c});
++  };
++  const auto &first=results.front();
++  if(!first.table.empty()) {
++    for(size_t start=0;start<first.table.size();start+=first.campaigns) {
++      int32_t day=first.first_day+int32_t(start/first.campaigns);
++      for(size_t id=0;id<first.campaigns;++id) {
++        Counts c{};
++        for(const auto &r:results) {
++          const auto &part=r.table[start+id];
++          c.sessions+=part.sessions;c.purchases+=part.purchases;
++          c.revenue+=part.revenue;c.assists+=part.assists;
++        }
++        if(c.sessions||c.assists)append(id,day,c);
++      }
++    }
++  } else {
++    Totals merged;
++    for(auto &r:results)r.merge_into(merged);
++    for(auto &[key,c]:merged)append(key.first,key.second,c);
++  }
+   write_campaigns(output / "campaign_daily" / "part-0.parquet", campaigns);
+   timer.mark("merge and Parquet output");
+ #ifdef SHOPPING_DIAGNOSTICS
+--- a/cpp/output.hpp
++++ b/cpp/output.hpp
+@@ -3,7 +3,7 @@
+   Key user;
+   int32_t day;
+   int64_t sessions, events, revenue;
+-  std::optional<Str> category;
++  const Str *category{};
+ };
+ struct Counts {
+   int64_t sessions{}, purchases{}, revenue{}, assists{};
+@@ -15,3 +15,4 @@
+ };
+ 
+ #include "flat_parquet.hpp"
++#include "user_stream.hpp"
+--- /dev/null
++++ b/cpp/user_stream.hpp
+@@ -0,0 +1,78 @@
++#pragma once
++class UserPageWriter {
++  using Bytes=flat_parquet::Bytes;
++  static constexpr flat_parquet::Column schema[]={
++    {"user_id",6,0},{"day",1,6},{"sessions",2},{"events",2},{"revenue_cents",2},{"top_category",6,0,true}
++  };
++  flat_parquet::File file;
++  std::array<Bytes,6> data;
++  Bytes definitions,optional,packed;
++  size_t rows{},text_bytes{};
++  std::array<std::array<char,9>,2> inline_name;
++  unsigned active_name{};
++  Bytes lengths,prefixes;
++  uintptr_t previous_key{};
++  Str last_name;
++  static constexpr size_t row_limit=16384;
++  void flush() {
++    if(!rows)return;
++    file.group(rows);
++    packed.clear();
++    flat_parquet::delta_pack<int32_t>(packed,prefixes);
++    flat_parquet::delta_pack<int32_t>(packed,lengths);
++    packed+=data[0];
++    file.page(packed,7);
++    lengths.clear();prefixes.clear();
++    for(size_t i=1;i<5;++i) {
++#ifdef SHOPPING_PLAIN_STREAM
++      file.page(data[i]);
++#else
++      packed.clear();
++      if(i==1)flat_parquet::delta_pack<int32_t>(packed,data[i]);
++      else flat_parquet::delta_pack<int64_t>(packed,data[i]);
++      file.page(packed,5);
++#endif
++    }
++    optional.clear();
++    size_t start=flat_parquet::levels(optional,rows);
++    std::memcpy(optional.data()+start,definitions.data(),definitions.size());
++    optional.append(data[5]);file.page(optional);
++    for(auto &p:data)p.clear();
++    definitions.clear();rows=0;text_bytes=0;
++  }
++public:
++  explicit UserPageWriter(const fs::path &path):file(path,schema) {
++    for(auto &p:data)p.reserve(row_limit*8);
++    definitions.reserve(row_limit/8);
++    packed.reserve(row_limit*4);
++  }
++  void append(const UserDay &r) {
++    [[maybe_unused]] Str previous=last_name;
++    bool same=r.user.bits==previous_key;
++    if(!same){active_name^=1;last_name=r.user.user_text(inline_name[active_name]);previous_key=r.user.bits;}
++    if(last_name.size()>INT32_MAX)throw std::length_error("user ID exceeds Parquet string limit");
++    size_t extra=last_name.size()+(r.category?r.category->size():0);
++    if(rows && (rows==row_limit || extra>std::max<size_t>(text_bytes,8u<<20)-text_bytes)) flush();
++    text_bytes+=extra;
++    size_t prefix=0;
++    if(rows) {
++      if(same)prefix=last_name.size();
++      else {
++        auto n=std::min(previous.size(),last_name.size());
++        while(prefix<n && previous[prefix]==last_name[prefix])++prefix;
++      }
++    }
++    flat_parquet::little(prefixes,int32_t(prefix));
++    flat_parquet::little(lengths,int32_t(last_name.size()-prefix));
++    data[0].append(last_name.substr(prefix));
++    flat_parquet::little(data[1],r.day);flat_parquet::little(data[2],r.sessions);
++    flat_parquet::little(data[3],r.events);flat_parquet::little(data[4],r.revenue);
++    if(!(rows%8))definitions.push_back(0);
++    if(r.category) {
++      definitions.back()=char(static_cast<unsigned char>(definitions.back())|(1u<<(rows%8)));
++      flat_parquet::plain_string(data[5],*r.category);
++    }
++    ++rows;
++  }
++  void close(){flush();file.close();}
++};

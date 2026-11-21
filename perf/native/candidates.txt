@@ -1,1 +1,1 @@
-base fin-slabkey-pgo denseend-pgo denseptr-pgo densereserve-pgo edgequote-pgo edgepdep-pgo line8-pgo eventlines-pgo tile8-pgo insert3-pgo col256-pgo ways8-pgo colways-pgo
+base fin-slabkey-pgo streamout-pgo streamdense-pgo streamhot-pgo nameprefix-pgo hotptr-pgo lograw-pgo logall-pgo demand64-pgo pread-pgo popboth-pgo routeboth-pgo twinssse-pgo

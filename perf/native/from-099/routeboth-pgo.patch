@@ -1,0 +1,390 @@
+--- /dev/null
++++ b/cpp/identity_routes.hpp
+@@ -0,0 +1,132 @@
++#pragma once
++// All identifiers from links enter this table, including aliases with no data.
++class IdentityRoutes {
++  struct Cell {Key key;uintptr_t value{};};
++  struct Table {
++    std::vector<Cell> values;
++#ifdef SHOPPING_ROUTE_FILTER
++    std::vector<uint64_t> possible;
++#endif
++    Cell *find(Key k,size_t hash) {
++      auto mask=values.size()-1;
++      size_t at=(hash/shards)&mask;
++      while(values[at].key.bits && !(values[at].key==k))at=(at+1)&mask;
++      return &values[at];
++    }
++  };
++  struct LinkWorker {
++    KeyPool pool;
++    std::vector<std::array<Cell*,2>> edges;
++    Bins<std::pair<Key,size_t>> endpoints;
++  };
++  struct Lookup {Key raw,person;};
++  std::array<Table,shards> tables;
++  std::vector<LinkWorker> streams;
++#ifdef SHOPPING_ROUTE_CACHE
++  std::vector<std::vector<Lookup>> caches;
++#endif
++  static Cell *root(Cell *p) {
++    for(;;){
++      std::atomic_ref<uintptr_t> ref(p->value);
++      auto old=ref.load(std::memory_order_relaxed);
++      auto *parent=reinterpret_cast<Cell*>(old);
++      if(p==parent)return p;
++      auto next=std::atomic_ref<uintptr_t>(parent->value).load(std::memory_order_relaxed);
++      ref.compare_exchange_weak(old,next,std::memory_order_relaxed);
++      p=parent;
++    }
++  }
++#ifdef SHOPPING_ROUTE_FILTER
++  static uint64_t check_bits(size_t hash){
++    return (uint64_t{1}<<((hash>>33)&63))|(uint64_t{1}<<((hash>>48)&63));
++  }
++#endif
++public:
++  IdentityRoutes(const std::vector<InputChunk>&links,unsigned threads) : streams(threads) {
++#ifdef SHOPPING_ROUTE_CACHE
++    caches.resize(threads);
++    for(auto &cache:caches)cache.resize(SHOPPING_ROUTE_CACHE);
++#endif
++    parallel(links.size(),threads,[&](size_t i,unsigned t){
++      auto &w=streams[t];
++      rows<2>(links[i].body(),[&](const auto &row){
++        if(row[0].empty()||row[1].empty())return;
++        size_t at=w.edges.size()*2;w.edges.emplace_back();
++        for(unsigned side=0;side<2;++side){
++          Key id=w.pool.encode(row[side],'u');
++          w.endpoints[id.hash()%shards].emplace_back(id,at+side);
++        }
++      });
++    });
++    parallel(shards,threads,[&](size_t b,unsigned){
++      size_t count=0;
++      for(auto &w:streams)count+=w.endpoints[b].size();
++      if(!count)return;
++      auto &tab=tables[b];
++      tab.values.resize(std::bit_ceil(count+count/4+2));
++#ifdef SHOPPING_ROUTE_FILTER
++      tab.possible.resize(std::bit_ceil(std::max<size_t>(1,count/8)));
++#endif
++      for(auto &w:streams){
++        for(auto [key,loc]:w.endpoints[b]){
++          size_t h=key.hash();auto *entry=tab.find(key,h);
++          if(!entry->key.bits){
++            entry->key=key;entry->value=reinterpret_cast<uintptr_t>(entry);
++#ifdef SHOPPING_ROUTE_FILTER
++            tab.possible[(h/shards)&(tab.possible.size()-1)]|=check_bits(h);
++#endif
++          }
++          w.edges[loc/2][loc%2]=entry;
++        }
++        std::vector<std::pair<Key,size_t>>().swap(w.endpoints[b]);
++      }
++    });
++    using Edge=std::array<Cell*,2>;
++    std::vector<std::span<Edge>> chunks;
++    for(auto &w:streams){
++      std::span<Edge> all(w.edges);
++      while(!all.empty()){auto n=std::min<size_t>(4096,all.size());chunks.push_back(all.first(n));all=all.subspan(n);}
++    }
++    parallel(chunks.size(),threads,[&](size_t i,unsigned){
++      for(auto [a,b]:chunks[i]){
++        for(;;){
++          a=root(a);b=root(b);if(a==b)break;
++          if(a->key.user_less(b->key))std::swap(a,b);
++          uintptr_t old=reinterpret_cast<uintptr_t>(a);
++          if(std::atomic_ref<uintptr_t>(a->value).compare_exchange_weak(
++               old,reinterpret_cast<uintptr_t>(b),std::memory_order_relaxed))break;
++        }
++      }
++    });
++    parallel(shards,threads,[&](size_t b,unsigned){
++      for(auto &v:tables[b].values)if(v.key.bits)
++        std::atomic_ref<uintptr_t>(v.value).store(reinterpret_cast<uintptr_t>(root(&v)),std::memory_order_relaxed);
++    });
++    parallel(shards,threads,[&](size_t b,unsigned){
++      for(auto &v:tables[b].values)if(v.key.bits)v.value=reinterpret_cast<Cell*>(v.value)->key.bits;
++    });
++    for(auto &w:streams)std::vector<Edge>().swap(w.edges);
++  }
++  Key lookup(Key raw,[[maybe_unused]] unsigned t) {
++    size_t h=raw.hash();
++#ifdef SHOPPING_ROUTE_CACHE
++    auto &slot=caches[t][(h^(h>>21))&(SHOPPING_ROUTE_CACHE-1)];
++    if(slot.raw==raw)return slot.person;
++#endif
++    auto &tab=tables[h%shards];
++    Key person=raw;
++    if(!tab.values.empty()){
++#ifdef SHOPPING_ROUTE_FILTER
++      auto need=check_bits(h);
++      if((tab.possible[(h/shards)&(tab.possible.size()-1)]&need)==need)
++#endif
++      {
++        auto *v=tab.find(raw,h);if(v->key.bits)person={v->value};
++      }
++    }
++#ifdef SHOPPING_ROUTE_CACHE
++    slot={raw,person};
++#endif
++    return person;
++  }
++};
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -28,20 +28,14 @@
+   PartitionSlab<Candidate> candidates;
+   PartitionSlab<std::pair<Key, EventData>> events;
+   PartitionSlab<std::pair<Key, ClickData>> clicks;
+-  struct Vertex {
+-    Key name;
+-    Vertex *parent, *next;
+-    size_t weight;
+-    std::span<EventData> events;
+-    std::span<ClickData> clicks;
+-  };
+-  std::vector<std::array<Vertex *, 2>> edges;
+-  Bins<std::pair<Key, size_t>> endpoints;
+   KeyPool pool;
+ #ifdef SHOPPING_DIAGNOSTICS
+   size_t revisions{}, valid_events{}, duplicates{}, valid_clicks{};
+ #endif
+ };
++#define SHOPPING_ROUTE_CACHE 16384
++#define SHOPPING_ROUTE_FILTER 1
++#include "identity_routes.hpp"
+ struct Catalog {
+   struct IndexedColumn {
+     Dict<int> catalog;
+@@ -402,22 +396,18 @@
+ void process_people(std::vector<ScanWorker<Layout>> &workers,
+                     std::vector<Result> &results, const Catalog &cat,
+                     unsigned threads, Timer &timer, Layout layout) {
+-  using Worker = ScanWorker<Layout>;
+-  using Vertex = typename Worker::Vertex;
+   using E = typename Layout::E;
+   using C = typename Layout::C;
+   struct Store {
+     std::vector<E> events;
+     std::vector<C> clicks;
+   };
+-  std::array<Store, shards> storage;
+-  std::array<std::vector<Vertex>, shards> vertices;
++  std::vector<Store> scratch(threads);
+   parallel(shards, threads, [&](size_t b, unsigned t) {
+     MEASURE(grouping);
+     struct Group {
+       Key key;
+       size_t event_end{}, click_end{};
+-      size_t vertex{};
+     };
+     struct Slot {
+       Key key;
+@@ -453,7 +443,7 @@
+     };
+     // First count each alias, then scatter into disjoint contiguous spans.
+     // A linked person may own spans in several of these raw-user shards.
+-    auto &store = storage[b];
++    auto &store = scratch[t];
+     size_t event_count = 0, click_count = 0;
+     for (auto &w : workers) {
+       for (auto part : w.events[b].spans())
+@@ -473,22 +463,6 @@
+         }
+       click_count += w.clicks[b].size();
+     }
+-    auto &nodes = vertices[b];
+-    size_t nv = 0;
+-    for (auto &w : workers)
+-      for (auto &[key, loc] : w.endpoints[b]) {
+-        auto &g = groups[intern(key)];
+-        if (!g.vertex)
+-          g.vertex = ++nv;
+-        key.bits = g.vertex - 1;
+-      }
+-    nodes.resize(nv);
+-    for (auto &w : workers) {
+-      for (auto &[key, loc] : w.endpoints[b])
+-        w.edges[loc / 2][loc % 2] = &nodes[key.bits];
+-      typename std::remove_reference_t<decltype(w.endpoints)>::value_type()
+-          .swap(w.endpoints[b]);
+-    }
+     store.events.resize(event_count);
+     store.clicks.resize(click_count);
+     size_t event_offset = 0, click_offset = 0;
+@@ -516,11 +490,7 @@
+                     .subspan(event_offset, g.event_end - event_offset);
+       auto cl = std::span(store.clicks)
+                     .subspan(click_offset, g.click_end - click_offset);
+-      if (g.vertex) {
+-        auto &v = nodes[g.vertex - 1];
+-        v = {g.key, &v, &v, 1, ev, cl};
+-      } else
+-        summarize(g.key, ev, cl, cat, results[t], layout);
++      summarize(g.key, ev, cl, cat, results[t], layout);
+       event_offset = g.event_end;
+       click_offset = g.click_end;
+     }
+@@ -529,110 +499,7 @@
+     w.events.release();
+     w.clicks.release();
+   }
+-  timer.mark("raw user grouping, link endpoints and singleton sessions");
+-  // Roots move strictly downward in bytewise order. Path splitting keeps long
+-  // chains short even while other edge workers are linking components.
+-  auto root = [](Vertex *v) {
+-    for (;;) {
+-      std::atomic_ref<Vertex *> ref(v->parent);
+-      auto *p = ref.load(std::memory_order_relaxed);
+-      if (v == p)
+-        return v;
+-      auto *g =
+-          std::atomic_ref<Vertex *>(p->parent).load(std::memory_order_relaxed);
+-      ref.compare_exchange_weak(p, g, std::memory_order_relaxed);
+-      v = p;
+-    }
+-  };
+-  using Edge = std::array<Vertex *, 2>;
+-  std::vector<std::span<Edge>> tasks;
+-  for (auto &w : workers) {
+-    std::span<Edge> edges(w.edges);
+-    while (!edges.empty()) {
+-      auto n = std::min<size_t>(edges.size(), 4096);
+-      tasks.push_back(edges.first(n));
+-      edges = edges.subspan(n);
+-    }
+-  }
+-  parallel(tasks.size(), threads, [&](size_t i, unsigned) {
+-    for (auto edge : tasks[i]) {
+-      auto *x = edge[0], *y = edge[1];
+-      for (;;) {
+-        x = root(x);
+-        y = root(y);
+-        if (x == y)
+-          break;
+-        if (x->name.user_less(y->name))
+-          std::swap(x, y);
+-        auto *expected = x;
+-        if (std::atomic_ref<Vertex *>(x->parent).compare_exchange_weak(
+-                expected, y, std::memory_order_relaxed))
+-          break;
+-      }
+-    }
+-  });
+-  // After the union barrier append every other alias to the root's list.
+-  parallel(shards, threads, [&](size_t b, unsigned) {
+-    for (auto &v : vertices[b]) {
+-      auto *r = root(&v);
+-      if (r == &v)
+-        continue;
+-      auto &head = r->next;
+-      v.next = std::atomic_ref<Vertex *>(head).exchange(
+-          &v, std::memory_order_relaxed);
+-    }
+-  });
+-  timer.mark("linked components");
+-  parallel(shards, threads, [&](size_t b, unsigned t) {
+-    std::vector<E> events_buffer;
+-    std::vector<C> click_buffer;
+-    for (auto &head : vertices[b]) {
+-      if (head.parent != &head)
+-        continue;
+-      std::span<E> ev;
+-      std::span<C> cl;
+-      size_t event_count = 0, click_count = 0;
+-      Vertex *v = &head;
+-      do {
+-        if (!v->events.empty()) {
+-          ev = v->events;
+-          event_count += ev.size();
+-        }
+-        if (!v->clicks.empty()) {
+-          cl = v->clicks;
+-          click_count += cl.size();
+-        }
+-        v = v->next;
+-      } while (v != &head);
+-      if (!event_count)
+-        continue;
+-      if (event_count > ev.size() || click_count > cl.size()) {
+-        bool merge_e = event_count > ev.size(),
+-             merge_c = click_count > cl.size();
+-        events_buffer.clear();
+-        click_buffer.clear();
+-        if (merge_e)
+-          events_buffer.reserve(event_count);
+-        if (merge_c)
+-          click_buffer.reserve(click_count);
+-        do {
+-          if (merge_e)
+-            events_buffer.insert(events_buffer.end(), v->events.begin(),
+-                                 v->events.end());
+-          if (merge_c)
+-            click_buffer.insert(click_buffer.end(), v->clicks.begin(),
+-                                v->clicks.end());
+-          v = v->next;
+-        } while (v != &head);
+-        if (merge_e)
+-          ev = events_buffer;
+-        if (merge_c)
+-          cl = click_buffer;
+-      }
+-      summarize(head.name, ev, cl, cat, results[t], layout);
+-    }
+-  });
+-  timer.mark("linked-person sessions, attribution and aggregation");
++  timer.mark("resolved person grouping, sessions, attribution and aggregation");
+ }
+ 
+ template <class Layout>
+@@ -678,25 +545,10 @@
+     w.events.reserve(event_hint);
+     w.clicks.reserve(click_hint);
+   }
+-  const Time anchor = window.start / 1000;
+-  parallel(
+-      links.size() + events.size() + clicks.size(), threads,
+-      [&](size_t job, unsigned t) {
+-        if (job < links.size()) {
+-          auto &w = workers[t];
+-          rows<2>(links[job].body(), [&](auto &r) {
+-            if (r[0].empty() || r[1].empty())
+-              return;
+-            size_t index = w.edges.size() * 2;
+-            w.edges.push_back({});
+-            for (unsigned side = 0; side < 2; ++side) {
+-              Key key = w.pool.encode(r[side], 'u');
+-              w.endpoints[key.hash() % shards].emplace_back(key, index + side);
+-            }
+-          });
+-          return;
+-        }
+-        job -= links.size();
++  IdentityRoutes identities(links,threads);
++  timer.mark("full identity routing table");
++  const Time anchor=window.start/1000;
++  parallel(events.size()+clicks.size(),threads,[&](size_t job,unsigned t){
+         if (job >= events.size()) {
+           rows<4>(clicks[job - events.size()].body(), [&](auto &r) {
+             if (r[0].empty() || r[1].empty())
+@@ -705,7 +557,7 @@
+             auto c = cat.campaign.find(r[2]);
+             if (ts < window.start - reach || ts >= window.end || c < 0)
+               return;
+-            auto alias = workers[t].pool.encode(r[1], 'u');
++            auto alias = identities.lookup(workers[t].pool.encode(r[1], 'u'),t);
+ #ifdef SHOPPING_DIAGNOSTICS
+             ++workers[t].valid_clicks;
+ #endif
+@@ -726,7 +578,7 @@
+           ++workers[t].revisions;
+           workers[t].valid_events += e.ts != bad;
+ #endif
+-          Key user = e.ts == bad ? Key{} : workers[t].pool.encode(r[1], 'u');
++          Key user = e.ts == bad ? Key{} : identities.lookup(workers[t].pool.encode(r[1], 'u'),t);
+           auto &w = workers[t];
+           uint64_t location = 0;
+           if (user.bits) {
