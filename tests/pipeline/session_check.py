@@ -47,6 +47,18 @@ def data(seed):
     return ' '.join(map(str,header+[n for person in people for n in person])).encode()
 
 
+def rust_native_vectors():
+    if platform.machine() not in ('x86_64', 'amd64', 'AMD64'):
+        return False
+    if Path('/proc/cpuinfo').exists():
+        cpu = Path('/proc/cpuinfo').read_text().lower()
+    elif platform.system() == 'Darwin':
+        cpu = subprocess.check_output(['sysctl', '-n', 'machdep.cpu.leaf7_features']).decode().lower()
+    else:
+        return False
+    return 'avx512f' in cpu and 'avx512dq' in cpu
+
+
 def main():
     p=argparse.ArgumentParser()
     p.add_argument('rust_src',type=Path)
@@ -54,23 +66,24 @@ def main():
     with tempfile.TemporaryDirectory() as folder:
         w=Path(folder)
         src=(args.rust_src/'core.rs').read_text()
-        if platform.machine() not in ('x86_64','amd64','AMD64'):
+        native_vectors = rust_native_vectors()
+        if not native_vectors:
             # The recorded source builds exclusively for x86. On other architectures,
             # its own scalar tail covers the entire slice, preserving event-by-event order.
-            src=src.replace('use std::arch::x86_64::*;', '#[cfg(target_arch="x86_64")] use std::arch::x86_64::*;')
-            src=src.replace('unsafe {\n            if n >= 8 {','#[cfg(target_arch="x86_64")] unsafe {\n            if n >= 8 {')
+            src=src.replace('use std::arch::x86_64::*;', '#[cfg(any())] use std::arch::x86_64::*;')
+            src=src.replace('unsafe {\n            if n >= 8 {','#[cfg(any())] unsafe {\n            if n >= 8 {')
         (w/'session.rs').write_text(src)
         shutil.copy2(args.rust_src/'keyrec.rs',w)
         main_src=(args.rust_src/'main.rs').read_text()
         (w/'names.rs').write_text(main_src[main_src.index('static PAIR36:'):main_src.index('#[inline(always)]\npub fn shard')])
         driver=(HERE/'session_core.rs').read_text()
-        if platform.machine() in ('x86_64','amd64','AMD64'):
+        if native_vectors:
             driver='#![feature(stdarch_x86_avx512)]\n'+driver
         (w/'run.rs').write_text(driver)
         env=os.environ.copy()
         env['RUSTC_BOOTSTRAP']='1'
         rust=[os.environ.get('RUSTC','rustc'),'--edition=2021','-Awarnings','-O']
-        if platform.machine() in ('x86_64','amd64','AMD64'):
+        if native_vectors:
             rust.extend(['-C','target-feature=+avx512f,+avx512dq'])
         subprocess.run([*rust,w/'run.rs','-o',w/'rust'],check=True,env=env)
         subprocess.run([os.environ.get('CXX','c++'),'-O2','-std=c++20',HERE/'session_core.cpp','-o',w/'cpp'],check=True)

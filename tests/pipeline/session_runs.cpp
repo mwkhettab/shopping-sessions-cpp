@@ -62,14 +62,19 @@ auto rows(const core::Core& c) {
     return got;
 }
 inline u64 packed(u32 t,u32 a,u32 pr=0,u32 cat=0){return (u64(t)<<33)|(u64(pr)<<9)|(cat<<4)|a;}
-int main() {
+int main(int argc,char** argv) {
+    const unsigned pattern=argc>1?unsigned(std::stoul(argv[1])):0;
     Model g;
     for (auto& tv:g.utabs) tv=3;
     g.utab[8]=COMPLEX;g.utab[5]|=EXTRA;
+    if (pattern>0) {g.utab[2]=0;g.utab[3]=0x3fff;g.utab[6]=1;}
     g.extra[5]={packed(86100000,0,1,1),packed(87500000,0,101,1)};
     for (u32 u=0;u<g.csr.size();++u) {
-        const u32 n=u==3?19:u%7,t0=650000000;
-        for(u32 i=0;i<n;++i) g.csr[u].push_back({(u64(t0+i*800000)<<32)|u64((i%5)<<4)|(u==4?4:i%2),u64(n-i+1)});
+        const u32 n=u==3?(pattern?169:19):(pattern && u==10?16:u%7),t0=pattern?260000000:650000000;
+        for(u32 i=0;i<n;++i) {
+            const auto ts=pattern?t0+u32((i/2)*8100000):t0+i*800000;
+            g.csr[u].push_back({(u64(ts)<<32)|u64((i%5)<<4)|(u==4?4:i%2),u64(n-i+1)});
+        }
     }
     std::map<std::pair<u32,u32>,Rec> expected;
     auto add=[&](u32 b,u32 slot,u32 u,u32 ing,u64 w,bool odd=false){
@@ -79,15 +84,20 @@ int main() {
         auto [it,ins]=expected.try_emplace({b,slot},r);if (!ins && ((it->second.w1>>16)&ING_MAX)>ing) it->second=r;
     };
     using std::size_t;
-    std::mt19937 rd(413);
+    std::mt19937 rd(413+pattern);
     for(u32 b:{0u,1u,3u,4u}) {
         for (u32 i=0;i<950;++i) {
             const auto u=b==0 ? (i<7?1: i<200?2:i<500?3:4):
                 b==1 ? (i<10?4:i<400?5:i<540?6:i<820?7:8):
                 b==3 ? (i<99?8:i<380?9:i<799?10:11):(i<173?11:12);
             u32 t=(b==1 && u==5)?u32(86000000+i*3500):u32(670000000+b*25000000+i*3700);
+            if (pattern && u!=5) {
+                const auto pos=b*950+i;
+                t=40000000+(pos/(6+pattern*3))*(1800001+pattern*1301)+(pos%(6+pattern*3))*15;
+            }
             if (i%123==0 && u==7) t-=500000;
-            const auto slot=i*16+(i%7),a=(u==9 && i%6==0)?3:(i%2);
+            const auto slot=i*16+(i%7);
+            const auto a=(u==9 && i%6==0)?3u:(pattern && u==2?2u:pattern && u==6?0u:i%2);
             const auto w=packed(t,a,i%9==0?u32(rd()%750+1):0,i%9==0?u32(rd()%32):0);
             if (i%7==0) add(b,slot,89,11,packed(t+600,1,12,2));
             add(b,slot,u,2,w);
@@ -119,10 +129,16 @@ int main() {
     for(auto& [u,records]:byuser) process_run(ref,oracle,u,records);
     auto got=rows(g.worker[0].core),b=rows(g.worker[1].core);got.insert(got.end(),b.begin(),b.end());std::sort(got.begin(),got.end());
     assert(got==rows(oracle.core));
+    bool aggregates_match=true;
     for(size_t i=0;i<(g.nc+1)*g.nd;++i) for(size_t f=0;f<2;++f) {
-        assert(g.worker[0].core.agg[i][f]+g.worker[1].core.agg[i][f]==oracle.core.agg[i][f]);
-        assert(g.worker[0].core.aggp[i][f]+g.worker[1].core.aggp[i][f]==oracle.core.aggp[i][f]);
+        const auto count=g.worker[0].core.agg[i][f]+g.worker[1].core.agg[i][f];
+        if (count!=oracle.core.agg[i][f]) std::cerr<<"aggregate cell "<<i<<" field "<<f<<": "<<count<<" vs "<<oracle.core.agg[i][f]<<"\n";
+        aggregates_match &= count==oracle.core.agg[i][f];
+        const auto purch=g.worker[0].core.aggp[i][f]+g.worker[1].core.aggp[i][f];
+        if (purch!=oracle.core.aggp[i][f]) std::cerr<<"purchase cell "<<i<<" field "<<f<<": "<<purch<<" vs "<<oracle.core.aggp[i][f]<<"\n";
+        aggregates_match &= purch==oracle.core.aggp[i][f];
     }
+    assert(aggregates_match);
     for(auto& worker:g.worker) for(auto r:worker.cx_raw) from.emplace_back(r.w1,r.w0);
     for(auto r:oracle.cx_raw) complex.emplace_back(r.w1,r.w0);
     complex.insert(complex.end(),odd.begin(),odd.end());std::sort(complex.begin(),complex.end());std::sort(from.begin(),from.end());assert(complex==from);
@@ -136,5 +152,5 @@ int main() {
     assert(dig.first==14 && dig.last==27 && dig.count==6 && dig.bits==1);
     assert(dig.sess[0]==((4ULL<<32)|14) && dig.sess[1]==20 && dig.sess[2]==((2ULL<<32)|24));
     assert(dig.purch[0]==80 && dig.purch[1]==70 && dig.purch[2]==((1ULL<<32)|60));
-    std::cout<<expected.size()<<" unique slots, "<<got.size()<<" daily rows, "<<complex.size()<<" exceptional events matched\n";
+    std::cout<<"pattern "<<pattern<<", "<<expected.size()<<" unique slots, "<<got.size()<<" daily rows, "<<complex.size()<<" exceptional events matched\n";
 }
