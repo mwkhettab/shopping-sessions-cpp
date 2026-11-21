@@ -24,6 +24,10 @@ The scorer entered `BB-3FCA75FD` in the final at **0.87 s**. Queue wait was 220 
 
 A 74-event regression exposed an error in the scored GCC image. The input contains two buyers named `Truncated` and `Merged`. Its only link joins `Merged` to a longer ID consisting of 33 `Q` characters followed by `Truncated`. The executable treated the suffix as an additional linked ID. It emitted 42 user-day rows and credited one purchasing session with 34 cents. The rules give 43 user-day rows and two purchasing sessions, one worth 11 cents and one worth 23 cents. The independent 0.87 s executable reproduced both expected tables. Commit `5230d4835e1b2f9f6b48d1dc53319a3e2b658077` selects the general link parser whenever the lookup table gives a zero digit count. Each supported short ID has at least one digit. The regression checks both tables through the normal executable.
 
+The scored executable also exhausted a 1 GiB container on a 2.68 MB input with 200 real links and IDs sharing a 270,713-byte prefix. The corrected GCC release counted exactly 200 links, matched the independent oracle on all 172 user-day and six campaign-day rows, and peaked at 94,852 KiB RSS in a 160 MiB container. Restoring only the affected lookup-table bytes in a diagnostic copy of the scored executable also corrected both regressions.
+
+On a four-vCPU Xeon 6975P-C, the corrected GCC release and the scored GCC release took 0.3319 s and 0.3327 s respectively on warm 20M input. The median paired change over seven rounds was +0.043%. At 60M, the medians were 1.0230 s and 1.0300 s, with a paired change of −0.686% over five rounds. The corrected scratch image passed the 36 fixtures, the long-link regression, the two published 1M tables, 54 additional cases and both complete tables at 20M and 60M. A second 60M input with 15M clicks, seed 733, produced 6,621,736 user-day rows and 28,014 campaign-day rows with both independent fingerprints. It took 0.958 s inside the container with eight application workers on four pinned CPUs, peaking at 1,700.6 MiB RSS. [Corrected GCC release qualification](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44950349906/job/136986673554)
+
 Seven warm 20M pairs and three warm 60M pairs compared the scored executable with three Clang 16 builds on one Xeon 6975P-C with four pinned vCPUs. Each executable processed the same inputs in a fresh process and wrote both Parquet tables. All three Clang variants won every warm pair against the scored release and matched both complete tables at both sizes. The Linux release images, 36 fixtures, two published 1M tables and 54 additional compact and generic cases supplied the controls. [Native compiler comparison](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44949153238/job/136983043326)
 
 | Native executable | 20M median | 60M median | Paired change at 20M | Paired change at 60M |
@@ -35,6 +39,19 @@ Seven warm 20M pairs and three warm 60M pairs compared the scored executable wit
 | Clang with alignment and three forced-inline event helpers | 0.3283 s | 0.9920 s | −2.46% | −3.38% |
 
 Paired changes are medians of the per-round ratios. The unpadded Clang executable targets baseline x86-64 with runtime ISA dispatch and uses Cascade Lake instruction scheduling. Its highest process RSS was 592.0 MiB at 20M and 1,659.8 MiB at 60M. The additional layout and inlining changes produced smaller differences than the variation across individual runs.
+
+The corrected Clang release `29ee0cc5c26291c511cad44aec18c6531f050f79` subsequently beat the official 0.33 s executable in all seven warm 20M pairs and all five warm 60M pairs on a separate Xeon 6975P-C. Process medians were 0.3236 s against 0.3301 s at 20M and 1.0033 s against 1.0312 s at 60M. The median paired changes were −2.585% and −3.003%. Five fresh containers gave a 0.37465 s median from Docker start to exit at 20M and 1.05102 s at 60M. Seed 733 completed in 0.939 s inside the eight-worker container and reached 1,732.2 MiB RSS. All three large inputs matched both independent tables. The release also passed the 36 fixtures, the long-link and catalog regressions, both published 1M references, 54 additional cases and the compact and general 1M paths on an emulated Nehalem. The static executable built locally and on the native runner had the same SHA-256, `4e80ac6118cf12eeb067b6b5aa90e39652aac39ba8483a1dfd144c77eb1f623e`. [Corrected Clang release qualification](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44950763539/job/136987956846)
+
+Four alternatives ran against the corrected GCC control on another four-vCPU Xeon 6975P-C. Each passed the 36 fixtures, both 1M reference tables, 54 compact and generic cases, and the independent full-table comparison at both sizes. The control took 0.3271 s at 20M and 1.0009 s at 60M. None of these alternatives improved both workloads. [Native decoder and GCC profile comparisons](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44950349958/job/136986673681)
+
+| Change against the corrected GCC release | 20M paired change, nine rounds | 60M paired change, five rounds |
+| --- | ---: | ---: |
+| Use a smaller joint ID-width table | +1.66% | +2.96% |
+| Find the last three field delimiters from a reversed mask | +2.85% | +2.43% |
+| Prepare two event rows ahead in the block scanner | +18.03% | +17.13% |
+| Train GCC on independently generated compact and opaque inputs | +0.63% | +0.11% |
+
+The first aligned-scanner run landed on an AMD EPYC 7763 with AVX2. Its CPU dispatch selected the portable CSV reader for every binary. All three variants matched the complete output at both sizes. Those timings describe fallback execution. [Portable scanner and parser telemetry](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44949153367/job/136983043827)
 
 ## Partitioned C++ pipeline qualification
 
