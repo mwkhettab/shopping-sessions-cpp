@@ -20,6 +20,22 @@ The entrant reported **0.88 s** for `BB-1F2F9464` at `25a940f0d0a8`. The entered
 
 The scorer entered `BB-3FCA75FD` in the final at **0.87 s**. Queue wait was 220 ms. This improved the prior official 0.99 s time by 12.1%. The entrant supplied these scores. The 0.99 s run reduced the previous best by 12.4%. The scorer marked the earlier `BB-BE7C95B8` as entered in the final with 3 ms queue wait. Its 1.13 s runtime was 32.7% lower than the previous 1.68 s best. Entries `BB-065C223B` and `BB-E8D93ABE` listed 41 ms and 105 ms of queue wait separately. Relative to `61e9ba6`, the 512-shard release decodes each field as its delimiter is encountered, raises the event and person shard count from 128 to 512, reserves identity storage from input size, and compares inline canonical IDs bytewise without a separate display-name vector. It also reserves Arrow builder capacity and uses unchecked numeric appends within that reservation. Its compiler flags, Dockerfile, global deduplication rules, session boundaries and attribution algorithm match the official baseline. Its official run was 0.03 s slower. Two submissions of the identical baseline pipeline differed by 0.02 s.
 
+## Experiments after the 0.33 s official score
+
+A 74-event regression exposed an error in the scored GCC image. The input contains two buyers named `Truncated` and `Merged`. Its only link joins `Merged` to a longer ID consisting of 33 `Q` characters followed by `Truncated`. The executable treated the suffix as an additional linked ID. It emitted 42 user-day rows and credited one purchasing session with 34 cents. The rules give 43 user-day rows and two purchasing sessions, one worth 11 cents and one worth 23 cents. The independent 0.87 s executable reproduced both expected tables. Commit `5230d4835e1b2f9f6b48d1dc53319a3e2b658077` selects the general link parser whenever the lookup table gives a zero digit count. Each supported short ID has at least one digit. The regression checks both tables through the normal executable.
+
+Seven warm 20M pairs and three warm 60M pairs compared the scored executable with three Clang 16 builds on one Xeon 6975P-C with four pinned vCPUs. Each executable processed the same inputs in a fresh process and wrote both Parquet tables. All three Clang variants won every warm pair against the scored release and matched both complete tables at both sizes. The Linux release images, 36 fixtures, two published 1M tables and 54 additional compact and generic cases supplied the controls. [Native compiler comparison](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44949153238/job/136983043326)
+
+| Native executable | 20M median | 60M median | Paired change at 20M | Paired change at 60M |
+| --- | ---: | ---: | ---: | ---: |
+| Scored GCC build | 0.3353 s | 1.0356 s | — | — |
+| GCC rebuilt with the comparison toolchain | 0.3361 s | 1.0290 s | +0.26% | +0.26% |
+| Clang with full LTO | 0.3284 s | 0.9966 s | −2.42% | −3.77% |
+| Clang with 32-byte branch alignment | 0.3279 s | 0.9967 s | −2.35% | −2.12% |
+| Clang with alignment and three forced-inline event helpers | 0.3283 s | 0.9920 s | −2.46% | −3.38% |
+
+Paired changes are medians of the per-round ratios. The unpadded Clang executable targets baseline x86-64 with runtime ISA dispatch and uses Cascade Lake instruction scheduling. Its highest process RSS was 592.0 MiB at 20M and 1,659.8 MiB at 60M. The additional layout and inlining changes produced smaller differences than the variation across individual runs.
+
 ## Partitioned C++ pipeline qualification
 
 The release sources at `faf1047c6cb00cc8099572f5e067d18076375571` decode batches of 64 rows, partition event revisions by ID, build a per-user click index, reconcile sessions across partition boundaries and write the two Parquet tables while processing the remaining people. The executable restarts on its general parser when an input exceeds the compact representation. The Linux build checks CPU features before entering each specialized instruction path.
