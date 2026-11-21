@@ -221,4 +221,6 @@ if __name__=='__main__':
     except BaseException as exc:
         note('Failure',repr(exc))
         raise
-    finally: publish()
+    finally:
+        (outcomes/'all-notes.json').write_text(json.dumps(notes))
+        publish()

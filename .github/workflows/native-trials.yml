@@ -2,6 +2,12 @@ name: Native x64 benchmark
 on:
   push:
     branches: [bench/native-x64-trials]
+    paths-ignore:
+      - perf/native/recover-runs.json
+      - perf/native/publish_profile.py
+      - .github/workflows/native-report.yml
+      - .github/workflows/native-trials.yml
+      - perf/native/run.py
 permissions:
   contents: read
 jobs:
@@ -62,3 +68,6 @@ jobs:
           name: native-observations-${{ matrix.os }}
           path: ${{ runner.temp }}/shopping-trials/results/
           retention-days: 3
+      - name: Publish final source samples and image verification
+        if: always() && steps.hardware.outputs.run == 'yes'
+        run: python3 perf/native/publish_profile.py "$RUNNER_TEMP/shopping-trials/results/"

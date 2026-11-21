@@ -1,0 +1,29 @@
+name: Archived native profiles
+on:
+  push:
+    branches: [bench/native-x64-trials]
+    paths:
+      - perf/native/recover-runs.json
+      - .github/workflows/native-report.yml
+permissions:
+  actions: read
+  contents: read
+jobs:
+  reports:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Select completed comparison
+        id: select
+        run: python3 -c 'import json,os; print("id="+str(json.load(open("perf/native/recover-runs.json"))["run"]),file=open(os.environ["GITHUB_OUTPUT"],"a"))'
+      - name: Read the public benchmark artifacts from this repository
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.select.outputs.id }}
+          path: ${{ runner.temp }}/previous-native
+      - name: Publish source samples and paired results
+        run: python3 perf/native/publish_profile.py "$RUNNER_TEMP/previous-native"
