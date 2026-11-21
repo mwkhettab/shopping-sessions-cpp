@@ -129,6 +129,19 @@ void report(const G& g,sys::Instant::time_point start) {
 }
 }
 int main(int argc,char** argv) {
+#if defined(__linux__) && defined(__x86_64__) && defined(SHOP_V4_DISPATCH)
+    // Only the sibling ELF uses v4 across all translation units. Its startup
+    // code and static initializers must run after the OS/CPU capability check.
+    if(__builtin_cpu_supports("x86-64-v4")) {
+        std::array<char,4096> path;
+        constexpr char suffix[]=".opt";
+        const auto length=::readlink("/proc/self/exe",path.data(),path.size());
+        if(length>0 && static_cast<std::size_t>(length)<=path.size()-sizeof(suffix)) {
+            std::memcpy(path.data()+length,suffix,sizeof(suffix));
+            ::execv(path.data(),argv);
+        }
+    }
+#endif
     try {pipeline::entry(argc,argv);}
     catch(const std::exception& e) {pipeline::sys::fallback(e.what());}
 }

@@ -6,6 +6,12 @@ set -- -std=c++20 -O3 -DNDEBUG -pthread
 if [ "${STATIC:-0}" = 1 ]; then
     set -- "$@" -static
 fi
+build_pipeline() {
+    output=$1
+    shift
+    "$compiler" "$@" cpp/pipeline/main.cpp cpp/pipeline/k_free.cpp cpp/pipeline/k_free_x86.cpp \
+        cpp/pipeline/sys_global_alloc.cpp -o "$output"
+}
 case "$(uname -s)-$(uname -m)" in
     Linux-x86_64)
         set -- "$@" -fno-pie -no-pie -DSHOP_KERNEL_ABSOLUTE_TABLES cpp/pipeline/k_free_clicks.S
@@ -20,7 +26,13 @@ case "$(uname -s)-$(uname -m)" in
                 -o build/sys_memory.o
             set -- "$@" build/sys_memory.o
         fi
+        if [ "${INTEL_LAYOUT:-0}" = 1 ]; then
+            set -- "$@" -mtune=cascadelake -flto=1 -flto-partition=one -Wa,-mbranches-within-32B-boundaries
+        fi
+        if [ "${V4_SIDECAR:-0}" = 1 ]; then
+            build_pipeline build/shopping.opt "$@" -march=x86-64-v4 -mtune=cascadelake
+            set -- "$@" -DSHOP_V4_DISPATCH
+        fi
         ;;
 esac
-"$compiler" "$@" cpp/pipeline/main.cpp cpp/pipeline/k_free.cpp cpp/pipeline/k_free_x86.cpp \
-    cpp/pipeline/sys_global_alloc.cpp -o build/shopping
+build_pipeline build/shopping "$@"
