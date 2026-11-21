@@ -147,14 +147,22 @@ def main():
                 if (src/'cpp'/header).is_file():
                     run(compiler,'-std=c++20','-O2','-fsanitize=undefined','-fno-sanitize-recover=all','-I',src/'cpp',root/'perf/native'/suite,'-o',unit)
                     run(unit)
-            if name.startswith(('reskind','resqproof','resordinal')):
+            if name.startswith(('reskind','resqproof','resordinal','resordlearn')):
                 suite='rich_event_test.cpp' if name.startswith('reskind') else 'compact_prefix_test.cpp'
                 run(compiler,'-std=c++20','-O2','-fsanitize=undefined','-fno-sanitize-recover=all','-I',src/'cpp',root/'perf/native'/suite,'-o',unit)
                 run(unit)
-            if name=='resordinal-pgo' and 'avx2' in flags and 'bmi2' in flags and 'pclmulqdq' in flags:
+            if name in ('resordinal-pgo','resordlearn-pgo') and 'avx2' in flags and 'bmi2' in flags and 'pclmulqdq' in flags:
                 run(compiler,'-std=c++20','-O2','-fsanitize=undefined','-fno-sanitize-recover=all','-I',src/'cpp',root/'perf/native/ordinal16_test.cpp','-o',unit)
                 run(unit)
             if name=='resdest-pgo' or name.startswith('flatgroup'):run(python,root/'perf/native/dest_oracle.py',binary)
+            # Other widths and shapes use the same tested component. Exercise
+            # the complete cross-product once and the end-to-end fixtures for every build.
+            for representative,suite in [('arenadense-pgo','revision_arena_test.cpp'),('trimunmap-pgo','trim_revision_test.cpp'),('sievepre8-pgo','revision_sieve_test.cpp')]:
+                if name==representative:
+                    run(compiler,'-std=c++20','-O2','-pthread','-fsanitize=undefined','-fno-sanitize-recover=all','-I',src/'cpp',root/'perf/native'/suite,'-o',unit)
+                    run(unit)
+            if name in ('sieve8-pgo','sievepre8-pgo','bands32sparse-pgo'):
+                run(python,root/'perf/native/packed_id_oracle.py',binary)
             binaries.append(binary)
         except (subprocess.CalledProcessError,OSError) as exc:
             if name in ('base',release_control): raise
@@ -211,8 +219,11 @@ def main():
                     if not layout:raise ValueError('missing storage calibration counters')
                     note('Revision storage '+b.name+' '+scale,f'{layout[1]} row revisions, {layout[2]} column revisions.')
                 elif (area/b.name/'cpp/timeline_reuse.hpp').is_file() and 'SHOP_TIMELINE_REUSE' in (area/b.name/'cpp/main.cpp').read_text():
-                    reuse=subprocess.run([b,data,d],check=True,env=env|{'SHOP_RECYCLE_TRACE':'1'},capture_output=True,text=True)
+                    reuse=subprocess.run([b,data,d],check=True,env=env|{'SHOP_RECYCLE_TRACE':'1','SHOP_ARENA_TRACE':'1','SHOP_SIEVE_TRACE':'1'},capture_output=True,text=True)
                     amounts=re.search(r'SHOP_TIMELINE_REUSE (\d+) (\d+)',reuse.stderr)
+                    for key in ('SHOP_ARENA','SHOP_SIEVE'):
+                        record=re.search(key+r' (\d+) (\d+) (\d+)',reuse.stderr)
+                        if record:note('Revision counts '+b.name+' '+scale,key+' '+', '.join(record.groups()))
                     if not amounts:raise ValueError('missing timeline capacity totals')
                     note('Timeline storage '+b.name+' '+scale,f'{int(amounts[1]):,} resident bytes and {int(amounts[2]):,} new bytes.')
                 else:run(b,data,d)
@@ -328,9 +339,12 @@ def main():
     locgen=area/'generate-skewed-alias'
     run('g++-12','-std=c++20','-O2',root/'perf/native/long_location_input.cpp','-o',locgen)
     verify_long_locations(area,locgen,list(dict.fromkeys([area/'bin'/release_control,area/'bin'/practice_winner])),note)
-    for name in dict.fromkeys([practice_winner, *[b for b in candidates if (b.startswith("pipe") or b in ("destslab-pgo","destpages-pgo","resdest-pgo","flatgroup-pgo"))]]):
+    for name in dict.fromkeys([practice_winner, *[b for b in candidates if (b.startswith("pipe") or b in ("destslab-pgo","destpages-pgo","resdest-pgo","flatgroup-pgo","trimunmap-pgo","bands32sparse-pgo"))]]):
         if (area / "bin" / name).is_file():
             race(root,area,name,note,run,env)
+
+    from release_input_costs import collect as isolated_release_input
+    isolated_release_input(root,area,note,run,env)
 
 published=0
 def publish():

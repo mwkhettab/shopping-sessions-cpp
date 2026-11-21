@@ -22,6 +22,10 @@ for root in map(Path,sys.argv[1:]):
         if keep:emit('Paired comparisons and profiles '+report.parent.name,' || '.join(keep)[:4000])
         phase=[x for x in notes if x.startswith(('Reader CPU by input','Process boundaries','Revision storage','Phase PMU','Phase clock diagnostic'))]
         if phase:emit('Hardware samples by execution phase '+report.parent.name,' || '.join(phase)[:4000])
+        isolated=[x for x in notes if x.startswith(('Isolated release input','Isolated release digests'))]
+        if isolated:emit('Release input write costs '+report.parent.name,' || '.join(isolated)[:4000])
+        revision_counts=[x for x in notes if x.startswith('Revision counts ')]
+        if revision_counts:emit('Revision sieve and arena counts '+report.parent.name,' || '.join(revision_counts)[:4000])
         memory=[x for x in notes if x.startswith(('Per-stage resources','Timeline storage'))]
         if memory:emit('Memory allocation and phase faults '+report.parent.name,' || '.join(memory)[:4000])
     for report in sorted(root.rglob('all-notes.json')):

@@ -1,1 +1,1 @@
-base fin-slabkey-pgo shipcolumns-pgo shipresident-pgo varcoltags-pgo clockpair-pgo resplane-pgo resraw-pgo resordinal-pgo reskind-pgo flatgroup-pgo resdest-pgo @best
+base fin-slabkey-pgo shipresident-pgo resordinal-pgo resordlearn-pgo arenadense-pgo arenastripe-pgo trimunmap-pgo sieve8-pgo sievepre8-pgo bands32-pgo bands32sieve-pgo bands32sparse-pgo @best
