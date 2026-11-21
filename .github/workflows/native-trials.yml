@@ -40,6 +40,8 @@ on:
       - perf/native/winner_trials/**
       - .github/workflows/native-clock-shapes.yml
       - perf/native/clock_shapes/**
+      - .github/workflows/native-ordinal-clock-oracles.yml
+      - perf/native/ordinal_clock_oracles/**
       - perf/native/finalist.json
       - perf/native/holdout_shipping.py
       - perf/native/port_input_settings.py

@@ -1,0 +1,62 @@
+name: Native concurrency and timestamp boundary checks
+on:
+  push:
+    branches: [bench/native-x64-trials]
+    paths:
+      - .github/workflows/native-ordinal-clock-oracles.yml
+      - perf/native/ordinal_clock_oracles/**
+permissions:
+  contents: read
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [first, second, third]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Identify the native CPU
+        id: cpu
+        run: python3 perf/native/intel-wide-runner.py
+      - uses: actions/checkout@v4
+        with:
+          ref: 29ee0cc5c26291c511cad44aec18c6531f050f79
+          path: .acceptance/release
+          persist-credentials: false
+      - name: Exercise concurrent slot claiming under Linux sanitizers
+        shell: bash
+        run: |
+          src="$RUNNER_TEMP/winner-unit"
+          mkdir "$src"
+          git -C .acceptance/release archive HEAD cpp/pipeline tests/pipeline Dockerfile build.sh | tar -xf - -C "$src"
+          cd "$src"
+          git apply --no-index "$GITHUB_WORKSPACE/perf/native/winner_trials/event-primary.patch"
+          flags=(-std=c++20 -O1 -g -pthread -fno-omit-frame-pointer -fno-pie -no-pie)
+          g++ "${flags[@]}" -fsanitize=address,undefined tests/pipeline/event_primary.cpp -o checked
+          UBSAN_OPTIONS=halt_on_error=1 ./checked
+          g++ "${flags[@]}" -fsanitize=thread tests/pipeline/event_primary.cpp -o threaded
+          if TSAN_OPTIONS=halt_on_error=1 ./threaded >tsan.log 2>&1; then
+            cat tsan.log
+          elif grep -q 'unexpected memory mapping' tsan.log; then
+            TSAN_OPTIONS=halt_on_error=1 setarch x86_64 -R ./threaded
+          else
+            cat tsan.log
+            exit 1
+          fi
+          echo '::notice title=Native duplicate safety::Eight worker threads completed 16 rounds under address, undefined-behavior and thread sanitizers.'
+      - name: Check all clock seconds and byte mutations with release Clang on native wide instructions
+        if: always() && steps.cpu.outputs.wide == 'true'
+        run: |
+          src="$RUNNER_TEMP/clock-unit"
+          mkdir "$src"
+          git -C .acceptance/release archive HEAD cpp/pipeline tests/pipeline build.sh | tar -xf - -C "$src"
+          cd "$src"
+          git apply --no-index "$GITHUB_WORKSPACE/perf/native/clock_shapes/constant-clock.patch"
+          cp "$GITHUB_WORKSPACE/perf/native/ordinal_clock_oracles/"{native-oracle.sh,time_rows.cpp,Dockerfile} .
+          docker buildx build --platform linux/amd64 --output "type=local,dest=$RUNNER_TEMP/clock-bin" .
+          "$RUNNER_TEMP/clock-bin/test-clock"
+          echo '::notice title=Native timestamp boundaries::The Clang release flags passed every clock second in both forms, 18,688 one-byte changes, 64 boundary alignments and the row oracle.'
