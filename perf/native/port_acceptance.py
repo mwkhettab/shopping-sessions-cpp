@@ -323,6 +323,13 @@ def main():
                     exec_logged([sys.executable, kit/"scripts/compare.py", out, area/"dev-answer"], log, env)
             state["implementations"][tag]["tested"] = True
             state["verified"]["1M/" + tag] = "36 fixtures, additional edge cases, both published 1M tables"
+        mark("patterned rules")
+        rules = results / "patterned-rules.jsonl"
+        exec_logged([sys.executable, NATIVE/"port_patterns.py", bins["candidate"], bins["baseline"],
+                     area/"starter-pyspark/fixtures", "--log", rules], results/"patterned-rules.log", env)
+        audits = [json.loads(line) for line in rules.read_text().splitlines()]
+        state["verified"]["patterned rules"] = {path: sum(r["path"] == path for r in audits)
+                                                for path in ("direct", "generic")}
         for scale in ("20M", "60M"):
             if scale not in args.scales:
                 continue

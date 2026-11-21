@@ -2,6 +2,14 @@ name: Native x64 benchmark
 on:
   workflow_dispatch:
     inputs:
+      peer_repository:
+        description: Optional public repository for a same-host release comparison
+        required: false
+        type: string
+      peer_revision:
+        description: Full commit SHA of the optional comparison
+        required: false
+        type: string
       peer_run_id:
         description: Optional run ID for an additional comparison artifact
         required: false
@@ -63,6 +71,14 @@ jobs:
           ref: 4db76beed31640ddf4b414ed19deba5ebc660b81
           path: .acceptance/baseline
           persist-credentials: false
+      - name: Check out optional comparison sources
+        if: steps.hardware.outputs.run == 'yes' && (inputs.peer_repository || vars.NATIVE_PEER_REPOSITORY) && (inputs.peer_revision || vars.NATIVE_PEER_REVISION)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.peer_repository || vars.NATIVE_PEER_REPOSITORY }}
+          ref: ${{ inputs.peer_revision || vars.NATIVE_PEER_REVISION }}
+          path: .acceptance/peer
+          persist-credentials: false
       - name: Read optional comparison artifact
         if: steps.hardware.outputs.run == 'yes' && (inputs.peer_run_id || vars.NATIVE_PEER_RUN_ID) && (inputs.peer_artifact || vars.NATIVE_PEER_ARTIFACT)
         uses: actions/download-artifact@v4
@@ -100,6 +116,8 @@ jobs:
         if: steps.hardware.outputs.run == 'yes'
         shell: bash
         env:
+          PEER_REPOSITORY: ${{ inputs.peer_repository || vars.NATIVE_PEER_REPOSITORY }}
+          PEER_REVISION: ${{ inputs.peer_revision || vars.NATIVE_PEER_REVISION }}
           PEER_RUN_ID: ${{ inputs.peer_run_id || vars.NATIVE_PEER_RUN_ID }}
           PEER_ARTIFACT: ${{ inputs.peer_artifact || vars.NATIVE_PEER_ARTIFACT }}
           CXX: g++-12
@@ -107,7 +125,14 @@ jobs:
           set -eu
           peer="$RUNNER_TEMP/shopping-peer"
           extra=()
-          if [[ -n "$PEER_RUN_ID" || -n "$PEER_ARTIFACT" ]]; then
+          if [[ -n "$PEER_REPOSITORY" || -n "$PEER_REVISION" ]]; then
+            if [[ -n "$PEER_RUN_ID" || -n "$PEER_ARTIFACT" || -z "$PEER_REPOSITORY" || ! "$PEER_REVISION" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "Supply either a full repository revision or a comparison artifact."
+              exit 2
+            fi
+            test "$(git -C .acceptance/peer rev-parse HEAD)" = "$PEER_REVISION"
+            extra+=(--peer-source "$GITHUB_WORKSPACE/.acceptance/peer")
+          elif [[ -n "$PEER_RUN_ID" || -n "$PEER_ARTIFACT" ]]; then
             if [[ -z "$PEER_RUN_ID" || -z "$PEER_ARTIFACT" ]]; then
               echo "Both peer_run_id and peer_artifact are required to load an optional job artifact."
               exit 2
