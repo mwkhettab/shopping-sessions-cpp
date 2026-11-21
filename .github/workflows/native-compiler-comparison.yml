@@ -7,6 +7,7 @@ on:
       - perf/native/port_compiler_build.sh
 permissions:
   contents: read
+  actions: read
 jobs:
   compare:
     runs-on: ubuntu-24.04
@@ -32,11 +33,37 @@ jobs:
           python-version: '3.12'
       - name: Prepare generator, fixtures and independent tables
         run: bash perf/native/prepare-port-runner.sh
+      - name: Recover the previous build diagnostic
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/jobs/136981469854/logs" > "$RUNNER_TEMP/previous-compiler-build.log"
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          log = (Path(os.environ["RUNNER_TEMP"]) / "previous-compiler-build.log").read_text(errors="replace")
+          lines = [s[:450] for s in log.splitlines() if re.search(r'ModuleNotFoundError|ERROR:|fatal error:|error:|E: (Unable|Version)|not found|storage reserve', s, re.I)]
+          safe = [s for s in lines if not re.search(r'authorization|token|password|credential|https?://[^ ]*[?@]', s, re.I)]
+          print("::notice title=Previous compiler build diagnostic::" + " | ".join(safe[-7:]).replace("%", "%25"))
+          PY
       - name: Build four standalone compiler alternatives
         run: |
           out="$RUNNER_TEMP/shopping-trials/compiler-binaries"
-          bash perf/native/port_compiler_build.sh "$GITHUB_WORKSPACE/.acceptance/candidate" "$out" \
-            gcc-stock portable-unpadded portable-aligned portable-inline
+          logs="$RUNNER_TEMP/shopping-trials/results"
+          mkdir -p "$logs"
+          export BUILDKIT_PROGRESS=plain
+          if ! bash perf/native/port_compiler_build.sh "$GITHUB_WORKSPACE/.acceptance/candidate" "$out" \
+            gcc-stock portable-unpadded portable-aligned portable-inline > "$logs/compiler-build.log" 2>&1; then
+            tail -40 "$logs/compiler-build.log"
+            python3 - "$logs/compiler-build.log" <<'PY'
+          import sys
+          from pathlib import Path
+          tail = Path(sys.argv[1]).read_text(errors="replace")[-3000:]
+          print("::error title=Native compiler build::" + tail.replace("%","%25").replace("\r","%0D").replace("\n","%0A"))
+          PY
+            exit 1
+          fi
           cat "$out/toolchain.txt"
       - name: Verify all compiler outputs and compare native processes
         env:

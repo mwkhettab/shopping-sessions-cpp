@@ -184,7 +184,7 @@ int main(int argc, char **argv) {
 TRIAL_GATE_C
 cat > "$work/Dockerfile" <<'TRIAL_DOCKERFILE'
 FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS build
-RUN apt-get update && apt-get install -y --no-install-recommends g++ clang-16=1:16.0.6-15~deb12u1 lld-16=1:16.0.6-15~deb12u1 binutils python3-minimal && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends g++ clang-16=1:16.0.6-15~deb12u1 lld-16=1:16.0.6-15~deb12u1 binutils python3 && rm -rf /var/lib/apt/lists/*
 COPY source/ /trial/source/
 COPY linux.sh guard_compile.py gate.c /trial/
 ARG VARIANTS
