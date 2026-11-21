@@ -149,6 +149,15 @@ inline std::pair<unsigned, unsigned> delimiters(const char *p) {
 #include "line_csv.hpp"
 #include "line_tile.hpp"
 #include "marked_events.hpp"
+#if defined(SHOPPING_X86_CSV) && defined(__x86_64__)
+// Training runs exercise the available backends separately. A cap can only
+// lower the detected instruction set; every backend still checks its ISA.
+inline unsigned event_reader_limit() {
+  static const unsigned limit = std::getenv("SHOP_TRAIN_BASE_READER") ? 1 :
+                                std::getenv("SHOP_TRAIN_BW_READER") ? 2 : 3;
+  return limit;
+}
+#endif
 template <size_t N, class F> void parse_rows(Str data, F &&callback) {
 #ifdef SHOPPING_X86_CSV
 #ifdef __x86_64__
@@ -157,7 +166,7 @@ template <size_t N, class F> void parse_rows(Str data, F &&callback) {
         __builtin_cpu_supports("pclmul")) {
       if (__builtin_cpu_supports("avx512f") &&
           __builtin_cpu_supports("avx512bw") &&
-          __builtin_cpu_supports("avx512vbmi2")) {
+          __builtin_cpu_supports("avx512vbmi2") && event_reader_limit() >= 3) {
         marked_events_vbmi2(data, callback);
         return;
       }

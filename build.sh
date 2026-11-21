@@ -13,7 +13,9 @@ elif [ "${PGO:-0}" = 1 ]; then
   "${PYTHON:-python3}" perf/train.py "$work/input"
   NCPU=4 build/shopping "$work/input/short" "$work/output-short"
   NCPU=4 build/shopping "$work/input/wide" "$work/output-wide"
-  "$compiler" "$@" "-fprofile-use=$idx" -fprofile-correction -Werror=missing-profile cpp/main.cpp -o build/shopping
+  SHOP_TRAIN_BASE_READER=1 NCPU=4 build/shopping "$work/input/short" "$work/output-avx2-short"
+  SHOP_TRAIN_BASE_READER=1 NCPU=4 build/shopping "$work/input/wide" "$work/output-avx2-wide"
+  "$compiler" "$@" "-fprofile-use=$idx" -fprofile-partial-training -fprofile-correction -Werror=missing-profile cpp/main.cpp -o build/shopping
 else
   "$compiler" "$@" cpp/main.cpp -o build/shopping
 fi
