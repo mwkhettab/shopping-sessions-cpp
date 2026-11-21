@@ -17,10 +17,12 @@ outcomes=area/'results'
 outcomes.mkdir(exist_ok=True)
 python=sys.executable
 env=dict(os.environ,NCPU=str(min(4,len(os.sched_getaffinity(0)))),POLARS_MAX_THREADS='2',PYTHONUNBUFFERED='1')
+notes=[]
 def run(*args,cwd=root,extra=None):
     return subprocess.run(args,check=True,cwd=cwd,env=env|(extra or {}))
 def note(title,message):
-    print(f'::notice file=BENCHMARKS.md,line=1,title={title}::{message}',flush=True)
+    print(title,message,flush=True)
+    notes.append(f'{title} {message}')
     with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as summary: print(f'- **{title}** {message}',file=summary)
 
 def main():
@@ -29,7 +31,7 @@ def main():
     flags=next(x.split(':',1)[1].split() for x in cpu if x.startswith('flags'))
     note('Hardware',f'{model}, {env["NCPU"]} workers, affinity {sorted(os.sched_getaffinity(0))}, AVX-512BW {"avx512bw" in flags}.')
     candidates=(root/'perf/native/candidates.txt').read_text().split()
-    if 'avx512bw' not in flags: candidates=[n for n in candidates if n!='v512']
+    if 'avx512bw' not in flags: candidates=[n for n in candidates if not n.startswith('v512')]
     binaries=[]
     area.joinpath('bin').mkdir(exist_ok=True)
     for name in candidates:
@@ -58,7 +60,13 @@ def main():
         run(compiler,'-std=c++20','-O2',str(localtests/'input.cpp'),'-o',unit)
         run(unit)
         run(python,root/'verify.py',binary,area/'dev','--starter',area/'starter-pyspark','--answer',area/'dev-answer')
-    name='time-query'
+    if shutil.which('perf'):
+        with tempfile.TemporaryDirectory(dir=area) as temp:
+            try:
+                probe=subprocess.run(['sudo','-n','perf','stat','-e','cycles,instructions,cache-misses,dTLB-load-misses,branch-misses',
+                    str(area/'bin/base'),str(area/'dev'),temp],text=True,capture_output=True,timeout=25,env=env)
+                note('PMU',probe.stderr.strip()[-650:].replace('\n',' '))
+            except (OSError,subprocess.TimeoutExpired) as error: note('PMU',str(error))
     for mode in ('read','lex'):
         floor=area/'floor'
         if not floor.exists():
@@ -93,4 +101,9 @@ def main():
                         phases.setdefault(key,[]).append(float(value))
             note(scale+' '+b.name,f'median {statistics.median(times):.4f} s, runs {times}, peak {max(r["peak_mib"] for r in rows):.0f} MiB, user {statistics.median(r["user_s"] for r in rows):.2f} s. '+str({k:round(statistics.median(v),3) for k,v in phases.items()}))
 
-if __name__=='__main__': main()
+if __name__=='__main__':
+    try: main()
+    finally:
+        for i in range(0,len(notes),3):
+            payload=' || '.join(notes[i:i+3]).replace('%','%25').replace('\r','%0D').replace('\n','%0A')
+            print(f'::notice file=BENCHMARKS.md,line=1,title=Native results {i//3+1}::{payload}')
