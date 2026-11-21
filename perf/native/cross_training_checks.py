@@ -13,10 +13,14 @@ def compare(root,area,scale,names,run,note):
                 run(binary,data,output,extra=extra)
                 run(python,root/'perf/native/compare_large.py',output,ref)
         path=area/'results'/f'cross-profile-{scale}-{cap}.jsonl'
-        run(python,root/'perf/measure.py',data,*options,'--runs','5' if scale=='practice' else '3','--warmup','1','--preload','--output-parent',area,'--log',path,extra=extra)
+        # The scored release ignores the experimental ceiling. Include its real
+        # dispatch here to measure both source and training differences.
+        control=area/'bin/shipresident-pgo'
+        timed=[control,*options] if control.is_file() else options
+        run(python,root/'perf/measure.py',data,*timed,'--runs','5' if scale=='practice' else '3','--warmup','1','--preload','--output-parent',area,'--log',path,extra=extra)
         rows=[x for x in map(json.loads,path.read_text().splitlines()) if x['round']>=0]
         stats=[]
-        for p in options:
+        for p in timed:
             vals=[x['wall_s'] for x in rows if x['binary']==str(p)]
             stats.append(f'{p.name} {statistics.median(vals):.4f} s [{min(vals):.4f},{max(vals):.4f}]')
         note('Cross-profile '+scale+' capability '+str(cap),', '.join(stats)+'. All complete tables matched the scored baseline.')

@@ -14,17 +14,22 @@ jobs:
   compare:
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
-        os: [ubuntu-24.04, ubuntu-22.04, ubuntu-latest]
+        include:
+          - {os: ubuntu-24.04, lane: primary}
+          - {os: ubuntu-22.04, lane: secondary}
+          - {os: ubuntu-latest, lane: recent}
+          - {os: ubuntu-24.04, lane: repeat}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 100
+    timeout-minutes: 115
     steps:
       - name: Identify CPU vendor
         id: hardware
         shell: bash
         run: |
           vendor=$(awk -F: '/^vendor_id/{gsub(/ /,"",$2); print $2; exit}' /proc/cpuinfo)
-          if [ "${{ matrix.os }}" = ubuntu-latest ] && [ "$vendor" != GenuineIntel ]; then
+          if [ "$vendor" != GenuineIntel ]; then
             echo "run=no" >> "$GITHUB_OUTPUT"
           else
             echo "run=yes" >> "$GITHUB_OUTPUT"
@@ -65,7 +70,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always() && steps.hardware.outputs.run == 'yes'
         with:
-          name: native-observations-${{ matrix.os }}
+          name: native-observations-${{ matrix.lane }}
           path: ${{ runner.temp }}/shopping-trials/results/
           retention-days: 3
       - name: Publish final source samples and image verification

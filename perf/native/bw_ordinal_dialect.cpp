@@ -11,7 +11,7 @@ template<size_t N> void compare(Str input,bool wide,Counts &counts) {
   auto callback=[&](const auto& row){
     using R=std::remove_cvref_t<decltype(row)>;
     if constexpr(std::is_same_v<R,OrdinalFields16> || std::is_same_v<R,CommaTileFields<N,true>> || std::is_same_v<R,CommaTileFields<N,false>>
-#if __has_include("byte_ordinal_tiles.hpp")
+#if __has_include(<byte_ordinal_tiles.hpp>)
       || std::is_same_v<R,ByteTileFields<true>> || std::is_same_v<R,ByteTileFields<false>> || std::is_same_v<R,WordTileFields>
 #endif
     )++counts.fast;

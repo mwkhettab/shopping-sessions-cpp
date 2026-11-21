@@ -1,0 +1,441 @@
+--- /dev/null
++++ b/cpp/flat_alias_groups.hpp
+@@ -0,0 +1,31 @@
++#pragma once
++// A primary slot owns the alias and its running event and click counts. Once
++// assigned, its index remains usable by every raw record until the scatter.
++template<class Index,unsigned Probes,bool Remember> struct FlatAliasGroups {
++  struct Group {Key key{};Index event_end{},click_end{},vertex{};};
++  std::vector<Group> primary,extra;
++  std::vector<uint32_t> live;
++  std::unordered_map<Key,size_t,KeyHash> spilled;
++  explicit FlatAliasGroups(size_t size):primary(size) {}
++  std::pair<size_t,Group*> intern(Key key) {
++    size_t mask=primary.size()-1,at=(key.hash()/shards)&mask;
++    for(unsigned attempt=0;attempt<Probes;++attempt,at=(at+1)&mask) {
++      Group &g=primary[at];
++      if(g.key==key)return {at,&g};
++      if(!g.key.bits) {
++        g.key=key;
++        if constexpr(Remember)live.push_back(uint32_t(at));
++        return {at,&g};
++      }
++    }
++    auto [it,added]=spilled.try_emplace(key,extra.size());
++    if(added)extra.push_back({key});
++    return {primary.size()+it->second,&extra[it->second]};
++  }
++  Group &operator[](size_t i){return i<primary.size()?primary[i]:extra[i-primary.size()];}
++  template<class Visit> void visit(Visit f){
++    if constexpr(Remember){for(auto i:live)f(primary[i]);}
++    else {for(auto &g:primary)if(g.key.bits)f(g);}
++    for(auto &g:extra)f(g);
++  }
++};
+--- a/cpp/input.hpp
++++ b/cpp/input.hpp
+@@ -148,8 +148,21 @@
+ #include "csv_x86.hpp"
+ #include "line_csv.hpp"
+ #include "line_tile.hpp"
++#include "ordinal_reader.hpp"
+ template <size_t N, class F> void parse_rows(Str data, F &&callback) {
+ #ifdef SHOPPING_X86_CSV
++  if constexpr (N == 7) {
++    if (wide_csv_supported() && __builtin_cpu_supports("bmi2") &&
++        __builtin_cpu_supports("pclmul")) {
++      if (__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
++          __builtin_cpu_supports("avx512vbmi2")) {
++        ordinal16_wide<7, 1024, true>(data, callback);
++        return;
++      }
++      ordinal16_standard<7, 1024, true>(data, callback);
++      return;
++    }
++  }
+   if (N == 7 && wide_csv_supported()) {
+     tiled_lines<N, 16>(data, callback);
+     return;
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -406,6 +406,7 @@
+ #define SHOP_REUSE_REGION 1
+ #define SHOP_LEND_REGION 1
+ #include "timeline_reuse.hpp"
++#include "flat_alias_groups.hpp"
+ template <class Layout>
+ void process_people(std::vector<ScanWorker<Layout>> &workers,
+                     std::vector<Result> &results, const Catalog &cat,
+@@ -415,59 +416,22 @@
+   using E = typename Layout::E;
+   using C = typename Layout::C;
+   std::vector<TimelineRegion> pool(threads);
+-  for (unsigned i = 0; i < workers.size(); ++i) {
+-    auto &w = workers[i];
+-    auto &revision = w.candidates.slab;
+-    if (revision.region != MAP_FAILED) {
+-      pool[i].base = static_cast<std::byte *>(revision.region);
+-      pool[i].bytes = revision.bytes;
+-    }
+-  }
+-  struct Store {
+-    TimelineArray<E> events;
+-    TimelineArray<C> clicks;
+-  };
++  for(unsigned i=0;i<workers.size();++i){
++    auto &w=workers[i];auto &revision=w.candidates.slab;
++    if(revision.region!=MAP_FAILED){
++      pool[i].base=static_cast<std::byte*>(revision.region);pool[i].bytes=revision.bytes;
++    }
++  }
++  struct Store { TimelineArray<E> events; TimelineArray<C> clicks; };
+   std::array<Store, shards> storage;
+   std::array<std::vector<Vertex>, shards> vertices;
+   parallel(shards, threads, [&](size_t b, unsigned t) {
+     MEASURE(grouping);
+-    struct Group {
+-      Key key;
+-      size_t event_end{}, click_end{};
+-      size_t vertex{};
+-    };
+-    struct Slot {
+-      Key key;
+-      size_t group;
+-    };
+-    std::vector<Group> groups;
+-    size_t n = 0;
+-    for (auto &w : workers)
+-      n += w.events[b].size() + w.clicks[b].size();
+-    size_t initial = std::bit_ceil(std::clamp<size_t>(n / 12, 128, 65536));
+-    std::vector<Slot> slots(initial);
+-    auto locate = [&](Key k) {
+-      size_t at = (k.hash() / shards) & (slots.size() - 1);
+-      while (slots[at].key.bits && !(slots[at].key == k))
+-        at = (at + 1) & (slots.size() - 1);
+-      return at;
+-    };
+-    auto intern = [&](Key k) {
+-      if (groups.size() * 10 >= slots.size() * 7) {
+-        auto old = std::move(slots);
+-        slots.clear();
+-        slots.resize(old.size() * 2);
+-        for (auto &x : old)
+-          if (x.key.bits)
+-            slots[locate(x.key)] = x;
+-      }
+-      auto &x = slots[locate(k)];
+-      if (!x.key.bits) {
+-        x = {k, groups.size()};
+-        groups.push_back({k});
+-      }
+-      return x.group;
+-    };
++    size_t record_count=0,endpoints=0;
++    for(auto &w:workers){record_count+=w.events[b].size()+w.clicks[b].size();endpoints+=w.endpoints[b].size();}
++    auto group_shard=[&]<class Index>(){
++      size_t approx=std::bit_ceil(std::clamp<size_t>((record_count+endpoints)/8,64,262144));
++      FlatAliasGroups<Index,8,false> groups(approx);
+     // First count each alias, then scatter into disjoint contiguous spans.
+     // A linked person may own spans in several of these raw-user shards.
+     auto &store = storage[b];
+@@ -479,14 +443,16 @@
+             u.bits = UINTPTR_MAX;
+             continue;
+           }
+-          u.bits = intern(Key{u.bits});
+-          ++groups[u.bits].event_end;
++          auto found=groups.intern(Key{u.bits});
++          u.bits=found.first;
++          ++found.second->event_end;
+           ++event_count;
+         }
+       for (auto part : w.clicks[b].spans())
+         for (auto &[u, c] : part) {
+-          u.bits = intern(Key{u.bits});
+-          ++groups[u.bits].click_end;
++          auto found=groups.intern(Key{u.bits});
++          u.bits=found.first;
++          ++found.second->click_end;
+         }
+       click_count += w.clicks[b].size();
+     }
+@@ -494,7 +460,7 @@
+     size_t nv = 0;
+     for (auto &w : workers)
+       for (auto &[key, loc] : w.endpoints[b]) {
+-        auto &g = groups[intern(key)];
++        auto &g=*groups.intern(key).second;
+         if (!g.vertex)
+           g.vertex = ++nv;
+         key.bits = g.vertex - 1;
+@@ -506,16 +472,16 @@
+       typename std::remove_reference_t<decltype(w.endpoints)>::value_type()
+           .swap(w.endpoints[b]);
+     }
+-    store.events.prepare(event_count, pool, t);
+-    store.clicks.prepare(click_count, pool, t);
++    store.events.prepare(event_count,pool,t);
++    store.clicks.prepare(click_count,pool,t);
+     size_t event_offset = 0, click_offset = 0;
+-    for (auto &g : groups) {
++    groups.visit([&](auto &g){
+       auto events_in_group = g.event_end, clicks_in_group = g.click_end;
+       g.event_end = event_offset;
+       g.click_end = click_offset;
+       event_offset += events_in_group;
+       click_offset += clicks_in_group;
+-    }
++    });
+     for (auto &w : workers) {
+       for (auto part : w.events[b].spans())
+         for (auto &[u, e] : part)
+@@ -528,11 +494,11 @@
+       w.clicks[b].release();
+     }
+     event_offset = click_offset = 0;
+-    for (auto &g : groups) {
+-      auto ev =
+-          store.events.view().subspan(event_offset, g.event_end - event_offset);
+-      auto cl =
+-          store.clicks.view().subspan(click_offset, g.click_end - click_offset);
++    groups.visit([&](auto &g){
++      auto ev = store.events.view()
++                    .subspan(event_offset, g.event_end - event_offset);
++      auto cl = store.clicks.view()
++                    .subspan(click_offset, g.click_end - click_offset);
+       if (g.vertex) {
+         auto &v = nodes[g.vertex - 1];
+         v = {g.key, &v, &v, 1, ev, cl};
+@@ -540,27 +506,23 @@
+         summarize(g.key, ev, cl, cat, results[t], layout);
+       event_offset = g.event_end;
+       click_offset = g.click_end;
+-    }
++    });
++    };
++    if(record_count+endpoints<=UINT32_MAX)group_shard.template operator()<uint32_t>();
++    else group_shard.template operator()<size_t>();
+   });
+   for (auto &w : workers) {
+     w.events.release();
+     w.clicks.release();
+   }
+   timer.mark("raw user grouping, link endpoints and singleton sessions");
+-  if (std::getenv("SHOP_RECYCLE_TRACE")) {
+-    size_t assigned = 0, heap = 0;
+-    for (auto &store : storage) {
+-      auto count = [&](auto &entries) {
+-        size_t n = entries.size * sizeof(*entries.data);
+-        assigned += n;
+-        if (entries.owned)
+-          heap += n;
+-      };
+-      count(store.events);
+-      count(store.clicks);
+-    }
+-    std::cerr << "SHOP_TIMELINE_REUSE " << assigned - heap << " " << heap
+-              << "\n";
++  if(std::getenv("SHOP_RECYCLE_TRACE")){
++    size_t assigned=0,heap=0;
++    for(auto &store:storage){
++      auto count=[&](auto &entries){size_t n=entries.size*sizeof(*entries.data);assigned+=n;if(entries.owned)heap+=n;};
++      count(store.events);count(store.clicks);
++    }
++    std::cerr<<"SHOP_TIMELINE_REUSE "<<assigned-heap<<" "<<heap<<"\n";
+   }
+ 
+   // Roots move strictly downward in bytewise order. Path splitting keeps long
+--- /dev/null
++++ b/cpp/ordinal_reader.hpp
+@@ -0,0 +1,118 @@
++#pragma once
++#ifdef SHOPPING_X86_CSV
++// Each separator gets an ordinal in a tile. A valid event has a newline
++// at exactly every seventh ordinal. Quotes must pair at field boundaries
++// before any event is emitted. All failed tiles use the existing row parser.
++struct OrdinalMasks {
++  uint64_t separators, quotes, newlines;
++};
++
++template <size_t N>
++inline constexpr auto ordinal_newlines = [] {
++  std::array<uint64_t, N> out{};
++  for (unsigned phase = 0; phase < N; ++phase)
++    for (unsigned bit = 0; bit < 64; ++bit)
++      if ((phase + bit + 1) % N == 0)
++        out[phase] |= uint64_t{1} << bit;
++  return out;
++}();
++
++__attribute__((target("avx2,bmi,bmi2,popcnt,pclmul"),
++               always_inline)) inline OrdinalMasks
++ordinal_masks_avx2(const char *p) {
++  auto a = row_mask32(p), b = row_mask32(p + 32);
++  auto join = [](unsigned x, unsigned y) {
++    return uint64_t(x) | (uint64_t(y) << 32);
++  };
++  auto lf = join(a.lf, b.lf);
++  return {join(a.comma, b.comma) | lf, join(a.quotes, b.quotes), lf};
++}
++
++__attribute__((target("avx512f,avx512bw"), always_inline)) inline OrdinalMasks
++ordinal_masks_wide(const char *p) {
++  auto text = _mm512_loadu_si512(p);
++  uint64_t lf = _mm512_cmpeq_epi8_mask(text, _mm512_set1_epi8('\n'));
++  return {lf | _mm512_cmpeq_epi8_mask(text, _mm512_set1_epi8(',')),
++          _mm512_cmpeq_epi8_mask(text, _mm512_set1_epi8('"')), lf};
++}
++
++__attribute__((target("avx2,pclmul"), always_inline)) inline uint64_t
++quote_prefix(uint64_t q) {
++  auto value = _mm_cvtsi64_si128(std::bit_cast<int64_t>(q));
++  return uint64_t(
++      _mm_cvtsi128_si64(_mm_clmulepi64_si128(value, _mm_set1_epi64x(-1), 0)));
++}
++struct OrdinalFields16 {
++  const char *data;
++  const uint16_t *end;
++  Str operator[](size_t i) const {
++    unsigned start = uint16_t(end[std::ptrdiff_t(i) - 1] + 1);
++    unsigned cut = end[i], trim = data[start] == '"';
++    return {data + start + trim, cut - start - 2 * trim};
++  }
++  template <size_t N> operator std::array<Str, N>() const {
++    std::array<Str, N> out;
++    for (unsigned i = 0; i < N; ++i)
++      out[i] = (*this)[i];
++    return out;
++  }
++};
++
++template <size_t N, class Row, class F>
++inline void emit_ordinal_row(const Row &row, F &fn) {
++  if constexpr (N == 7 && requires {
++                  fn.common(static_cast<const char *>(nullptr), 0u,
++                            static_cast<const char *>(nullptr), 0u, Str{},
++                            Str{});
++                }) {
++    Str kind = row[4];
++    if (kind.size() == 4 && (std::memcmp(kind.data(), "view", 4) == 0 ||
++                             std::memcmp(kind.data(), "cart", 4) == 0)) {
++      Str id = row[0], user = row[1], ingest = row[3];
++      if (id.size() - 2 <= 7 && user.size() - 2 <= 7 && ingest.size() == 20 &&
++          !row[5].empty() &&
++          fn.common(id.data(), unsigned(id.size()), user.data(),
++                    unsigned(user.size()), row[2], ingest))
++        return;
++    }
++  }
++  fn(row);
++}
++
++__attribute__((target("avx512f,avx512bw,avx512vbmi2"),
++               always_inline)) inline void
++save_positions16(uint16_t *out, uint16_t offset, uint64_t mask) {
++  alignas(64) static constexpr auto sequence = [] {
++    std::array<uint8_t, 64> s{};
++    for (unsigned i = 0; i < 64; ++i)
++      s[i] = uint8_t(i);
++    return s;
++  }();
++  auto packed =
++      _mm512_maskz_compress_epi8(mask, _mm512_load_si512(sequence.data()));
++  auto origin = _mm512_set1_epi16(short(offset));
++  auto first = _mm512_cvtepu8_epi16(_mm512_castsi512_si256(packed));
++  _mm512_storeu_si512(out, _mm512_add_epi16(first, origin));
++  if (std::popcount(mask) > 32) {
++    auto high = _mm512_shuffle_i64x2(packed, packed, 0xee);
++    auto second = _mm512_cvtepu8_epi16(_mm512_castsi512_si256(high));
++    _mm512_storeu_si512(out + 32, _mm512_add_epi16(second, origin));
++  }
++}
++
++#define SHOP_ORD16_TARGET "avx2,bmi,bmi2,popcnt,pclmul"
++#define SHOP_ORD16_READER ordinal16_standard
++#define SHOP_ORD16_WIDE 0
++#include "ordinal_reader.inc"
++#undef SHOP_ORD16_TARGET
++#undef SHOP_ORD16_READER
++#undef SHOP_ORD16_WIDE
++#define SHOP_ORD16_TARGET                                                      \
++  "avx2,bmi,bmi2,popcnt,pclmul,avx512f,avx512bw,avx512vbmi2"
++#define SHOP_ORD16_READER ordinal16_wide
++#define SHOP_ORD16_WIDE 1
++#include "ordinal_reader.inc"
++#undef SHOP_ORD16_TARGET
++#undef SHOP_ORD16_READER
++#undef SHOP_ORD16_WIDE
++#endif
+--- /dev/null
++++ b/cpp/ordinal_reader.inc
+@@ -0,0 +1,70 @@
++template <size_t N, unsigned Bytes, bool Direct, class F>
++__attribute__((target(SHOP_ORD16_TARGET))) void SHOP_ORD16_READER(Str data,
++                                                                  F &fn) {
++  static_assert(Bytes % 64 == 0 && Bytes <= 8192);
++  constexpr unsigned Words = Bytes / 64;
++  alignas(64) std::array<uint16_t, Bytes + 64> positions;
++  positions[0] = UINT16_MAX;
++  uint16_t *cuts = positions.data() + 1;
++  while (data.size() >= Bytes) {
++    const char *text = data.data();
++    std::array<OrdinalMasks, Words> masks;
++    for (unsigned k = 0; k < Words; ++k) {
++#if SHOP_ORD16_WIDE
++      masks[k] = ordinal_masks_wide(text + 64 * k);
++#else
++      masks[k] = ordinal_masks_avx2(text + 64 * k);
++#endif
++    }
++    unsigned words = Words;
++    while (words && !masks[words - 1].newlines)
++      --words;
++    if (!words) {
++      auto lf = data.find('\n', Bytes);
++      size_t take = lf == Str::npos ? data.size() : lf + 1;
++      scalar_rows<N>(data.substr(0, take), fn);
++      data.remove_prefix(take);
++      continue;
++    }
++    auto &last = masks[words - 1];
++    unsigned length = words * 64 - std::countl_zero(last.newlines);
++    uint64_t tail = mask_to(length - (words - 1) * 64);
++    last.separators &= tail;
++    last.quotes &= tail;
++    uint64_t inside = 0, previous = 1, invalid = 0;
++    unsigned nc = 0;
++    for (unsigned b = 0; b < words; ++b) {
++      auto [sep, q, lf] = masks[b];
++      unsigned count = std::popcount(sep);
++      uint64_t want = ordinal_newlines<N>[nc % N] & mask_to(count);
++      invalid |= _pext_u64(lf, sep) ^ want;
++      uint64_t parity = quote_prefix(q) ^ inside;
++      uint64_t next = b + 1 < words ? (masks[b + 1].separators & 1) : 1;
++      invalid |= ((q & parity) & ~((sep << 1) | previous)) |
++                 ((q & ~parity) & ~((sep >> 1) | (next << 63))) |
++                 (sep & parity);
++      inside = uint64_t(0) - (parity >> 63);
++      previous = sep >> 63;
++#if SHOP_ORD16_WIDE
++      save_positions16(cuts + nc, uint16_t(64 * b), sep);
++#else
++      auto *at = cuts + nc;
++      for (auto bits = sep; bits; bits &= bits - 1)
++        *at++ = uint16_t(64 * b + std::countr_zero(bits));
++#endif
++      nc += count;
++    }
++    if (invalid || inside || nc % N) {
++      tiled_lines<N, 16>(data.substr(0, length), fn);
++    } else
++      for (unsigned i = 0; i < nc; i += N) {
++        OrdinalFields16 row{text, cuts + i};
++        if constexpr (Direct)
++          emit_ordinal_row<N>(row, fn);
++        else
++          fn(row);
++      }
++    data.remove_prefix(length);
++  }
++  tiled_lines<N, 16>(data, fn);
++}

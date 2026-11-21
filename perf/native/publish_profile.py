@@ -18,24 +18,6 @@ for root in map(Path,sys.argv[1:]):
         if images:emit('Release images '+report.parent.name,' || '.join(images)[:4000])
     for report in sorted(root.rglob('all-notes.json')):
         notes=json.loads(report.read_text())
-        calibration=[x for x in notes if x.startswith('Cross-profile ')]
-        if calibration:emit('Compiler training by CPU capability '+report.parent.name,' || '.join(calibration)[:4100])
-        balance=[x for x in notes if x.startswith('Per-worker tail ')]
-        if balance:emit('Per-worker CPU and stage drain '+report.parent.name,' || '.join(balance)[:4100])
-        minimum=[x for x in notes if x.startswith('Minimum Intel ISA ')]
-        if minimum:emit('AVX-512F and BW reader audit '+report.parent.name,' || '.join(minimum)[:3000])
-        keep=[re.sub(r' {2,}',' ',x) for x in notes if x.startswith(('Release pairs','Population structure','ThreadSanitizer','20M process PMU','Sampled branch-misses','Sampled cache-misses','Input probe'))]
-        if keep:emit('Paired comparisons and profiles '+report.parent.name,' || '.join(keep)[:4000])
-        phase=[x for x in notes if x.startswith(('Reader CPU by input','Process boundaries','Revision storage','Phase PMU','Phase clock diagnostic'))]
-        if phase:emit('Hardware samples by execution phase '+report.parent.name,' || '.join(phase)[:4000])
-        isolated=[x for x in notes if x.startswith(('Isolated release input','Isolated release digests'))]
-        if isolated:emit('Release input write costs '+report.parent.name,' || '.join(isolated)[:4000])
-        revision_counts=[x for x in notes if x.startswith('Revision counts ')]
-        if revision_counts:emit('Revision sieve and arena counts '+report.parent.name,' || '.join(revision_counts)[:4000])
-        memory=[x for x in notes if x.startswith(('Per-stage resources','Timeline storage'))]
-        if memory:emit('Memory allocation and phase faults '+report.parent.name,' || '.join(memory)[:4000])
-    for report in sorted(root.rglob('all-notes.json')):
-        notes=json.loads(report.read_text())
         ranked=[]
         for scale in ('practice','final','holdout'):
             values=[]
@@ -51,6 +33,26 @@ for root in map(Path,sys.argv[1:]):
                 head,_,tail=entry.partition(', runs');details.append(head+' digest '+tail.partition('digest ')[2])
             elif entry.startswith(('Floor read','Floor lex','Hardware ','Runner CPU topology','Two pinned CPUs','Skewed revision locations','ThreadSanitizer ','Failure','Rejected ')):details.append(entry)
         if details:emit('Workers and cumulative input probes '+report.parent.name,' || '.join(details)[:4000])
+    for report in sorted(root.rglob('all-notes.json')):
+        notes=json.loads(report.read_text())
+        calibration=[x for x in notes if x.startswith('Cross-profile ')]
+        if calibration:emit('Compiler training by CPU capability '+report.parent.name,' || '.join(calibration)[:4100])
+        balance=[x for x in notes if x.startswith('Per-worker tail ')]
+        if balance:emit('Per-worker CPU and stage drain '+report.parent.name,' || '.join(balance)[:4100])
+        minimum=[x for x in notes if x.startswith('Minimum Intel ISA ')]
+        if minimum:emit('AVX-512F and BW reader audit '+report.parent.name,' || '.join(minimum)[:3000])
+        projection=[x for x in notes if x.startswith(('Event projection ','Hot symbol sizes ','Instruction supply '))]
+        if projection:emit('Event projections and instruction delivery '+report.parent.name,' || '.join(projection)[:3900])
+        keep=[re.sub(r' {2,}',' ',x) for x in notes if x.startswith(('Release pairs','Population structure','ThreadSanitizer','20M process PMU','Sampled branch-misses','Sampled cache-misses','Input probe'))]
+        if keep:emit('Paired comparisons and profiles '+report.parent.name,' || '.join(keep)[:4000])
+        phase=[x for x in notes if x.startswith(('Reader CPU by input','Process boundaries','Revision storage','Phase PMU','Phase clock diagnostic'))]
+        if phase:emit('Hardware samples by execution phase '+report.parent.name,' || '.join(phase)[:4000])
+        isolated=[x for x in notes if x.startswith(('Isolated release input','Isolated release digests'))]
+        if isolated:emit('Release input write costs '+report.parent.name,' || '.join(isolated)[:4000])
+        revision_counts=[x for x in notes if x.startswith('Revision counts ')]
+        if revision_counts:emit('Revision sieve and arena counts '+report.parent.name,' || '.join(revision_counts)[:4000])
+        memory=[x for x in notes if x.startswith(('Per-stage resources','Timeline storage'))]
+        if memory:emit('Memory allocation and phase faults '+report.parent.name,' || '.join(memory)[:4000])
     for source in root.rglob('source-lines*.txt'):
         folder=source.parent
         records=[]

@@ -49,6 +49,9 @@ def main():
                 revision='fin-slabkey-pgo' if name=='base' else name
                 relative=root/'perf/native/from-099'/(name+'.patch')
                 patches=[root/'perf/native/fin-slabkey-pgo.patch',relative] if relative.exists() else [root/f'perf/native/{revision}.patch']
+                resident_delta=root/'perf/native/from-resident'/(name+'.patch')
+                if resident_delta.is_file():
+                    patches=[root/'perf/native/fin-slabkey-pgo.patch',root/'perf/native/from-099/shipresident-pgo.patch',resident_delta]
                 for path in patches:
                     if path.stat().st_size==0: continue
                     with path.open('rb') as patch:
@@ -184,6 +187,24 @@ def main():
             if name.startswith('cleanord') and isa_ok:
                 run(compiler,'-std=c++20','-O2','-fsanitize=undefined','-fno-sanitize-recover=all','-I',src/'cpp',root/'perf/native/ordinal16_test.cpp','-o',unit)
                 run(unit)
+            if (src/'cpp/alias_chain.hpp').exists():
+                if name in ('chainraw-pgo','chain8-pgo'):
+                    run(compiler,'-std=c++20','-O2','-pthread','-fsanitize=undefined','-fno-sanitize-recover=all','-I',src/'cpp',root/'perf/native/alias_chain_test.cpp','-o',unit)
+                    run(unit)
+                run(python,root/'perf/native/dest_oracle.py',binary)
+            if name.startswith('slot'):
+                run(python,root/'perf/native/dest_oracle.py',binary)
+            if name=='netcut32-pgo':
+                run(compiler,'-std=c++20','-O2','-fsanitize=undefined','-fno-sanitize-recover=all','-I',src/'cpp',root/'perf/native/small_event_test.cpp','-o',unit)
+                run(unit)
+            if isa_ok and (src/'cpp/sparse_separators.hpp').exists():
+                for check in (('sparse_positions_test.cpp','bw_ordinal_dialect.cpp') if name=='spshufflecomma-pgo' else ('bw_ordinal_dialect.cpp',)):
+                    run(compiler,'-std=c++20','-O2','-fsanitize=undefined','-fno-sanitize-recover=all','-I',src/'cpp',root/'perf/native'/check,'-o',unit)
+                    run(unit)
+            if isa_ok and (src/'cpp/vertical_fields.hpp').exists():
+                for check in ('vertical_event_test.cpp','ordinal16_test.cpp'):
+                    run(compiler,'-std=c++20','-O2','-fsanitize=undefined','-fno-sanitize-recover=all','-I',src/'cpp',root/'perf/native'/check,'-o',unit)
+                    run(unit)
             binaries.append(binary)
         except (subprocess.CalledProcessError,OSError) as exc:
             if name in ('base',release_control): raise
@@ -362,13 +383,17 @@ def main():
     locgen=area/'generate-skewed-alias'
     run('g++-12','-std=c++20','-O2',root/'perf/native/long_location_input.cpp','-o',locgen)
     verify_long_locations(area,locgen,list(dict.fromkeys([area/'bin'/release_control,area/'bin'/practice_winner])),note)
-    for name in dict.fromkeys([practice_winner, *[b for b in candidates if (b.startswith("pipe") or b in ("destslab-pgo","destpages-pgo","resdest-pgo","flatgroup-pgo","trimunmap-pgo","bands32sparse-pgo","rawindex16-pgo"))]]):
+    for name in dict.fromkeys([practice_winner, *[b for b in candidates if (b.startswith("pipe") or b in ("destslab-pgo","destpages-pgo","resdest-pgo","flatgroup-pgo","trimunmap-pgo","bands32sparse-pgo","rawindex16-pgo","chainraw-pgo","chain8-pgo"))]]):
         if (area / "bin" / name).is_file():
             race(root,area,name,note,run,env)
 
     from worker_tail import execute as per_worker
     per_worker(root,area/'shipresident-pgo',[(k,area/k,area/(k+'-oracle')) for k in ('practice','holdout')],'g++-12',env,True,run,note,outcomes)
 
+    from frontend_counters import run_study as instruction_supply
+    if shutil.which('perf'):instruction_supply(root,area,list(dict.fromkeys([release_control,practice_winner])),note,env)
+    from vertical_probe import collect as event_fields
+    event_fields(root,area,practice_winner,note,run,env)
     from release_input_costs import collect as isolated_release_input
     isolated_release_input(root,area,note,run,env)
 

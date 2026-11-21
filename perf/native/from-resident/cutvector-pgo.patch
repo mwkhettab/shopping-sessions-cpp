@@ -1,0 +1,175 @@
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -163,6 +163,7 @@
+   size_t count{}, slot{};
+ };
+ #include "session_bins.hpp"
++#include "small_event_network.hpp"
+ struct Result {
+   SessionBins bins;
+ #ifdef SHOPPING_DIAGNOSTICS
+@@ -207,7 +208,7 @@
+   result.max_events = std::max(result.max_events, events.size());
+   result.max_clicks = std::max(result.max_clicks, clicks.size());
+ #endif
+-  const bool use_bins = !result.bins.cells.empty() && events.size() >= 32;
++  const bool use_bins = !result.bins.cells.empty() && events.size() >= (std::is_same_v<typename Layout::E,uint64_t>?32:32);
+   {
+     MEASURE(sorting);
+     if (!use_bins)
+@@ -282,10 +283,20 @@
+     for (int campaign : result.active)
+       ++result.at(campaign, day).assists;
+   };
++  auto marked_scan=[&]{
++    if constexpr(std::is_same_v<typename Layout::E,uint64_t>){
++      if(events.size()<=64){
++        MEASURE(session);
++        scan_marked_events<true>(events,layout,begin_session,spend,end_session);
++        return true;
++      }
++    }
++    return false;
++  };
+   if (use_bins) {
+     MEASURE(session);
+     result.bins.scan(events, begin_session, spend, end_session, layout);
+-  } else {
++  } else if (!marked_scan()) {
+     size_t i = 0;
+     while (i < events.size()) {
+       Time start = layout.time(events[i]);
+--- /dev/null
++++ b/cpp/small_event_network.hpp
+@@ -0,0 +1,131 @@
++#pragma once
++
++struct PackedSessionMarks {
++  uint64_t gaps{}, purchases{};
++};
++inline constexpr uint8_t active_lanes(unsigned count) {
++  return uint8_t((1u << std::min(count,8u)) - 1);
++}
++inline PackedSessionMarks scalar_marks(std::span<const uint64_t> events) {
++  PackedSessionMarks result;
++  uint64_t before=events.front()>>32;
++  for(size_t i=0;i<events.size();++i){
++    uint64_t ts=events[i]>>32;
++    result.gaps|=uint64_t(ts-before>uint64_t(session_gap))<<i;
++    result.purchases|=uint64_t(bool(uint32_t(events[i])>>8))<<i;
++    before=ts;
++  }
++  return result;
++}
++
++#ifdef SHOPPING_X86_CSV
++#define SHOP_EVENT_LANE __attribute__((target("avx512f"),always_inline)) inline
++template<unsigned Distance> SHOP_EVENT_LANE __m512i partner_lanes(__m512i v) {
++  if constexpr(Distance==1)
++    return _mm512_permutexvar_epi64(_mm512_setr_epi64(1,0,3,2,5,4,7,6),v);
++  if constexpr(Distance==2)
++    return _mm512_permutexvar_epi64(_mm512_setr_epi64(2,3,0,1,6,7,4,5),v);
++  return _mm512_permutexvar_epi64(_mm512_setr_epi64(4,5,6,7,0,1,2,3),v);
++}
++template<unsigned Registers,unsigned Span,unsigned Distance>
++SHOP_EVENT_LANE void compare_lanes(__m512i (&values)[Registers]){
++  if constexpr(Distance<8){
++    constexpr unsigned upper=[]{
++      unsigned bits=0;
++      for(unsigned j=0;j<8;++j)
++        bits|=unsigned(bool(j&Distance)!=bool(j&Span))<<j;
++      return bits;
++    }();
++    for(unsigned r=0;r<Registers;++r){
++      auto other=partner_lanes<Distance>(values[r]);
++      unsigned high=((r*8)&Span)?(upper^255):upper;
++      values[r]=_mm512_mask_max_epu64(_mm512_min_epu64(values[r],other),__mmask8(high),values[r],other);
++    }
++  }else{
++    for(unsigned r=0;r<Registers;++r)if(!(r&(Distance/8))){
++      unsigned other=r^(Distance/8);
++      auto low=_mm512_min_epu64(values[r],values[other]);
++      auto high=_mm512_max_epu64(values[r],values[other]);
++      if((r*8)&Span){values[r]=high;values[other]=low;}
++      else{values[r]=low;values[other]=high;}
++    }
++  }
++  if constexpr(Distance>1)compare_lanes<Registers,Span,Distance/2>(values);
++  else if constexpr(Span<Registers*8)compare_lanes<Registers,Span*2,Span>(values);
++}
++template<unsigned Registers>
++__attribute__((target("avx512f"))) void sort_registers(std::span<uint64_t> a) {
++  __m512i values[Registers];
++  __mmask8 live[Registers];
++  for(unsigned r=0;r<Registers;++r){
++    size_t begin=std::min<size_t>(8*r,a.size());
++    live[r]=active_lanes(unsigned(a.size()-begin));
++    values[r]=_mm512_mask_loadu_epi64(_mm512_set1_epi64(-1),live[r],a.data()+begin);
++  }
++  compare_lanes<Registers,2,1>(values);
++  for(unsigned r=0;r<Registers;++r)
++    _mm512_mask_storeu_epi64(a.data()+std::min<size_t>(8*r,a.size()),live[r],values[r]);
++}
++__attribute__((target("avx512f"))) inline PackedSessionMarks vector_marks(std::span<const uint64_t> a) {
++  PackedSessionMarks result;
++  const auto predecessor=_mm512_setr_epi64(0,0,1,2,3,4,5,6);
++  for(unsigned i=0;i<a.size();i+=8){
++    auto live=active_lanes(unsigned(a.size()-i));
++    auto raw=_mm512_maskz_loadu_epi64(live,a.data()+i);
++    auto times=_mm512_srli_epi64(raw,32);
++    auto before=_mm512_mask_set1_epi64(_mm512_permutexvar_epi64(predecessor,times),1,
++                                      static_cast<long long>(a[i?i-1:0]>>32));
++    auto gap=_mm512_cmpgt_epi64_mask(_mm512_sub_epi64(times,before),_mm512_set1_epi64(session_gap));
++    auto buy=_mm512_test_epi64_mask(raw,_mm512_set1_epi64(0xffffff00ULL));
++    result.gaps|=uint64_t(gap&live)<<i;
++    result.purchases|=uint64_t(buy&live)<<i;
++  }
++  return result;
++}
++#undef SHOP_EVENT_LANE
++#endif
++
++template<unsigned Limit> bool short_event_sort(std::span<uint64_t> a) {
++#ifdef SHOPPING_X86_CSV
++  if(a.size()<4 || a.size()>Limit || !__builtin_cpu_supports("avx512f"))return false;
++  if(a.size()<=8)sort_registers<1>(a);
++  else if(a.size()<=16)sort_registers<2>(a);
++  else if constexpr(Limit<=32)sort_registers<4>(a);
++  else if(a.size()<=32)sort_registers<4>(a);
++  else sort_registers<8>(a);
++  return true;
++#else
++  (void)a;return false;
++#endif
++}
++template<bool Vectors>
++PackedSessionMarks session_marks(std::span<const uint64_t> a){
++#ifdef SHOPPING_X86_CSV
++  if constexpr(Vectors)if(__builtin_cpu_supports("avx512f"))return vector_marks(a);
++#endif
++  return scalar_marks(a);
++}
++
++template<bool Vectors,class Layout,class Begin,class Spend,class End>
++void scan_marked_events(std::span<const uint64_t> events,Layout layout,Begin begin,Spend spend,End end){
++  auto marks=session_marks<Vectors>(events);
++  size_t first=0;
++  do{
++    size_t next=marks.gaps?std::countr_zero(marks.gaps):events.size();
++    marks.gaps&=marks.gaps-1;
++    uint64_t in_session=next==64?UINT64_MAX:(uint64_t{1}<<next)-1;
++    uint64_t selected=marks.purchases&in_session;
++    marks.purchases^=selected;
++    Time start=layout.time(events[first]);
++    begin(start);
++    int64_t revenue=0;
++    while(selected){
++      auto e=layout.unpack(events[std::countr_zero(selected)]);
++      spend(e.category,e.price);
++      revenue+=e.price;
++      selected&=selected-1;
++    }
++    end(start,next-first,revenue);
++    first=next;
++  }while(first<events.size());
++}

@@ -1,0 +1,1432 @@
+--- a/cpp/flat_parquet.hpp
++++ b/cpp/flat_parquet.hpp
+@@ -288,8 +288,8 @@
+ class UserFile {
+   using Bytes = flat_parquet::Bytes;
+   static constexpr flat_parquet::Column columns[] = {
+-      {"user_id", 6, 0}, {"day", 1, 6},        {"sessions", 2},
+-      {"events", 2},     {"revenue_cents", 2}, {"top_category", 6, 0, true}};
++      {"user_id", 6, 0}, {"day", 1, 6}, {"sessions", 2}, {"events", 2},
++      {"revenue_cents", 2}, {"top_category", 6, 0, true}};
+   static constexpr size_t max_rows = 16384;
+   static constexpr size_t max_text_bytes = 8u << 20;
+ 
+@@ -340,10 +340,8 @@
+       user_name = row.user.user_text(inline_name);
+       previous_user = row.user;
+     }
+-    const size_t extra =
+-        user_name.size() + (row.category ? row.category->size() : 0);
+-    if (rows && (rows == max_rows ||
+-                 extra > std::max(max_text_bytes, text_bytes) - text_bytes))
++    const size_t extra = user_name.size() + (row.category ? row.category->size() : 0);
++    if (rows && (rows == max_rows || extra > std::max(max_text_bytes, text_bytes) - text_bytes))
+       flush();
+     text_bytes += extra;
+     flat_parquet::plain_string(values[0], user_name);
+@@ -354,8 +352,7 @@
+     if (rows % 8 == 0)
+       definitions.push_back(0);
+     if (row.category) {
+-      definitions.back() = char(static_cast<unsigned char>(definitions.back()) |
+-                                (1u << (rows % 8)));
++      definitions.back() = char(static_cast<unsigned char>(definitions.back()) | (1u << (rows % 8)));
+       flat_parquet::plain_string(values[5], *row.category);
+     }
+     ++rows;
+--- a/cpp/grouped_control.hpp
++++ b/cpp/grouped_control.hpp
+@@ -1,56 +1,36 @@
+ #pragma once
+-template <class Value> struct ControlIndex {
+-  static constexpr size_t width = 16;
++template<class Value> struct ControlIndex {
++  static constexpr size_t width=16;
+   std::vector<uint8_t> tags;
+   std::unique_ptr<Value[]> values;
+-  explicit ControlIndex(size_t size) { reset(size); }
+-  void reset(size_t n) {
+-    n = std::max(n, width);
+-    tags.assign(n, 0);
+-    values = std::make_unique_for_overwrite<Value[]>(n);
+-  }
+-  static uint8_t fingerprint(uint64_t h) {
+-    return uint8_t(1 + ((h ^ (h >> 33)) >> 47 & 127));
+-  }
+-  static std::pair<unsigned, unsigned> masks(const uint8_t *base, uint8_t tag) {
++  explicit ControlIndex(size_t size) {reset(size);}
++  void reset(size_t n){n=std::max(n,width);tags.assign(n,0);values=std::make_unique_for_overwrite<Value[]>(n);}
++  static uint8_t fingerprint(uint64_t h){return uint8_t(1+((h^(h>>33))>>47 & 127));}
++  static std::pair<unsigned,unsigned> masks(const uint8_t *base,uint8_t tag){
+ #if defined(__SSE2__)
+-    auto group = _mm_loadu_si128(reinterpret_cast<const __m128i *>(base));
+-    return {unsigned(_mm_movemask_epi8(
+-                _mm_cmpeq_epi8(group, _mm_set1_epi8(char(tag))))),
+-            unsigned(
+-                _mm_movemask_epi8(_mm_cmpeq_epi8(group, _mm_setzero_si128())))};
++    auto group=_mm_loadu_si128(reinterpret_cast<const __m128i*>(base));
++    return {unsigned(_mm_movemask_epi8(_mm_cmpeq_epi8(group,_mm_set1_epi8(char(tag))))),
++            unsigned(_mm_movemask_epi8(_mm_cmpeq_epi8(group,_mm_setzero_si128())))};
+ #elif defined(__aarch64__)
+-    auto group = vld1q_u8(base);
+-    return {mask(vceqq_u8(group, vdupq_n_u8(tag))),
+-            mask(vceqq_u8(group, vdupq_n_u8(0)))};
++    auto group=vld1q_u8(base);
++    return {mask(vceqq_u8(group,vdupq_n_u8(tag))),mask(vceqq_u8(group,vdupq_n_u8(0)))};
+ #else
+-    unsigned hit = 0, empty = 0;
+-    for (unsigned i = 0; i < width; ++i) {
+-      hit |= unsigned(base[i] == tag) << i;
+-      empty |= unsigned(!base[i]) << i;
+-    }
+-    return {hit, empty};
++    unsigned hit=0,empty=0;for(unsigned i=0;i<width;++i){hit|=unsigned(base[i]==tag)<<i;empty|=unsigned(!base[i])<<i;}return {hit,empty};
+ #endif
+   }
+-  template <class Match>
+-  std::pair<size_t, bool> locate(uint64_t hash, Match equal) const {
+-    size_t group = ((hash / shards) & (tags.size() / width - 1)) * width;
+-    uint8_t tag = fingerprint(hash);
+-    for (;;) {
+-      auto [matches, empty] = masks(tags.data() + group, tag);
+-      while (matches) {
+-        size_t slot = group + std::countr_zero(matches);
+-        if (equal(values[slot]))
+-          return {slot, true};
+-        matches &= matches - 1;
++  template<class Match> std::pair<size_t,bool> locate(uint64_t hash,Match equal) const {
++    size_t group=((hash/shards)&(tags.size()/width-1))*width;
++    uint8_t tag=fingerprint(hash);
++    for(;;){
++      auto [matches,empty]=masks(tags.data()+group,tag);
++      while(matches) {
++        size_t slot=group+std::countr_zero(matches);
++        if(equal(values[slot]))return {slot,true};
++        matches&=matches-1;
+       }
+-      if (empty)
+-        return {group + std::countr_zero(empty), false};
+-      group = (group + width) & (tags.size() - 1);
++      if(empty)return {group+std::countr_zero(empty),false};
++      group=(group+width)&(tags.size()-1);
+     }
+   }
+-  void insert(size_t slot, uint64_t hash, uint64_t value) {
+-    values[slot] = value;
+-    tags[slot] = fingerprint(hash);
+-  }
++  void insert(size_t slot,uint64_t hash,uint64_t value){values[slot]=value;tags[slot]=fingerprint(hash);}
+ };
+--- a/cpp/input.hpp
++++ b/cpp/input.hpp
+@@ -148,12 +148,15 @@
+ #include "csv_x86.hpp"
+ #include "line_csv.hpp"
+ #include "line_tile.hpp"
++#include "quote_certificate.hpp"
++#include "ordinal_csv.hpp"
+ template <size_t N, class F> void parse_rows(Str data, F &&callback) {
+ #ifdef SHOPPING_X86_CSV
+-  if (N == 7 && wide_csv_supported()) {
+-    tiled_lines<N, 16>(data, callback);
+-    return;
+-  }
++  if constexpr(N==7)if(wide_csv_supported() && __builtin_cpu_supports("bmi2") && __builtin_cpu_supports("pclmul")){
++    if(__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw")){ordinal16_wide<N,2048,true>(data,callback);return;}
++    ordinal16_standard<N,2048,true>(data,callback);return;
++  }
++  if(N==7 && wide_csv_supported()){tiled_lines<N,16>(data,callback);return;}
+   if (wide_csv_supported()) { line_csv_rows<N>(data,callback); return; }
+   if (wide_csv_supported()) {
+     wide_csv_rows<N>(data, callback);
+--- a/cpp/line_tile.hpp
++++ b/cpp/line_tile.hpp
+@@ -7,86 +7,50 @@
+ }
+ struct CsvPrefix {
+   uint64_t commas{}, quotes{}, range{};
+-  uint8_t start_id{}, id_width{}, start_user{}, user_width{}, start_time{},
+-      time_width{}, count{};
++  uint8_t start_id{}, id_width{}, start_user{}, user_width{}, start_time{}, time_width{}, count{};
+ };
+ constexpr auto csv_prefixes() {
+-  std::array<std::array<std::array<CsvPrefix, 21>, 7>, 4> table{};
+-  for (unsigned ew : {8u, 9u})
+-    for (unsigned uw : {8u, 9u})
+-      for (unsigned q0 = 0; q0 < 2; ++q0)
+-        for (unsigned q1 = 0; q1 < 2; ++q1)
+-          for (unsigned q2 = 0; q2 < 2; ++q2)
+-            for (unsigned w : {13u, 20u, 25u}) {
+-              const unsigned c0 = ew + 2 * q0, c1 = c0 + 1 + uw + 2 * q1,
+-                             c2 = c1 + 1 + w + 2 * q2;
+-              auto bit = [](unsigned i) { return uint64_t{1} << i; };
+-              uint64_t quotes = (q0 ? (bit(0) | bit(c0 - 1)) : 0) |
+-                                (q1 ? (bit(c0 + 1) | bit(c1 - 1)) : 0) |
+-                                (q2 ? (bit(c1 + 1) | bit(c2 - 1)) : 0);
+-              table[c0 - 8][c1 - 17][c2 - 31] = {bit(c0) | bit(c1) | bit(c2),
+-                                                 quotes,
+-                                                 bit(c2 + 1) - 1,
+-                                                 uint8_t(q0),
+-                                                 uint8_t(ew),
+-                                                 uint8_t(c0 + 1 + q1),
+-                                                 uint8_t(uw),
+-                                                 uint8_t(c1 + 1 + q2),
+-                                                 uint8_t(w),
+-                                                 uint8_t(2 * (q0 + q1 + q2))};
+-            }
++  std::array<std::array<std::array<CsvPrefix,21>,7>,4> table{};
++  for(unsigned ew:{8u,9u})for(unsigned uw:{8u,9u})
++  for(unsigned q0=0;q0<2;++q0) for(unsigned q1=0;q1<2;++q1)
++    for(unsigned q2=0;q2<2;++q2) for(unsigned w:{13u,20u,25u}){
++      const unsigned c0=ew+2*q0,c1=c0+1+uw+2*q1,c2=c1+1+w+2*q2;
++      auto bit=[](unsigned i){return uint64_t{1}<<i;};
++      uint64_t quotes=(q0?(bit(0)|bit(c0-1)):0) |
++                       (q1?(bit(c0+1)|bit(c1-1)):0) |
++                       (q2?(bit(c1+1)|bit(c2-1)):0);
++      table[c0-8][c1-17][c2-31]={bit(c0)|bit(c1)|bit(c2),quotes,bit(c2+1)-1,
++        uint8_t(q0),uint8_t(ew),uint8_t(c0+1+q1),uint8_t(uw),uint8_t(c1+1+q2),uint8_t(w),uint8_t(2*(q0+q1+q2))};
++    }
+   return table;
+ }
+-inline constexpr auto csv_prefix_table = csv_prefixes();
+-template <class F>
+-__attribute__((target("avx2,bmi,popcnt"), always_inline)) inline bool
+-prefix_event(const char *p, unsigned len, uint64_t lo, uint64_t hi, uint64_t ql,
+-             uint64_t qh, F &fn) {
+-  auto a = lo & (uint64_t{15} << 8), b = lo & (uint64_t{127} << 17),
+-       c = lo & (((uint64_t{1} << 21) - 1) << 31);
+-  if (!a || !b || !c)
+-    return false;
+-  unsigned c0 = std::countr_zero(a), c1 = std::countr_zero(b),
+-           c2 = std::countr_zero(c);
+-  const CsvPrefix &prefix = csv_prefix_table[c0 - 8][c1 - 17][c2 - 31];
+-  if (!prefix.range || (lo & prefix.range) != prefix.commas ||
+-      (ql & prefix.range) != prefix.quotes)
+-    return false;
++inline constexpr auto csv_prefix_table=csv_prefixes();
++template<class F>
++__attribute__((target("avx2,bmi,popcnt"),always_inline)) inline bool
++prefix_event(const char *p,unsigned len,uint64_t lo,uint64_t hi,uint64_t ql,uint64_t qh,F &fn) {
++  auto a=lo&(uint64_t{15}<<8), b=lo&(uint64_t{127}<<17), c=lo&(((uint64_t{1}<<21)-1)<<31);
++  if(!a||!b||!c)return false;
++  unsigned c0=std::countr_zero(a),c1=std::countr_zero(b),c2=std::countr_zero(c);
++  const CsvPrefix &prefix=csv_prefix_table[c0-8][c1-17][c2-31];
++  if(!prefix.range || (lo&prefix.range)!=prefix.commas || (ql&prefix.range)!=prefix.quotes)return false;
+   // The kernel is only reached when 128 input bytes remain mapped. Confirm
+   // the candidate delimiter positions against this particular line as well.
+-  unsigned s3 = c2 + 1, q3 = p[s3] == '"', c3 = s3 + 20 + 2 * q3, s4 = c3 + 1,
+-           q4 = p[s4] == '"', c4 = s4 + 4 + 2 * q4;
+-  unsigned c5 = hi ? 127u - std::countl_zero(hi) : 63u - std::countl_zero(lo);
+-  if (c4 >= c5 || p[c3] != ',' || p[c4] != ',' || (q3 && p[c3 - 1] != '"') ||
+-      (q4 && p[c4 - 1] != '"'))
+-    return false;
+-  unsigned s5 = c4 + 1, s6 = c5 + 1;
+-  bool q5 = (c5 - s5 >= 2) & (p[s5] == '"') & (p[c5 - 1] == '"');
+-  bool q6 = (len - s6 >= 2) & (p[s6] == '"') & (p[len - 1] == '"');
+-  if (prefix.count + 2 * (q3 + q4 + q5 + q6) !=
+-      unsigned(std::popcount(ql) + std::popcount(qh)))
+-    return false;
+-  const char *id = p + prefix.start_id, *user = p + prefix.start_user,
+-             *kind = p + s4 + q4;
+-  Str ts{p + prefix.start_time, prefix.time_width}, ingest{p + s3 + q3, 20};
+-  unsigned product_length = c5 - s5 - 2 * q5;
+-  if constexpr (requires {
+-                  fn.common(id, prefix.id_width, user, prefix.user_width, ts,
+-                            ingest);
+-                }) {
+-    if (product_length &&
+-        (std::memcmp(kind, "view", 4) == 0 ||
+-         std::memcmp(kind, "cart", 4) == 0) &&
+-        fn.common(id, prefix.id_width, user, prefix.user_width, ts, ingest))
+-      return true;
++  unsigned s3=c2+1,q3=p[s3]=='"',c3=s3+20+2*q3,s4=c3+1,q4=p[s4]=='"',c4=s4+4+2*q4;
++  unsigned c5=hi?127u-std::countl_zero(hi):63u-std::countl_zero(lo);
++  if(c4>=c5 || p[c3]!=',' || p[c4]!=',' || (q3 && p[c3-1]!='"') || (q4 && p[c4-1]!='"'))return false;
++  unsigned s5=c4+1,s6=c5+1;
++  bool q5=(c5-s5>=2)&(p[s5]=='"')&(p[c5-1]=='"');
++  bool q6=(len-s6>=2)&(p[s6]=='"')&(p[len-1]=='"');
++  if(prefix.count+2*(q3+q4+q5+q6)!=unsigned(std::popcount(ql)+std::popcount(qh)))return false;
++  const char *id=p+prefix.start_id,*user=p+prefix.start_user,*kind=p+s4+q4;
++  Str ts{p+prefix.start_time,prefix.time_width}, ingest{p+s3+q3,20};
++  unsigned product_length=c5-s5-2*q5;
++  if constexpr(requires { fn.common(id,prefix.id_width,user,prefix.user_width,ts,ingest); }) {
++    if(product_length && (std::memcmp(kind,"view",4)==0 || std::memcmp(kind,"cart",4)==0)
++       && fn.common(id,prefix.id_width,user,prefix.user_width,ts,ingest))return true;
+   }
+-  std::array<Str, 7> fields{Str(id, prefix.id_width),
+-                            Str(user, prefix.user_width),
+-                            ts,
+-                            ingest,
+-                            Str(kind, 4),
+-                            Str(p + s5 + q5, product_length),
+-                            Str(p + s6 + q6, len - s6 - 2 * q6)};
++  std::array<Str,7> fields{Str(id,prefix.id_width),Str(user,prefix.user_width),ts,ingest,Str(kind,4),
++                            Str(p+s5+q5,product_length),Str(p+s6+q6,len-s6-2*q6)};
+   fn(fields);
+   return true;
+ }
+@@ -117,9 +81,7 @@
+     get(64, hi, qh);
+   if (size_t(std::popcount(lo) + std::popcount(hi)) != N - 1)
+     return;
+-  if constexpr (N == 7)
+-    if (prefix_event(p, unsigned(len), lo, hi, ql, qh, fn))
+-      return;
++  if constexpr(N==7)if(prefix_event(p,unsigned(len),lo,hi,ql,qh,fn))return;
+   std::array<Str, N> fields;
+   unsigned start = 0, wrapped = 0;
+   for (unsigned i = 0; i < N; ++i) {
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -6,10 +6,11 @@
+ #include <regex>
+ #include <span>
+ 
+-template <class Generic, class Common> struct EventCallbacks {
++template<class Generic,class Common,class Prepared> struct EventCallbacks {
+   Generic generic;
+   Common common;
+-  template <class Row> void operator()(const Row &row) { generic(row); }
++  Prepared prepared;
++  template<class Row> void operator()(const Row &row){generic(row);}
+ };
+ size_t bucket(Key k) { return k.hash() % shards; }
+ #include "event_layout.hpp"
+@@ -192,6 +193,7 @@
+       return sparse[{campaign, day}];
+     return table[size_t(day - first_day) * campaigns + campaign];
+   }
++
+ };
+ 
+ template <class Layout>
+@@ -337,67 +339,52 @@
+     while (capacity < count + count / 2)
+       capacity *= 2;
+     MEASURE(dedup);
+-    auto resolve = [&]<class Value>() {
+-      ControlIndex<Value> best(capacity);
+-      auto seconds = [&](const Candidate &r, unsigned owner) {
+-        return r.ingest & 0x80000000u
+-                   ? workers[owner].extended[r.location].seconds
+-                   : Time(r.ingest) - Time(1u << 30) + anchor;
+-      };
+-      auto discard = [&](const Candidate &r, unsigned owner) {
+-        auto &w = workers[owner];
+-        uint64_t location = r.ingest & 0x80000000u
+-                                ? w.extended[r.location].location
+-                                : r.location;
+-        if (location) {
+-          --location;
+-          w.events[location % shards][location / shards].first.bits = 0;
+-        }
+-      };
+-      for (unsigned owner = 0; owner < workers.size(); ++owner) {
+-        auto &refs = workers[owner].candidates[b];
+-        // Reserve zero for an empty slot. Six low bits identify one of at most
+-        // 64 input workers, and the remaining bits locate its immutable
+-        // revision.
+-        for (size_t i = 0; i < refs.size(); ++i) {
+-          Key id = refs.key(i);
+-          auto hash = id.hash();
+-          auto location = 1 + (uint64_t(i) << 6) + owner;
+-          auto [slot, found] = best.locate(hash, [&](uint64_t code) {
+-            auto prior = code - 1;
+-            return workers[prior & 63].candidates[b].key(prior >> 6) == id;
+-          });
+-          if (!found) {
+-            best.insert(slot, hash, location);
+-            continue;
+-          }
+-          auto prior = best.values[slot] - 1;
+-          auto old_owner = unsigned(prior & 63);
+-          const auto r = refs[i];
+-          const auto old = workers[old_owner].candidates[b][prior >> 6];
++    auto resolve=[&]<class Value>() {
++    ControlIndex<Value> best(capacity);
++    auto seconds = [&](const Candidate &r, unsigned owner) {
++      return r.ingest & 0x80000000u
++                 ? workers[owner].extended[r.location].seconds
++                 : Time(r.ingest) - Time(1u << 30) + anchor;
++    };
++    auto discard = [&](const Candidate &r, unsigned owner) {
++      auto &w = workers[owner];
++      uint64_t location =
++          r.ingest & 0x80000000u ? w.extended[r.location].location : r.location;
++      if (location) {
++        --location;
++        w.events[location % shards][location / shards].first.bits = 0;
++      }
++    };
++    for (unsigned owner = 0; owner < workers.size(); ++owner) {
++      auto &refs = workers[owner].candidates[b];
++      // Reserve zero for an empty slot. Six low bits identify one of at most
++      // 64 input workers, and the remaining bits locate its immutable revision.
++      for (size_t i = 0; i < refs.size(); ++i) {
++        Key id=refs.key(i);
++        auto hash=id.hash();
++        auto location=1+(uint64_t(i)<<6)+owner;
++        auto [slot,found]=best.locate(hash,[&](uint64_t code){
++          auto prior=code-1;
++          return workers[prior&63].candidates[b].key(prior>>6)==id;
++        });
++        if(!found){best.insert(slot,hash,location);continue;}
++        auto prior=best.values[slot]-1;
++        auto old_owner=unsigned(prior&63);
++        const auto r=refs[i];
++        const auto old=workers[old_owner].candidates[b][prior>>6];
+ #ifdef SHOPPING_DIAGNOSTICS
+-          ++workers[t].duplicates;
++        ++workers[t].duplicates;
+ #endif
+-          bool before = (r.ingest | old.ingest) & 0x80000000u
+-                            ? seconds(r, owner) < seconds(old, old_owner)
+-                            : r.ingest < old.ingest;
+-          if (before) {
+-            discard(old, old_owner);
+-            best.values[slot] = location;
+-          } else
+-            discard(r, owner);
+-        }
+-      }
++        bool before=(r.ingest|old.ingest)&0x80000000u?seconds(r,owner)<seconds(old,old_owner):r.ingest<old.ingest;
++        if(before){discard(old,old_owner);best.values[slot]=location;}
++        else discard(r,owner);
++      }
++    }
+     };
+     // One location contains the revision's offset and its six-bit worker.
+     // Bound the maximum encoded value using the actual shard populations.
+-    bool small = std::all_of(workers.begin(), workers.end(), [&](auto &w) {
+-      return w.candidates[b].size() <= (UINT32_MAX >> 6);
+-    });
+-    if (small)
+-      resolve.template operator()<uint32_t>();
+-    else
+-      resolve.template operator()<uint64_t>();
++    bool small=std::all_of(workers.begin(),workers.end(),[&](auto &w){return w.candidates[b].size()<=(UINT32_MAX>>6);});
++    if(small)resolve.template operator()<uint32_t>();else resolve.template operator()<uint64_t>();
+     for (auto &w : workers)
+       w.candidates[b].release();
+   });
+@@ -415,18 +402,13 @@
+   using E = typename Layout::E;
+   using C = typename Layout::C;
+   std::vector<TimelineRegion> pool(threads);
+-  for (unsigned i = 0; i < workers.size(); ++i) {
+-    auto &w = workers[i];
+-    auto &revision = w.candidates.slab;
+-    if (revision.region != MAP_FAILED) {
+-      pool[i].base = static_cast<std::byte *>(revision.region);
+-      pool[i].bytes = revision.bytes;
+-    }
+-  }
+-  struct Store {
+-    TimelineArray<E> events;
+-    TimelineArray<C> clicks;
+-  };
++  for(unsigned i=0;i<workers.size();++i){
++    auto &w=workers[i];auto &revision=w.candidates.slab;
++    if(revision.region!=MAP_FAILED){
++      pool[i].base=static_cast<std::byte*>(revision.region);pool[i].bytes=revision.bytes;
++    }
++  }
++  struct Store { TimelineArray<E> events; TimelineArray<C> clicks; };
+   std::array<Store, shards> storage;
+   std::array<std::vector<Vertex>, shards> vertices;
+   parallel(shards, threads, [&](size_t b, unsigned t) {
+@@ -506,8 +488,8 @@
+       typename std::remove_reference_t<decltype(w.endpoints)>::value_type()
+           .swap(w.endpoints[b]);
+     }
+-    store.events.prepare(event_count, pool, t);
+-    store.clicks.prepare(click_count, pool, t);
++    store.events.prepare(event_count,pool,t);
++    store.clicks.prepare(click_count,pool,t);
+     size_t event_offset = 0, click_offset = 0;
+     for (auto &g : groups) {
+       auto events_in_group = g.event_end, clicks_in_group = g.click_end;
+@@ -529,10 +511,10 @@
+     }
+     event_offset = click_offset = 0;
+     for (auto &g : groups) {
+-      auto ev =
+-          store.events.view().subspan(event_offset, g.event_end - event_offset);
+-      auto cl =
+-          store.clicks.view().subspan(click_offset, g.click_end - click_offset);
++      auto ev = store.events.view()
++                    .subspan(event_offset, g.event_end - event_offset);
++      auto cl = store.clicks.view()
++                    .subspan(click_offset, g.click_end - click_offset);
+       if (g.vertex) {
+         auto &v = nodes[g.vertex - 1];
+         v = {g.key, &v, &v, 1, ev, cl};
+@@ -547,20 +529,13 @@
+     w.clicks.release();
+   }
+   timer.mark("raw user grouping, link endpoints and singleton sessions");
+-  if (std::getenv("SHOP_RECYCLE_TRACE")) {
+-    size_t assigned = 0, heap = 0;
+-    for (auto &store : storage) {
+-      auto count = [&](auto &entries) {
+-        size_t n = entries.size * sizeof(*entries.data);
+-        assigned += n;
+-        if (entries.owned)
+-          heap += n;
+-      };
+-      count(store.events);
+-      count(store.clicks);
+-    }
+-    std::cerr << "SHOP_TIMELINE_REUSE " << assigned - heap << " " << heap
+-              << "\n";
++  if(std::getenv("SHOP_RECYCLE_TRACE")){
++    size_t assigned=0,heap=0;
++    for(auto &store:storage){
++      auto count=[&](auto &entries){size_t n=entries.size*sizeof(*entries.data);assigned+=n;if(entries.owned)heap+=n;};
++      count(store.events);count(store.clicks);
++    }
++    std::cerr<<"SHOP_TIMELINE_REUSE "<<assigned-heap<<" "<<heap<<"\n";
+   }
+ 
+   // Roots move strictly downward in bytewise order. Path splitting keeps long
+@@ -712,115 +687,114 @@
+     w.clicks.reserve(click_hint);
+   }
+   const Time anchor = window.start / 1000;
+-  parallel(links.size() + events.size() + clicks.size(), threads,
+-           [&](size_t job, unsigned t) {
+-             if (job < links.size()) {
+-               auto &w = workers[t];
+-               rows<2>(links[job].body(), [&](auto &r) {
+-                 if (r[0].empty() || r[1].empty())
+-                   return;
+-                 size_t index = w.edges.size() * 2;
+-                 w.edges.push_back({});
+-                 for (unsigned side = 0; side < 2; ++side) {
+-                   Key key = w.pool.encode(r[side], 'u');
+-                   w.endpoints[key.hash() % shards].emplace_back(key,
+-                                                                 index + side);
+-                 }
+-               });
+-               return;
+-             }
+-             job -= links.size();
+-             if (job >= events.size()) {
+-               rows<4>(clicks[job - events.size()].body(), [&](auto &r) {
+-                 if (r[0].empty() || r[1].empty())
+-                   return;
+-                 Time ts = timestamp(r[3]);
+-                 auto c = cat.campaign.find(r[2]);
+-                 if (ts < window.start - reach || ts >= window.end || c < 0)
+-                   return;
+-                 auto alias = workers[t].pool.encode(r[1], 'u');
++  parallel(
++      links.size() + events.size() + clicks.size(), threads,
++      [&](size_t job, unsigned t) {
++        if (job < links.size()) {
++          auto &w = workers[t];
++          rows<2>(links[job].body(), [&](auto &r) {
++            if (r[0].empty() || r[1].empty())
++              return;
++            size_t index = w.edges.size() * 2;
++            w.edges.push_back({});
++            for (unsigned side = 0; side < 2; ++side) {
++              Key key = w.pool.encode(r[side], 'u');
++              w.endpoints[key.hash() % shards].emplace_back(key, index + side);
++            }
++          });
++          return;
++        }
++        job -= links.size();
++        if (job >= events.size()) {
++          rows<4>(clicks[job - events.size()].body(), [&](auto &r) {
++            if (r[0].empty() || r[1].empty())
++              return;
++            Time ts = timestamp(r[3]);
++            auto c = cat.campaign.find(r[2]);
++            if (ts < window.start - reach || ts >= window.end || c < 0)
++              return;
++            auto alias = workers[t].pool.encode(r[1], 'u');
+ #ifdef SHOPPING_DIAGNOSTICS
+-                 ++workers[t].valid_clicks;
++            ++workers[t].valid_clicks;
+ #endif
+-                 workers[t].clicks[alias.hash() % shards].emplace_back(
+-                     Key{alias.bits},
+-                     layout.click(workers[t].pool.encode(r[0], 'k'), ts, c));
+-               });
+-               return;
+-             }
+-             auto put = [&](Key id, Key user, Event e, Time ingest) {
+-               auto &w = workers[t];
+-               uint64_t location = 0;
+-               if (user.bits) {
+-                 size_t b = user.hash() % shards;
+-                 auto &rows = w.events[b];
+-                 location = uint64_t(rows.size()) * shards + b + 1;
+-                 rows.emplace_back(Key{user.bits}, layout.pack(e));
+-               }
+-               Time seconds = ingest / 1000;
+-               Time relative = seconds - anchor;
+-               // Bias signed seconds into 31 bits. The high bit selects the
+-               // overflow vector.
+-               uint64_t when = uint64_t(relative) + (uint64_t{1} << 30);
+-               Candidate ref{id, 0, 0};
+-               if (when < 0x80000000ULL && location <= UINT32_MAX) {
+-                 ref.ingest = uint32_t(when);
+-                 ref.location = uint32_t(location);
+-               } else {
+-                 if (w.extended.size() > UINT32_MAX)
+-                   throw std::length_error("revision index exhausted");
+-                 ref.ingest = 0x80000000u;
+-                 ref.location = uint32_t(w.extended.size());
+-                 w.extended.push_back({seconds, location});
+-               }
+-               w.candidates[bucket(id)].push_back(ref);
+-             };
+-             auto generic_event = [&](auto const &r) __attribute__((noinline)) {
+-               if (r[0].empty())
+-                 return;
+-               auto &w = workers[t];
+-               Time ingest = ingest_time(r[3]);
+-               Key id = w.pool.encode(r[0], 'e');
+-               Event e = validate(r, ingest, cat, window);
++            workers[t].clicks[alias.hash() % shards].emplace_back(
++                Key{alias.bits},
++                layout.click(workers[t].pool.encode(r[0], 'k'), ts, c));
++          });
++          return;
++        }
++        auto put=[&](Key id, Key user, Event e, Time ingest) {
++          auto &w = workers[t];
++          uint64_t location = 0;
++          if (user.bits) {
++            size_t b = user.hash() % shards;
++            auto &rows = w.events[b];
++            location = uint64_t(rows.size()) * shards + b + 1;
++            rows.emplace_back(Key{user.bits}, layout.pack(e));
++          }
++          Time seconds = ingest / 1000;
++          Time relative = seconds - anchor;
++          // Bias signed seconds into 31 bits. The high bit selects the overflow
++          // vector.
++          uint64_t when = uint64_t(relative) + (uint64_t{1} << 30);
++          Candidate ref{id, 0, 0};
++          if (when < 0x80000000ULL && location <= UINT32_MAX) {
++            ref.ingest = uint32_t(when);
++            ref.location = uint32_t(location);
++          } else {
++            if (w.extended.size() > UINT32_MAX)
++              throw std::length_error("revision index exhausted");
++            ref.ingest = 0x80000000u;
++            ref.location = uint32_t(w.extended.size());
++            w.extended.push_back({seconds, location});
++          }
++          w.candidates[bucket(id)].push_back(ref);
++        };
++        auto generic_event=[&](auto const &r) __attribute__((noinline)) {
++          if(r[0].empty())return;
++          auto &w=workers[t];
++          Time ingest=ingest_time(r[3]);
++          Key id=w.pool.encode(r[0],'e');
++          Event e=validate(r,ingest,cat,window);
+ #ifdef SHOPPING_DIAGNOSTICS
+-               ++w.revisions;
+-               w.valid_events += e.ts != bad;
++          ++w.revisions;
++          w.valid_events+=e.ts!=bad;
+ #endif
+-               Key user = e.ts == bad ? Key{} : w.pool.encode(r[1], 'u');
+-               put(id, user, e, ingest);
+-             };
+-             auto common_event = [&](const char *id, unsigned id_width,
+-                                     const char *user, unsigned user_width,
+-                                     Str event_time, Str arrival) {
+-               if constexpr (sizeof(uintptr_t) != 8 ||
+-                             std::endian::native != std::endian::little)
+-                 return false;
+-               if (id[0] != 'e' || user[0] != 'u')
+-                 return false;
+-               auto load = [](const char *p, unsigned n) {
+-                 const uint64_t mask = UINT64_MAX >> (8 * (9 - n));
+-                 return little_word(p + 1) & mask;
+-               };
+-               auto event_word = load(id, id_width),
+-                    user_word = load(user, user_width);
+-               if ((event_word | user_word) >> 63 || !id[id_width - 1] ||
+-                   !user[user_width - 1])
+-                 return false;
+-               Time ingest = ingest_time(arrival), ts = timestamp(event_time);
+-               bool good = ts >= window.start && ts < window.end &&
+-                           ingest - ts <= day_ms;
++          Key user=e.ts==bad?Key{}:w.pool.encode(r[1],'u');
++          put(id,user,e,ingest);
++        };
++        auto common_event=[&](const char *id,unsigned id_width,const char *user,unsigned user_width,Str event_time,Str arrival) {
++          if constexpr(sizeof(uintptr_t)!=8 || std::endian::native!=std::endian::little)return false;
++          if(id[0]!='e' || user[0]!='u')return false;
++          auto load=[](const char *p,unsigned n){
++            const uint64_t mask=UINT64_MAX>>(8*(9-n));
++            return little_word(p+1)&mask;
++          };
++          auto event_word=load(id,id_width),user_word=load(user,user_width);
++          if((event_word|user_word)>>63 || !id[id_width-1] || !user[user_width-1])return false;
++          Time ingest=ingest_time(arrival),ts=timestamp(event_time);
++          bool good=ts>=window.start && ts<window.end && ingest-ts<=day_ms;
+ #ifdef SHOPPING_DIAGNOSTICS
+-               ++workers[t].revisions;
+-               workers[t].valid_events += good;
++          ++workers[t].revisions;
++          workers[t].valid_events+=good;
+ #endif
+-               put(Key{uintptr_t(permute_key(event_word) << 1)},
+-                   good ? Key{uintptr_t(permute_key(user_word) << 1)} : Key{},
+-                   Event{good ? ts : bad, 0, 0}, ingest);
+-               return true;
+-             };
+-             auto callbacks = EventCallbacks{generic_event, common_event};
+-             rows<7>(events[job].body(), callbacks);
+-           });
++          put(Key{uintptr_t(permute_key(event_word)<<1)},good?Key{uintptr_t(permute_key(user_word)<<1)}:Key{},
++              Event{good?ts:bad,0,0},ingest);
++          return true;
++        };
++        auto prepared=[&](uint64_t id_bits,uint64_t user_bits,Str event_time,Str arrival){
++          Time ingest=ingest_time(arrival),ts=timestamp(event_time);
++          bool good=ts>=window.start && ts<window.end && ingest-ts<=day_ms;
++#ifdef SHOPPING_DIAGNOSTICS
++          ++workers[t].revisions;
++          workers[t].valid_events+=good;
++#endif
++          put(Key{uintptr_t(id_bits)},good?Key{uintptr_t(user_bits)}:Key{},
++              Event{good?ts:bad,0,0},ingest);
++        };
++        auto callbacks=EventCallbacks{generic_event,common_event,prepared};
++        rows<7>(events[job].body(),callbacks);
++      });
+   timer.mark("concurrent input, raw user partition and revision index");
+ #ifdef SHOPPING_DIAGNOSTICS
+   size_t revision_count = 0, revision_capacity = 0;
+@@ -845,10 +819,10 @@
+         output / "user_daily" / ("part-" + std::to_string(i) + ".parquet"));
+   });
+   process_people(workers, results, cat, threads, timer, layout);
+-  for (auto &w : workers)
+-    w.candidates.release();
+-  parallel(results.size(), threads,
+-           [&](size_t i, unsigned) { results[i].user_file->close(); });
++  for(auto &w:workers)w.candidates.release();
++  parallel(results.size(), threads, [&](size_t i, unsigned) {
++    results[i].user_file->close();
++  });
+   std::vector<CampaignDay> campaigns;
+   auto append = [&](size_t id, int32_t day, const Counts &counts) {
+     campaigns.push_back({cat.campaigns[id], cat.channels[id], day, counts});
+@@ -862,8 +836,7 @@
+     for (const auto &[key, counts] : merged)
+       append(key.first, key.second, counts);
+   } else {
+-    for (size_t start = 0; start < first.table.size();
+-         start += first.campaigns) {
++    for (size_t start = 0; start < first.table.size(); start += first.campaigns) {
+       const int32_t day = first.first_day + int32_t(start / first.campaigns);
+       for (size_t id = 0; id < first.campaigns; ++id) {
+         Counts counts;
+--- /dev/null
++++ b/cpp/ordinal_csv.hpp
+@@ -0,0 +1,96 @@
++#pragma once
++#ifdef SHOPPING_X86_CSV
++// Within a 256-byte tile even its very last delimiter fits in one byte.
++// Extract newline bits in separator order. In a well-formed event stream
++// every seventh separator must be LF, regardless of field widths or quotes.
++struct OrdinalMasks { uint64_t separators, quotes, newlines; };
++
++template<size_t N> inline constexpr auto ordinal_newlines=[] {
++  std::array<uint64_t,N> out{};
++  for(unsigned phase=0;phase<N;++phase)
++    for(unsigned bit=0;bit<64;++bit)
++      if((phase+bit+1)%N==0)out[phase]|=uint64_t{1}<<bit;
++  return out;
++}();
++
++struct OrdinalFields {
++  const char *base;
++  const uint8_t *end;
++  Str operator[](size_t i) const {
++    unsigned first=uint8_t(end[std::ptrdiff_t(i)-1]+1),cut=end[i];
++    unsigned trim=base[first]=='"';
++    return {base+first+trim,cut-first-2*trim};
++  }
++  template<size_t N> operator std::array<Str,N>() const {
++    std::array<Str,N> row;
++    for(unsigned i=0;i<N;++i)row[i]=(*this)[i];
++    return row;
++  }
++};
++
++__attribute__((target("avx2,bmi,bmi2,popcnt,pclmul"),always_inline))
++inline OrdinalMasks ordinal_masks_avx2(const char *p){
++  auto a=row_mask32(p),b=row_mask32(p+32);
++  auto join=[](unsigned x,unsigned y){return uint64_t(x)|(uint64_t(y)<<32);};
++  auto lf=join(a.lf,b.lf);
++  return {join(a.comma,b.comma)|lf,join(a.quotes,b.quotes),lf};
++}
++
++__attribute__((target("avx512f,avx512bw"),always_inline))
++inline OrdinalMasks ordinal_masks_wide(const char *p){
++  auto text=_mm512_loadu_si512(p);
++  uint64_t lf=_mm512_cmpeq_epi8_mask(text,_mm512_set1_epi8('\n'));
++  return {lf|_mm512_cmpeq_epi8_mask(text,_mm512_set1_epi8(',')),
++          _mm512_cmpeq_epi8_mask(text,_mm512_set1_epi8('"')),lf};
++}
++
++inline constexpr auto byte_positions=[] {
++  std::array<uint64_t,256> table{};
++  for(unsigned mask=0;mask<256;++mask){
++    unsigned n=0;
++    for(unsigned i=0;i<8;++i)if(mask&(1u<<i))table[mask]|=uint64_t(i)<<(8*n++);
++  }
++  return table;
++}();
++
++template<bool lookup>
++__attribute__((target("avx2,bmi,bmi2,popcnt,pclmul"),always_inline))
++inline void ordinal_positions(uint8_t *out,unsigned base,uint64_t sep){
++  if constexpr(lookup){
++    for(unsigned i=0;i<64;i+=8){
++      uint8_t marks=uint8_t(sep);sep>>=8;
++      uint64_t positions=byte_positions[marks]+uint64_t(base+i)*0x0101010101010101ULL;
++      std::memcpy(out,&positions,8);out+=std::popcount(marks);
++    }
++  }else{
++    while(sep){*out++=uint8_t(base+std::countr_zero(sep));sep&=sep-1;}
++  }
++}
++
++__attribute__((target("avx512f,avx512bw,avx512vbmi2"),always_inline))
++inline void ordinal_positions_wide(uint8_t *out,unsigned base,uint64_t sep){
++  alignas(64) static constexpr auto seq=[] {
++    std::array<uint8_t,64> out{};
++    for(unsigned i=0;i<64;++i)out[i]=uint8_t(i);
++    return out;
++  }();
++  auto offsets=_mm512_add_epi8(_mm512_load_si512(seq.data()),_mm512_set1_epi8(char(base)));
++  _mm512_storeu_si512(out,_mm512_maskz_compress_epi8(sep,offsets));
++}
++
++#include "ordinal_wide_tiles.hpp"
++#define ORDINAL_USE_WIDE 0
++#define ORDINAL_READER ordinal_rows
++#define ORDINAL_TARGET "avx2,bmi,bmi2,popcnt,pclmul"
++#include "ordinal_loop.inc"
++#undef ORDINAL_TARGET
++#undef ORDINAL_READER
++#undef ORDINAL_USE_WIDE
++#define ORDINAL_USE_WIDE 1
++#define ORDINAL_READER ordinal_wide_rows
++#define ORDINAL_TARGET "avx2,bmi,bmi2,popcnt,pclmul,avx512f,avx512bw,avx512vbmi2"
++#include "ordinal_loop.inc"
++#undef ORDINAL_TARGET
++#undef ORDINAL_READER
++#undef ORDINAL_USE_WIDE
++#endif
+--- /dev/null
++++ b/cpp/ordinal_loop.inc
+@@ -0,0 +1,53 @@
++// Instantiate the same grammar and emission loop with each runtime-checked ISA.
++template<size_t N,bool Lookup,class F>
++__attribute__((target(ORDINAL_TARGET))) void ORDINAL_READER(Str data,F &fn){
++  alignas(64) std::array<uint8_t,1+256+64> positions;
++  positions[0]=255;
++  auto *cuts=positions.data()+1;
++  while(data.size()>=256){
++    const char *p=data.data();
++    OrdinalMasks m[4];
++    for(unsigned b=0;b<4;++b){
++#if ORDINAL_USE_WIDE
++      m[b]=ordinal_masks_wide(p+b*64);
++#else
++      m[b]=ordinal_masks_avx2(p+b*64);
++#endif
++    }
++    unsigned blocks=4;
++    while(blocks && !m[blocks-1].newlines)--blocks;
++    if(!blocks){
++      auto lf=data.find('\n',256),n=lf==Str::npos?data.size():lf+1;
++      scalar_rows<N>(data.substr(0,n),fn);data.remove_prefix(n);continue;
++    }
++    unsigned length=64u*blocks-std::countl_zero(m[blocks-1].newlines);
++    uint64_t tail=mask_to(length-(blocks-1)*64);
++    m[blocks-1].separators&=tail;m[blocks-1].quotes&=tail;
++    uint64_t inside=0,prev=1,invalid=0;
++    unsigned nc=0;
++    for(unsigned b=0;b<blocks;++b){
++      auto [sep,q,lf]=m[b];
++      auto count=unsigned(std::popcount(sep));
++      uint64_t want=ordinal_newlines<N>[nc%N]&mask_to(count);
++      invalid|=_pext_u64(lf,sep)^want;
++      uint64_t parity=quote_prefix(q)^inside;
++      uint64_t next=b+1<blocks?(m[b+1].separators&1):1;
++      invalid|=((q&parity)&~((sep<<1)|prev))|((q&~parity)&~((sep>>1)|(next<<63)))|(sep&parity);
++      inside=uint64_t(0)-(parity>>63);prev=sep>>63;
++#if ORDINAL_USE_WIDE
++      ordinal_positions_wide(cuts+nc,b*64,sep);
++#else
++      ordinal_positions<Lookup>(cuts+nc,b*64,sep);
++#endif
++      nc+=count;
++    }
++    if(invalid || inside || nc%N){
++      tiled_lines<N,16>(data.substr(0,length),fn);
++    }else{
++      for(unsigned i=0;i<nc;i+=N){OrdinalFields row{p,cuts+i};fn(row);}
++    }
++    data.remove_prefix(length);
++  }
++  tiled_lines<N,16>(data,fn);
++}
++
+--- /dev/null
++++ b/cpp/ordinal_wide_tiles.hpp
+@@ -0,0 +1,67 @@
++#pragma once
++#ifdef SHOPPING_X86_CSV
++#include "trimmed_ordinals.hpp"
++#include "vertical_fields.hpp"
++// A tile may contain arbitrarily long fields. Every absolute delimiter offset
++// fits in 16 bits, including a newline at the very end of its register group.
++struct OrdinalFields16 {
++  const char *data;
++  const uint16_t *end;
++  Str operator[](size_t i) const {
++    unsigned start=uint16_t(end[std::ptrdiff_t(i)-1]+1);
++    unsigned cut=end[i],trim=data[start]=='"';
++    return {data+start+trim,cut-start-2*trim};
++  }
++  template<size_t N> operator std::array<Str,N>()const{
++    std::array<Str,N> out;
++    for(unsigned i=0;i<N;++i)out[i]=(*this)[i];
++    return out;
++  }
++};
++
++template<size_t N,class Row,class F>
++inline void emit_ordinal_row(const Row &row,F &fn) {
++  if constexpr(N==7 && requires{fn.common(static_cast<const char*>(nullptr),0u,static_cast<const char*>(nullptr),0u,Str{},Str{});}){
++    Str kind=row[4];
++    if(kind.size()==4 && (std::memcmp(kind.data(),"view",4)==0 || std::memcmp(kind.data(),"cart",4)==0)){
++      Str id=row[0],user=row[1],ingest=row[3];
++      if(id.size()-2<=7 && user.size()-2<=7 && ingest.size()==20 && !row[5].empty() &&
++         fn.common(id.data(),unsigned(id.size()),user.data(),unsigned(user.size()),row[2],ingest))return;
++    }
++  }
++  fn(row);
++}
++
++__attribute__((target("avx512f,avx512bw,avx512vbmi2"),always_inline))
++inline void save_positions16(uint16_t *out,uint16_t offset,uint64_t mask){
++  alignas(64) static constexpr auto sequence=[] {
++    std::array<uint8_t,64> s{};
++    for(unsigned i=0;i<64;++i)s[i]=uint8_t(i);
++    return s;
++  }();
++  auto packed=_mm512_maskz_compress_epi8(mask,_mm512_load_si512(sequence.data()));
++  auto origin=_mm512_set1_epi16(short(offset));
++  auto first=_mm512_cvtepu8_epi16(_mm512_castsi512_si256(packed));
++  _mm512_storeu_si512(out,_mm512_add_epi16(first,origin));
++  if(std::popcount(mask)>32){
++    auto high=_mm512_shuffle_i64x2(packed,packed,0xee);
++    auto second=_mm512_cvtepu8_epi16(_mm512_castsi512_si256(high));
++    _mm512_storeu_si512(out+32,_mm512_add_epi16(second,origin));
++  }
++}
++
++#define SHOP_ORD16_TARGET "avx2,bmi,bmi2,popcnt,pclmul"
++#define SHOP_ORD16_READER ordinal16_standard
++#define SHOP_ORD16_WIDE 0
++#include "ordinal_wide_tiles.inc"
++#undef SHOP_ORD16_TARGET
++#undef SHOP_ORD16_READER
++#undef SHOP_ORD16_WIDE
++#define SHOP_ORD16_TARGET "avx2,bmi,bmi2,popcnt,pclmul,avx512f,avx512bw"
++#define SHOP_ORD16_READER ordinal16_wide
++#define SHOP_ORD16_WIDE 1
++#include "ordinal_wide_tiles.inc"
++#undef SHOP_ORD16_TARGET
++#undef SHOP_ORD16_READER
++#undef SHOP_ORD16_WIDE
++#endif
+--- /dev/null
++++ b/cpp/ordinal_wide_tiles.inc
+@@ -0,0 +1,72 @@
++template<size_t N,unsigned Bytes,bool Direct,class F>
++__attribute__((target(SHOP_ORD16_TARGET))) void SHOP_ORD16_READER(Str data,F &fn){
++  static_assert(Bytes%64==0 && Bytes<=8192);
++  constexpr unsigned Words=Bytes/64;
++  alignas(64) std::array<uint16_t,Bytes+64> positions;
++  positions[0]=0;
++  uint16_t *cuts=positions.data()+1;
++  while(data.size()>=Bytes){
++    const char *text=data.data();
++    std::array<OrdinalMasks,Words> masks;
++    for(unsigned k=0;k<Words;++k){
++#if SHOP_ORD16_WIDE
++      masks[k]=ordinal_masks_wide(text+64*k);
++#else
++      masks[k]=ordinal_masks_avx2(text+64*k);
++#endif
++    }
++    unsigned words=Words;
++    while(words && !masks[words-1].newlines)--words;
++    if(!words){
++      auto lf=data.find('\n',Bytes);
++      size_t take=lf==Str::npos?data.size():lf+1;
++      scalar_rows<N>(data.substr(0,take),fn);
++      data.remove_prefix(take);
++      continue;
++    }
++    auto &last=masks[words-1];
++    unsigned length=words*64-std::countl_zero(last.newlines);
++    uint64_t tail=mask_to(length-(words-1)*64);
++    last.separators&=tail;last.quotes&=tail;
++    uint64_t inside=0,previous=1,invalid=0;
++    unsigned nc=0;
++    unsigned open=(text[0]=='"');
++    for(unsigned b=0;b<words;++b){
++      auto [sep,q,lf]=masks[b];
++      unsigned count=std::popcount(sep);
++      uint64_t want=ordinal_newlines<N>[nc%N]&mask_to(count);
++      invalid|=_pext_u64(lf,sep)^want;
++      uint64_t closed=(q<<1)|(b?(masks[b-1].quotes>>63):0);
++      uint64_t parity=quote_prefix(q)^inside;
++      uint64_t next=b+1<words?(masks[b+1].separators&1):1;
++      invalid|=((q&parity)&~((sep<<1)|previous))|((q&~parity)&~((sep>>1)|(next<<63)))|(sep&parity);
++      inside=uint64_t(0)-(parity>>63);previous=sep>>63;
++
++      auto *at=cuts+nc;
++      for(auto bits=sep;bits;bits&=bits-1){
++        unsigned j=std::countr_zero(bits);
++        *at++=uint16_t(2*(64*b+j+1)+((closed>>j)&1));
++      }
++
++      nc+=count;
++    }
++    if(invalid || inside || nc%N){
++      tiled_lines<N,16>(data.substr(0,length),fn);
++    }else {
++      unsigned i=0;
++      if constexpr(Direct && N==7 && requires{fn.common(text,2u,text,2u,Str{},Str{});}){
++        if constexpr(sizeof(uintptr_t)==8 && requires{fn.prepared(uint64_t{},uint64_t{},Str{},Str{});}){
++          if(__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("avx512dq"))
++            for(;nc-i>=56;i+=56)emit_key_batch(text,cuts+i,fn);
++        }
++        for(;nc-i>=56;i+=56)emit_shape_batch(text,cuts+i,fn);
++      }
++      for(;i<nc;i+=N){
++        std::conditional_t<(N==7),LaneFields,TrimmedFields> row{text,cuts+i};
++        if constexpr(Direct)emit_ordinal_row<N>(row,fn);else fn(row);
++      }
++    }
++    data.remove_prefix(length);
++  }
++  tiled_lines<N,16>(data,fn);
++}
+--- /dev/null
++++ b/cpp/quote_certificate.hpp
+@@ -0,0 +1,58 @@
++#pragma once
++#ifdef SHOPPING_X86_CSV
++__attribute__((target("avx2,pclmul"),always_inline)) inline uint64_t quote_prefix(uint64_t q){
++  auto value=_mm_cvtsi64_si128(std::bit_cast<int64_t>(q));
++  return uint64_t(_mm_cvtsi128_si64(_mm_clmulepi64_si128(value,_mm_set1_epi64x(-1),0)));
++}
++inline bool csv_separator(char c){return c==',' || c=='\n';}
++__attribute__((target("avx2,pclmul"),always_inline)) inline bool
++certify_quotes(const char *start,size_t n){
++  uint64_t inside=0,previous=1,invalid=0;
++  for(size_t i=0;i<n;i+=64){
++    const char *p=start+i;unsigned used=unsigned(std::min<size_t>(64,n-i));
++    alignas(32) char tail[64]{};
++    if(used<64){std::memcpy(tail,p,used);p=tail;}
++    auto a=_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
++    auto b=_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p+32));
++    auto join=[](__m256i x,__m256i y) __attribute__((target("avx2"),always_inline)) {
++      return uint64_t(unsigned(_mm256_movemask_epi8(x)))|(uint64_t(unsigned(_mm256_movemask_epi8(y)))<<32);
++    };
++    auto quote=_mm256_set1_epi8('"'),comma=_mm256_set1_epi8(','),lf=_mm256_set1_epi8('\n');
++    uint64_t q=join(_mm256_cmpeq_epi8(a,quote),_mm256_cmpeq_epi8(b,quote));
++    uint64_t sep=join(_mm256_or_si256(_mm256_cmpeq_epi8(a,comma),_mm256_cmpeq_epi8(a,lf)),
++                      _mm256_or_si256(_mm256_cmpeq_epi8(b,comma),_mm256_cmpeq_epi8(b,lf)));
++    uint64_t parity=quote_prefix(q)^inside;
++    auto opening=q&parity,closing=q&~parity;
++    uint64_t next=(i+64<n)?uint64_t(csv_separator(start[i+64])):uint64_t(1);
++    invalid|=(opening&~((sep<<1)|previous)) | (closing&~((sep>>1)|(next<<63))) | (sep&parity);
++    inside=uint64_t(0)-(parity>>63);previous=sep>>63;
++  }
++  return !(invalid|inside);
++}
++template<size_t N,class F>
++__attribute__((target("avx2,bmi,popcnt"),always_inline)) inline void
++split_certified(const char *p,unsigned len,const char *end,F &fn) {
++  if(len>=128 || end-p<128){split_known_line<N>(p,len,end,fn);return;}
++  auto marks=[&](unsigned at) __attribute__((target("avx2,bmi,popcnt"),always_inline)) {
++    auto comma=_mm256_set1_epi8(',');
++    auto a=_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p+at));
++    auto b=_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p+at+32));
++    return (uint64_t(unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a,comma))))|
++            (uint64_t(unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b,comma))))<<32))&mask_to(len-at);
++  };
++  uint64_t lo=marks(0),hi=len>64?marks(64):0;
++  if(std::popcount(lo)+std::popcount(hi)!=N-1)return;
++  std::array<Str,N> row;
++  unsigned from=0;
++  for(unsigned i=0;i<N;++i){
++    unsigned cut=len;
++    if(i+1<N){
++      if(lo){cut=std::countr_zero(lo);lo&=lo-1;}
++      else{cut=64+std::countr_zero(hi);hi&=hi-1;}
++    }
++    unsigned q=p[from]=='"';
++    row[i]=Str(p+from+q,cut-from-2*q);from=cut+1;
++  }
++  fn(row);
++}
++#endif
+--- a/cpp/rev_columns.hpp
++++ b/cpp/rev_columns.hpp
+@@ -1,57 +1,46 @@
+ #pragma once
+-// Store the event IDs and revision payloads in separate arrays within each
+-// block. Only identical IDs require an ingest comparison or a raw event
+-// location.
+-template <size_t Width> struct RevisionColumns {
++template<size_t Width> struct RevisionColumns {
+   struct Block {
+     uintptr_t keys[Width];
+-    std::array<uint32_t, 2> data[Width];
++    std::array<uint32_t,2> data[Width];
+   };
+   struct Bin {
+     Block *blocks{};
+-    size_t used{}, limit{};
++    size_t used{},limit{};
+     std::vector<Block> more;
+-    size_t size() const { return used; }
+-    size_t capacity() const { return limit + more.capacity() * Width; }
+-    const Block &block(size_t i) const {
+-      return i < limit ? blocks[i / Width] : more[(i - limit) / Width];
+-    }
+-    Key key(size_t i) const { return {block(i).keys[i % Width]}; }
++    size_t size() const{return used;}
++    size_t capacity() const{return limit+more.capacity()*Width;}
++    const Block &block(size_t i) const{return i<limit?blocks[i/Width]:more[(i-limit)/Width];}
++    Key key(size_t i) const{return {block(i).keys[i%Width]};}
+     RevisionIndex operator[](size_t i) const {
+-      const auto &b = block(i);
+-      auto j = i % Width;
+-      return {Key{b.keys[j]}, b.data[j][0], b.data[j][1]};
++      const auto &b=block(i);auto j=i%Width;
++      return {Key{b.keys[j]},b.data[j][0],b.data[j][1]};
+     }
+     void push_back(RevisionIndex r) {
+       Block *p;
+-      size_t j = used % Width;
+-      if (used < limit) {
+-        p = &blocks[used / Width];
+-        if (!j)
+-          ::new (static_cast<void *>(p)) Block;
+-      } else {
+-        if (!j)
+-          more.emplace_back();
+-        p = &more.back();
++      size_t j=used%Width;
++      if(used<limit){
++        p=&blocks[used/Width];
++        if(!j)::new(static_cast<void*>(p)) Block;
+       }
+-      p->keys[j] = r.id.bits;
+-      p->data[j] = {r.ingest, r.location};
+-      ++used;
++      else {
++        if(!j)more.emplace_back();
++        p=&more.back();
++      }
++      p->keys[j]=r.id.bits;p->data[j]={r.ingest,r.location};++used;
+     }
+-    void release() { std::vector<Block>().swap(more); }
++    void release(){std::vector<Block>().swap(more);}
+   };
+   PartitionSlab<Block> slab;
+-  std::array<Bin, shards> bins;
++  std::array<Bin,shards> bins;
+   void reserve(size_t count) {
+-    slab.reserve((count + Width - 1) / Width);
+-    for (size_t i = 0; i < bins.size(); ++i) {
+-      bins[i].blocks = slab[i].data;
+-      bins[i].limit = slab[i].limit * Width;
++    slab.reserve((count+Width-1)/Width);
++    for(size_t i=0;i<bins.size();++i){
++      bins[i].blocks=slab[i].data;bins[i].limit=slab[i].limit*Width;
+     }
+   }
+-  void release() { slab.release(); }
+-  Bin &operator[](size_t i) { return bins[i]; }
+-  const Bin &operator[](size_t i) const { return bins[i]; }
+-  auto begin() const { return bins.begin(); }
+-  auto end() const { return bins.end(); }
++  void release(){slab.release();}
++  Bin &operator[](size_t i){return bins[i];}
++  const Bin &operator[](size_t i)const{return bins[i];}
++  auto begin()const{return bins.begin();}auto end()const{return bins.end();}
+ };
+--- a/cpp/timeline_reuse.hpp
++++ b/cpp/timeline_reuse.hpp
+@@ -1,20 +1,15 @@
+ #pragma once
+ 
+-// Each worker gives up its revision storage after all duplicate winners are known.
+-// The storage remains mapped until every linked-person timeline is finished.
+ struct TimelineRegion {
+   std::byte *base{};
+   size_t bytes{};
+   std::atomic<size_t> offset{};
+   void *take(size_t need) {
+-    if (!base || !need || need > SIZE_MAX - 63)
+-      return nullptr;
+-    size_t aligned = (need + 63) & ~size_t(63),
+-           start = offset.load(std::memory_order_relaxed);
+-    while (aligned <= bytes - start) {
+-      if (offset.compare_exchange_weak(start, start + aligned,
+-                                       std::memory_order_relaxed))
+-        return base + start;
++    if (!base || !need || need>SIZE_MAX-63) return nullptr;
++    size_t aligned=(need+63)&~size_t(63), start=offset.load(std::memory_order_relaxed);
++    while (aligned<=bytes-start) {
++      if(offset.compare_exchange_weak(start,start+aligned,std::memory_order_relaxed))
++        return base+start;
+     }
+     return nullptr;
+   }
+@@ -23,36 +18,28 @@
+ // All survivors are written exactly once before any timeline is read.
+ // Placement array new starts every element's lifetime in the previously
+ // allocated revision pages. Only trivial destructors are supported here.
+-template <class T> struct TimelineArray {
+-  static_assert(std::is_trivially_destructible_v<T> && alignof(T) <= 64);
++template<class T> struct TimelineArray {
++  static_assert(std::is_trivially_destructible_v<T> && alignof(T)<=64);
+   T *data{};
+   size_t size{};
+   std::unique_ptr<T[]> owned;
+-  void prepare(size_t count, std::span<TimelineRegion> regions,
+-               unsigned owner) {
+-    size = count;
+-    if (!count)
+-      return;
+-    if (count > SIZE_MAX / sizeof(T))
+-      throw std::bad_array_new_length();
+-    void *memory = nullptr;
++  void prepare(size_t count,std::span<TimelineRegion> regions,unsigned owner){
++    size=count;
++    if(!count)return;
++    if(count>SIZE_MAX/sizeof(T))throw std::bad_array_new_length();
++    void *memory=nullptr;
+ #if SHOP_REUSE_REGION
+-    memory = regions[owner].take(count * sizeof(T));
++    memory=regions[owner].take(count*sizeof(T));
+ #if SHOP_LEND_REGION
+-    for (unsigned j = 1; !memory && j < regions.size(); ++j)
+-      memory = regions[(owner + j) % regions.size()].take(count * sizeof(T));
++    for(unsigned j=1;!memory && j<regions.size();++j)
++      memory=regions[(owner+j)%regions.size()].take(count*sizeof(T));
+ #endif
+ #else
+-    (void)regions;
+-    (void)owner;
++    (void)regions;(void)owner;
+ #endif
+-    if (memory)
+-      data = ::new (memory) T[count];
+-    else {
+-      owned = std::make_unique_for_overwrite<T[]>(count);
+-      data = owned.get();
+-    }
++    if(memory)data=::new(memory) T[count];
++    else {owned=std::make_unique_for_overwrite<T[]>(count);data=owned.get();}
+   }
+-  T &operator[](size_t i) { return data[i]; }
+-  std::span<T> view() { return {data, size}; }
++  T &operator[](size_t i){return data[i];}
++  std::span<T> view(){return {data,size};}
+ };
+--- /dev/null
++++ b/cpp/trimmed_ordinals.hpp
+@@ -0,0 +1,56 @@
++#pragma once
++
++// Each word encodes twice the position just after a separator, plus one if
++// its field ends in a quote. A certified field then has the same flag at
++// its opening and closing ends, even for an empty quoted value.
++struct TrimmedFields {
++  const char *data;
++  const uint16_t *end;
++  Str operator[](size_t i) const {
++    unsigned last=end[i], trim=last&1;
++    unsigned begin=end[std::ptrdiff_t(i)-1]>>1;
++    return {data+begin+trim, (last>>1)-1-begin-2*trim};
++  }
++  template<size_t N> operator std::array<Str,N>() const {
++    std::array<Str,N> values;
++    for(size_t i=0;i<N;++i) values[i]=(*this)[i];
++    return values;
++  }
++};
++struct LaneFields {
++  const char *data;
++  std::array<uint16_t,8> begins,lengths;
++  LaneFields(const char *text,const uint16_t *cuts):data(text) {
++    auto words=_mm_loadu_si128(reinterpret_cast<const __m128i*>(cuts-1));
++    auto end=_mm_srli_si128(words,2), begin=_mm_srli_epi16(words,1);
++    auto ones=_mm_set1_epi16(1), trim=_mm_and_si128(end,ones);
++    auto width=_mm_sub_epi16(_mm_sub_epi16(_mm_srli_epi16(end,1),ones),begin);
++    _mm_storeu_si128(reinterpret_cast<__m128i*>(begins.data()),_mm_add_epi16(begin,trim));
++    _mm_storeu_si128(reinterpret_cast<__m128i*>(lengths.data()),_mm_sub_epi16(width,_mm_add_epi16(trim,trim)));
++  }
++  Str operator[](size_t i)const{return {data+begins[i],lengths[i]};}
++  template<size_t N> operator std::array<Str,N>()const{
++    std::array<Str,N> values;
++    for(size_t i=0;i<N;++i)values[i]=(*this)[i];
++    return values;
++  }
++};
++__attribute__((target("avx512f,avx512bw,avx512vbmi2"),always_inline)) inline void
++save_trimmed_positions(uint16_t *out,unsigned base,uint64_t separators,uint64_t closed) {
++  alignas(64) static constexpr auto sequence=[] {
++    std::array<uint8_t,64> values{};
++    for(unsigned i=0;i<64;++i)values[i]=uint8_t(2*i);
++    return values;
++  }();
++  auto base_offsets=_mm512_load_si512(sequence.data());
++  auto marked=_mm512_mask_add_epi8(base_offsets,closed,base_offsets,_mm512_set1_epi8(1));
++  auto packed=_mm512_maskz_compress_epi8(separators,marked);
++  auto origin=_mm512_set1_epi16(short(2*(base+1)));
++  auto lower=_mm512_cvtepu8_epi16(_mm512_castsi512_si256(packed));
++  _mm512_storeu_si512(out,_mm512_add_epi16(lower,origin));
++  if(std::popcount(separators)>32){
++    auto high=_mm512_shuffle_i64x2(packed,packed,0xee);
++    auto upper=_mm512_cvtepu8_epi16(_mm512_castsi512_si256(high));
++    _mm512_storeu_si512(out+32,_mm512_add_epi16(upper,origin));
++  }
++}
+--- /dev/null
++++ b/cpp/vertical_fields.hpp
+@@ -0,0 +1,108 @@
++#pragma once
++
++#define SHOP_ROWBATCH __attribute__((target("avx2,bmi,bmi2,popcnt,pclmul"),always_inline)) inline
++#define SHOP_KEYBATCH __attribute__((target("avx2,bmi,bmi2,popcnt,pclmul,avx512f,avx512bw,avx512dq")))
++
++struct EightEventFields {
++  __m128i begins[6], widths[6], eligible;
++  // Each row contains the previous line end and the seven current ends. Every
++  // index stores twice the next start and the field's verified quote flag.
++  SHOP_ROWBATCH explicit EightEventFields(const uint16_t *cuts) {
++    __m128i pairs[8],quads[8],columns[8];
++    for(unsigned i=0;i<4;++i){
++      auto a=_mm_loadu_si128(reinterpret_cast<const __m128i *>(cuts+14*i-1));
++      auto b=_mm_loadu_si128(reinterpret_cast<const __m128i *>(cuts+14*i+6));
++      pairs[2*i]=_mm_unpacklo_epi16(a,b);
++      pairs[2*i+1]=_mm_unpackhi_epi16(a,b);
++    }
++    for(unsigned i=0;i<2;++i)for(unsigned j=0;j<2;++j){
++      auto a=pairs[4*i+j],b=pairs[4*i+j+2];
++      quads[4*i+2*j]=_mm_unpacklo_epi32(a,b);
++      quads[4*i+2*j+1]=_mm_unpackhi_epi32(a,b);
++    }
++    for(unsigned i=0;i<4;++i){
++      columns[2*i]=_mm_unpacklo_epi64(quads[i],quads[i+4]);
++      columns[2*i+1]=_mm_unpackhi_epi64(quads[i],quads[i+4]);
++    }
++    auto one=_mm_set1_epi16(1);
++    for(unsigned i=0;i<6;++i){
++      auto left=_mm_srli_epi16(columns[i],1);
++      auto end=columns[i+1],trim=_mm_and_si128(end,one);
++      begins[i]=_mm_add_epi16(left,trim);
++      auto raw=_mm_sub_epi16(_mm_sub_epi16(_mm_srli_epi16(end,1),one),left);
++      widths[i]=_mm_sub_epi16(raw,_mm_add_epi16(trim,trim));
++    }
++    auto short_id=[](__m128i width){
++      return _mm_and_si128(_mm_cmpgt_epi16(width,_mm_set1_epi16(1)),
++                           _mm_cmpgt_epi16(_mm_set1_epi16(10),width));
++    };
++    eligible=_mm_and_si128(short_id(widths[0]),short_id(widths[1]));
++    eligible=_mm_and_si128(eligible,_mm_cmpeq_epi16(widths[3],_mm_set1_epi16(20)));
++    eligible=_mm_and_si128(eligible,_mm_cmpeq_epi16(widths[4],_mm_set1_epi16(4)));
++    eligible=_mm_and_si128(eligible,_mm_cmpgt_epi16(widths[5],_mm_setzero_si128()));
++  }
++  SHOP_ROWBATCH unsigned common_kinds(const char *base) const {
++    auto valid=_mm256_cvtepi16_epi32(eligible);
++    auto words=_mm256_mask_i32gather_epi32(_mm256_setzero_si256(),reinterpret_cast<const int *>(base),
++                                           _mm256_cvtepu16_epi32(begins[4]),valid,1);
++    auto view=_mm256_cmpeq_epi32(words,_mm256_set1_epi32(0x77656976));
++    auto cart=_mm256_cmpeq_epi32(words,_mm256_set1_epi32(0x74726163));
++    return unsigned(_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_or_si256(view,cart))));
++  }
++  static void save(uint16_t (&out)[8],__m128i v){
++    _mm_storeu_si128(reinterpret_cast<__m128i *>(out),v);
++  }
++};
++
++template<class F>
++__attribute__((target("avx2,bmi,bmi2,popcnt,pclmul"))) inline void
++emit_shape_batch(const char *base,const uint16_t *cuts,F &fn){
++  EightEventFields fields(cuts);
++  unsigned mask=fields.common_kinds(base);
++  uint16_t id[8],user[8],ew[8],uw[8],ts[8],tw[8],arrival[8];
++  fields.save(id,fields.begins[0]);fields.save(ew,fields.widths[0]);
++  fields.save(user,fields.begins[1]);fields.save(uw,fields.widths[1]);
++  fields.save(ts,fields.begins[2]);fields.save(tw,fields.widths[2]);fields.save(arrival,fields.begins[3]);
++  for(unsigned i=0;i<8;++i){
++    if((mask&(1u<<i)) && fn.common(base+id[i],ew[i],base+user[i],uw[i],Str(base+ts[i],tw[i]),Str(base+arrival[i],20)))continue;
++    fn(TrimmedFields{base,cuts+7*i});
++  }
++}
++
++SHOP_KEYBATCH inline __m512i eight_key_hashes(const char *text,__m128i starts,__m128i widths,
++                                               char expected,__mmask8 &live){
++  auto offsets=_mm256_cvtepu16_epi32(starts);
++  auto enabled=_mm256_sllv_epi32(_mm256_set1_epi32(int(live)),_mm256_setr_epi32(31,30,29,28,27,26,25,24));
++  auto prefix=_mm256_mask_i32gather_epi32(_mm256_setzero_si256(),reinterpret_cast<const int *>(text),
++                offsets,enabled,1);
++  auto matches=_mm256_cmpeq_epi32(_mm256_and_si256(prefix,_mm256_set1_epi32(255)),_mm256_set1_epi32(expected));
++  live&=__mmask8(_mm256_movemask_ps(_mm256_castsi256_ps(matches)));
++  auto words=_mm512_mask_i32gather_epi64(_mm512_setzero_si512(),live,offsets,text+1,1);
++  auto lengths=_mm512_cvtepu16_epi64(widths);
++  auto remainder=_mm512_slli_epi64(_mm512_sub_epi64(_mm512_set1_epi64(9),lengths),3);
++  auto suffix=_mm512_and_si512(words,_mm512_srlv_epi64(_mm512_set1_epi64(-1),remainder));
++  auto last_shift=_mm512_slli_epi64(_mm512_sub_epi64(lengths,_mm512_set1_epi64(2)),3);
++  auto last=_mm512_and_si512(_mm512_srlv_epi64(suffix,last_shift),_mm512_set1_epi64(255));
++  live&=_mm512_cmpneq_epi64_mask(last,_mm512_setzero_si512());
++  live&=_mm512_cmpge_epi64_mask(suffix,_mm512_setzero_si512());
++  auto mixed=_mm512_xor_si512(suffix,_mm512_srli_epi64(suffix,27));
++  auto product=_mm512_mullo_epi64(mixed,_mm512_set1_epi64(static_cast<long long>(0x9e3779b97f4a7c15ULL)));
++  auto low=_mm512_and_si512(product,_mm512_set1_epi64(INT64_MAX));
++  return _mm512_slli_epi64(_mm512_xor_si512(low,_mm512_srli_epi64(low,31)),1);
++}
++template<class F> SHOP_KEYBATCH inline void emit_key_batch(const char *base,const uint16_t *cuts,F &fn){
++  EightEventFields fields(cuts);
++  __mmask8 mask=__mmask8(fields.common_kinds(base));
++  auto ids=eight_key_hashes(base,fields.begins[0],fields.widths[0],'e',mask);
++  auto users=eight_key_hashes(base,fields.begins[1],fields.widths[1],'u',mask);
++  uint64_t id[8],user[8];
++  uint16_t ts[8],tw[8],arrival[8];
++  _mm512_storeu_si512(id,ids);_mm512_storeu_si512(user,users);
++  fields.save(ts,fields.begins[2]);fields.save(tw,fields.widths[2]);fields.save(arrival,fields.begins[3]);
++  for(unsigned i=0;i<8;++i){
++    if(mask&(1u<<i))fn.prepared(id[i],user[i],Str(base+ts[i],tw[i]),Str(base+arrival[i],20));
++    else fn(TrimmedFields{base,cuts+7*i});
++  }
++}
++#undef SHOP_KEYBATCH
++#undef SHOP_ROWBATCH

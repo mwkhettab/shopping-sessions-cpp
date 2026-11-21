@@ -1,0 +1,337 @@
+--- /dev/null
++++ b/cpp/alias_chain.hpp
+@@ -0,0 +1,80 @@
++#pragma once
++
++// Deduplication is complete before grouping begins. Each source pair now
++// belongs to one alias, then to exactly one connected component.
++template <class T, unsigned Block> struct AliasChain {
++  using Pair = std::pair<Key, T>;
++  struct Chunk {
++    Chunk *previous;
++    T values[Block ? Block : 1];
++  };
++  void *tail{};
++  size_t count{};
++
++  std::span<T> contiguous() const {
++    if constexpr (Block) {
++      if (count && count <= Block)
++        return {static_cast<Chunk *>(tail)->values, count};
++    } else if (count == 1) {
++      return {&static_cast<Pair *>(tail)->second, 1};
++    }
++    return {};
++  }
++  void copy_to(std::span<T> output) const {
++    size_t left = count;
++    if constexpr (Block) {
++      auto *node = static_cast<Chunk *>(tail);
++      while (left) {
++        size_t used = 1 + (left - 1) % Block;
++        left -= used;
++        std::copy_n(node->values, used, output.data() + left);
++        node = node->previous;
++      }
++    } else {
++      auto *node = static_cast<Pair *>(tail);
++      while (left) {
++        output[--left] = node->second;
++        uintptr_t link = node->first.bits;
++        node = link ? reinterpret_cast<Pair *>(link) : nullptr;
++      }
++    }
++  }
++  std::span<T> materialize(std::vector<T> &scratch) const {
++    auto span = contiguous();
++    if (span.size() == count) return span;
++    if (scratch.size() < count) scratch.resize(count);
++    auto result = std::span(scratch).first(count);
++    copy_to(result);
++    return result;
++  }
++};
++
++template <class T, unsigned Block> struct AliasChainWriter {
++  using Chain = AliasChain<T, Block>;
++  using Chunk = typename Chain::Chunk;
++  static constexpr size_t per_page = std::max<size_t>(16, 16384 / sizeof(Chunk));
++  std::vector<TimelineArray<Chunk>> pages;
++  size_t next = per_page;
++
++  void append(Chain &chain, typename Chain::Pair &record,
++              std::span<TimelineRegion> regions, unsigned owner) {
++    if constexpr (Block) {
++      size_t position = chain.count % Block;
++      auto *node = static_cast<Chunk *>(chain.tail);
++      if (position == 0) {
++        if (next == per_page) {
++          pages.emplace_back().prepare(per_page, regions, owner);
++          next = 0;
++        }
++        auto *fresh = &pages.back()[next++];
++        fresh->previous = node;
++        chain.tail = node = fresh;
++      }
++      node->values[position] = record.second;
++    } else {
++      record.first.bits = chain.tail ? reinterpret_cast<uintptr_t>(chain.tail) : 0;
++      chain.tail = &record;
++    }
++    ++chain.count;
++  }
++};
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -27,6 +27,11 @@
+ #include "partition_slab.hpp"
+ #include "rev_columns.hpp"
+ #include "grouped_control.hpp"
++#define SHOP_REUSE_REGION 1
++#define SHOP_LEND_REGION 1
++#include "timeline_reuse.hpp"
++#include "alias_chain.hpp"
++inline constexpr unsigned event_block = 0, click_block = 0;
+ template <class Layout> struct ScanWorker {
+   using EventData = typename Layout::E;
+   using ClickData = typename Layout::C;
+@@ -39,8 +44,8 @@
+     Key name;
+     Vertex *parent, *next;
+     size_t weight;
+-    std::span<EventData> events;
+-    std::span<ClickData> clicks;
++    AliasChain<EventData,event_block> events;
++    AliasChain<ClickData,click_block> clicks;
+   };
+   std::vector<std::array<Vertex *, 2>> edges;
+   Bins<std::pair<Key, size_t>> endpoints;
+@@ -403,9 +408,7 @@
+   });
+   // Let the raw grouping pass reclaim the mapped revision pages.
+ }
+-#define SHOP_REUSE_REGION 1
+-#define SHOP_LEND_REGION 1
+-#include "timeline_reuse.hpp"
++
+ template <class Layout>
+ void process_people(std::vector<ScanWorker<Layout>> &workers,
+                     std::vector<Result> &results, const Catalog &cat,
+@@ -424,8 +427,8 @@
+     }
+   }
+   struct Store {
+-    TimelineArray<E> events;
+-    TimelineArray<C> clicks;
++    AliasChainWriter<E,event_block> events;
++    AliasChainWriter<C,click_block> clicks;
+   };
+   std::array<Store, shards> storage;
+   std::array<std::vector<Vertex>, shards> vertices;
+@@ -433,7 +436,8 @@
+     MEASURE(grouping);
+     struct Group {
+       Key key;
+-      size_t event_end{}, click_end{};
++      AliasChain<E,event_block> events;
++      AliasChain<C,click_block> clicks;
+       size_t vertex{};
+     };
+     struct Slot {
+@@ -468,27 +472,21 @@
+       }
+       return x.group;
+     };
+-    // First count each alias, then scatter into disjoint contiguous spans.
+-    // A linked person may own spans in several of these raw-user shards.
+-    auto &store = storage[b];
+-    size_t event_count = 0, click_count = 0;
+-    for (auto &w : workers) {
+-      for (auto part : w.events[b].spans())
+-        for (auto &[u, e] : part) {
+-          if (!u.bits) {
+-            u.bits = UINTPTR_MAX;
+-            continue;
++    auto &store=storage[b];
++    for(auto &w:workers) {
++      for(auto part:w.events[b].spans())
++        for(auto &record:part)
++          if(record.first.bits){
++            auto &group=groups[intern(record.first)];
++            store.events.append(group.events,record,pool,t);
+           }
+-          u.bits = intern(Key{u.bits});
+-          ++groups[u.bits].event_end;
+-          ++event_count;
++      if constexpr(event_block)w.events[b].release();
++      for(auto part:w.clicks[b].spans())
++        for(auto &record:part){
++          auto &group=groups[intern(record.first)];
++          store.clicks.append(group.clicks,record,pool,t);
+         }
+-      for (auto part : w.clicks[b].spans())
+-        for (auto &[u, c] : part) {
+-          u.bits = intern(Key{u.bits});
+-          ++groups[u.bits].click_end;
+-        }
+-      click_count += w.clicks[b].size();
++      if constexpr(click_block)w.clicks[b].release();
+     }
+     auto &nodes = vertices[b];
+     size_t nv = 0;
+@@ -506,62 +504,24 @@
+       typename std::remove_reference_t<decltype(w.endpoints)>::value_type()
+           .swap(w.endpoints[b]);
+     }
+-    store.events.prepare(event_count, pool, t);
+-    store.clicks.prepare(click_count, pool, t);
+-    size_t event_offset = 0, click_offset = 0;
+-    for (auto &g : groups) {
+-      auto events_in_group = g.event_end, clicks_in_group = g.click_end;
+-      g.event_end = event_offset;
+-      g.click_end = click_offset;
+-      event_offset += events_in_group;
+-      click_offset += clicks_in_group;
+-    }
+-    for (auto &w : workers) {
+-      for (auto part : w.events[b].spans())
+-        for (auto &[u, e] : part)
+-          if (u.bits != UINTPTR_MAX)
+-            store.events[groups[u.bits].event_end++] = e;
+-      for (auto part : w.clicks[b].spans())
+-        for (auto &[u, c] : part)
+-          store.clicks[groups[u.bits].click_end++] = c;
+-      w.events[b].release();
+-      w.clicks[b].release();
+-    }
+-    event_offset = click_offset = 0;
+-    for (auto &g : groups) {
+-      auto ev =
+-          store.events.view().subspan(event_offset, g.event_end - event_offset);
+-      auto cl =
+-          store.clicks.view().subspan(click_offset, g.click_end - click_offset);
+-      if (g.vertex) {
+-        auto &v = nodes[g.vertex - 1];
+-        v = {g.key, &v, &v, 1, ev, cl};
+-      } else
+-        summarize(g.key, ev, cl, cat, results[t], layout);
+-      event_offset = g.event_end;
+-      click_offset = g.click_end;
++    std::vector<E> scratch_events;
++    std::vector<C> scratch_clicks;
++    for(auto &g:groups){
++      if(g.vertex){
++        auto &v=nodes[g.vertex-1];
++        v={g.key,&v,&v,1,g.events,g.clicks};
++      }else if(g.events.count){
++        auto ev=g.events.materialize(scratch_events);
++        auto cl=g.clicks.materialize(scratch_clicks);
++        summarize(g.key,ev,cl,cat,results[t],layout);
++      }
+     }
+   });
+-  for (auto &w : workers) {
+-    w.events.release();
+-    w.clicks.release();
++  for(auto &w:workers){
++    if constexpr(event_block)w.events.release();
++    if constexpr(click_block)w.clicks.release();
+   }
+   timer.mark("raw user grouping, link endpoints and singleton sessions");
+-  if (std::getenv("SHOP_RECYCLE_TRACE")) {
+-    size_t assigned = 0, heap = 0;
+-    for (auto &store : storage) {
+-      auto count = [&](auto &entries) {
+-        size_t n = entries.size * sizeof(*entries.data);
+-        assigned += n;
+-        if (entries.owned)
+-          heap += n;
+-      };
+-      count(store.events);
+-      count(store.clicks);
+-    }
+-    std::cerr << "SHOP_TIMELINE_REUSE " << assigned - heap << " " << heap
+-              << "\n";
+-  }
+ 
+   // Roots move strictly downward in bytewise order. Path splitting keeps long
+   // chains short even while other edge workers are linking components.
+@@ -622,49 +582,44 @@
+     for (auto &head : vertices[b]) {
+       if (head.parent != &head)
+         continue;
++      size_t ne=0,nc=0;
+       std::span<E> ev;
+       std::span<C> cl;
+-      size_t event_count = 0, click_count = 0;
+-      Vertex *v = &head;
++      auto *v=&head;
+       do {
+-        if (!v->events.empty()) {
+-          ev = v->events;
+-          event_count += ev.size();
++        if(v->events.count){ne+=v->events.count;ev=v->events.contiguous();}
++        if(v->clicks.count){nc+=v->clicks.count;cl=v->clicks.contiguous();}
++        v=v->next;
++      }while(v!=&head);
++      if(!ne)continue;
++      bool gather_e=ne!=ev.size(),gather_c=nc!=cl.size();
++      if(gather_e || gather_c){
++        if(gather_e){
++          if(events_buffer.size()<ne)events_buffer.resize(ne);
++          ev=std::span(events_buffer).first(ne);
+         }
+-        if (!v->clicks.empty()) {
+-          cl = v->clicks;
+-          click_count += cl.size();
++        if(gather_c){
++          if(click_buffer.size()<nc)click_buffer.resize(nc);
++          cl=std::span(click_buffer).first(nc);
+         }
+-        v = v->next;
+-      } while (v != &head);
+-      if (!event_count)
+-        continue;
+-      if (event_count > ev.size() || click_count > cl.size()) {
+-        bool merge_e = event_count > ev.size(),
+-             merge_c = click_count > cl.size();
+-        events_buffer.clear();
+-        click_buffer.clear();
+-        if (merge_e)
+-          events_buffer.reserve(event_count);
+-        if (merge_c)
+-          click_buffer.reserve(click_count);
+-        do {
+-          if (merge_e)
+-            events_buffer.insert(events_buffer.end(), v->events.begin(),
+-                                 v->events.end());
+-          if (merge_c)
+-            click_buffer.insert(click_buffer.end(), v->clicks.begin(),
+-                                v->clicks.end());
+-          v = v->next;
+-        } while (v != &head);
+-        if (merge_e)
+-          ev = events_buffer;
+-        if (merge_c)
+-          cl = click_buffer;
++        size_t ei=0,ci=0;
++        do{
++          if(gather_e && v->events.count){
++            v->events.copy_to(ev.subspan(ei,v->events.count));ei+=v->events.count;
++          }
++          if(gather_c && v->clicks.count){
++            v->clicks.copy_to(cl.subspan(ci,v->clicks.count));ci+=v->clicks.count;
++          }
++          v=v->next;
++        }while(v!=&head);
+       }
+       summarize(head.name, ev, cl, cat, results[t], layout);
+     }
+   });
++  for(auto &w:workers){
++    if constexpr(!event_block){for(auto &bucket:w.events.buckets)bucket.release();w.events.release();}
++    if constexpr(!click_block){for(auto &bucket:w.clicks.buckets)bucket.release();w.clicks.release();}
++  }
+   timer.mark("linked-person sessions, attribution and aggregation");
+ }
+ 
