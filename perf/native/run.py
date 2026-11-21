@@ -31,7 +31,7 @@ def main():
     model=next(x.split(':',1)[1].strip() for x in cpu if x.startswith('model name'))
     flags=next(x.split(':',1)[1].split() for x in cpu if x.startswith('flags'))
     note('Hardware',f'{model}, {env["NCPU"]} workers, affinity {sorted(os.sched_getaffinity(0))}, AVX-512BW {"avx512bw" in flags}.')
-    note("Control","Official 1.13-second commit 8430241e49a4147b9b42dffce4cf21a4088eb5ff, byte-checked sources.")
+    note("Control","Official 0.99-second commit 33fb788bf962900617e8c0455d366f7f0a5d7eeb, byte-checked sources. A second independently trained build measures build variance.")
     candidates=(root/'perf/native/candidates.txt').read_text().split()
     if 'avx512bw' not in flags: candidates=[n for n in candidates if not n.startswith('v512')]
     binaries=[]
@@ -43,10 +43,10 @@ def main():
             shutil.copytree(root/'cpp',src/'cpp',dirs_exist_ok=True)
             shutil.copy2(root/'build.sh',src/'build.sh')
             if name not in ('haswell','skylake'):
-                revision='clean-graphpages' if name=='base' else name
+                revision='fin-slabkey-pgo' if name=='base' else name
                 with (root/f'perf/native/{revision}.patch').open('rb') as patch:
                     subprocess.run(['patch','-s','-p1'],cwd=src,stdin=patch,check=True)
-            if name=='base': run('sha256sum','--check',root/'perf/native/official-113.sha256',cwd=src)
+            if name=='base': run('sha256sum','--check',root/'perf/native/official-099.sha256',cwd=src)
             compiler=shutil.which('g++-12') or shutil.which('g++')
             if name in ('haswell','skylake'):
                 wrapper=src/'cxx'
@@ -57,7 +57,7 @@ def main():
                 compiler=str(wrapper)
             if (src/'cpp/flat_parquet.hpp').exists():
                 shutil.copy2(root/'perf/native/standalone-build.sh',src/'build.sh')
-            mode=name.rsplit('-',1)[-1]
+            mode='pgo' if name=='base' else name.rsplit('-',1)[-1]
             if mode in ('pgo','lto'):
                 shutil.copy2(root/'perf/native/tuned-build.sh',src/'build.sh')
                 (src/'perf').mkdir(exist_ok=True)
@@ -71,6 +71,7 @@ def main():
             run(compiler,'-std=c++20','-O2',str(localtests/'input.cpp'),'-o',unit)
             run(unit)
             run(python,root/'verify.py',binary,area/'dev','--starter',area/'starter-pyspark','--answer',area/'dev-answer')
+            run(python,root/'perf/native/random_rules.py',binary)
             binaries.append(binary)
         except (subprocess.CalledProcessError,OSError) as exc:
             if name=='base': raise
@@ -167,6 +168,8 @@ def main():
                 (outcomes/'profile.txt').write_text(proc.stderr)
                 note('Profile '+best.name,' '.join(proc.stderr.splitlines()[-12:])[-1150:])
         publish()
+    from input_profile import collect
+    collect(root,area,'base',note,run,env)
     from extra_checks import scaling, race
     scaling(root,area,practice_winner,note,run,env)
     from native_images import verify_images

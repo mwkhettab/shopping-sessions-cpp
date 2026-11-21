@@ -1,1 +1,1 @@
-base fin-slabkey-pgo shapebare-pgo shape1024-pgo shape4096-pgo shape16384-pgo localblocks8-pgo localblocks64-pgo
+base fin-slabkey-pgo spanbins-pgo chaincompact-pgo chainbins-pgo
