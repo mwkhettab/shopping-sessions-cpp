@@ -25,7 +25,8 @@ template<class C> [[gnu::noinline]] void link_slow(C& c,std::string_view buf,std
 }
 struct alignas(64) LkRow {
     std::array<u8,32> e{},m{};
-    i64 offa=-1,offb=0;
+    i64 offa{},offb{};
+    // A recognized link shape has at least one base36 digit in each ID.
     u64 na=0,nb=0;
     std::array<u64,4> pad{};
 };
@@ -57,7 +58,7 @@ PIPELINE_ROUTING_X64 inline int lk_loop_x64(const char*& p,const char* lim,LkBat
         const auto row=_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
         auto nl=std::countr_zero(u32(_mm256_movemask_epi8(_mm256_cmpeq_epi8(row,lf))));
         auto cp=std::countr_zero(u32(_mm256_movemask_epi8(_mm256_cmpeq_epi8(row,cm))));
-        const auto& pat=LKP[nl*16+cp]; if(pat.offa<0) return 1;
+        const auto& pat=LKP[nl*16+cp]; if(!pat.na) return 1;
         const auto diff=_mm256_xor_si256(row,_mm256_load_si256(reinterpret_cast<const __m256i*>(pat.e.data())));
         if(!_mm256_testz_si256(diff,_mm256_load_si256(reinterpret_cast<const __m256i*>(pat.m.data())))) return 1;
         std::memcpy(&lb.a[n],p+pat.offa,8);std::memcpy(&lb.b[n],p+pat.offb,8);
@@ -112,7 +113,7 @@ inline int lk_loop(const char*& p,const char* lim,LkBatch& lb,std::size_t& n) {
     if(routing_x64()) return lk_loop_x64(p,lim,lb,n);
 #endif
     while(p<=lim) {
-        const auto [nl,cm]=lk_shape(p);const auto& pat=LKP[nl*16+cm]; if(pat.offa<0) return 1;
+        const auto [nl,cm]=lk_shape(p);const auto& pat=LKP[nl*16+cm]; if(!pat.na) return 1;
         for(std::size_t i=0;i<32;++i) if((u8(p[i])^pat.e[i])&pat.m[i]) return 1;
         std::memcpy(&lb.a[n],p+pat.offa,8);std::memcpy(&lb.b[n],p+pat.offb,8);
         lb.na[n]=pat.na;lb.nb[n]=pat.nb;lb.at[n]=std::uintptr_t(p);p+=nl+1;

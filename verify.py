@@ -16,6 +16,7 @@ binary = args.binary.resolve()
 scripts = args.starter / "scripts"
 subprocess.run([sys.executable, scripts / "run_fixtures.py", args.starter / "fixtures", "--", binary], check=True)
 subprocess.run([sys.executable, root / "tests/catalog.py", binary], check=True)
+subprocess.run([sys.executable, root / "tests/pipeline/long_link.py", binary], check=True)
 with tempfile.TemporaryDirectory() as out:
     subprocess.run([binary, args.dev, out], check=True)
     subprocess.run([sys.executable, scripts / "compare.py", out, args.answer], check=True)
