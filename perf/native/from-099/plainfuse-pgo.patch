@@ -1,0 +1,464 @@
+--- a/cpp/flat_parquet.hpp
++++ b/cpp/flat_parquet.hpp
+@@ -285,59 +285,85 @@
+ }
+ } // namespace flat_parquet
+ 
+-inline void write_users(const fs::path &path,
+-                        const std::vector<UserDay> &data) {
+-  MEASURE(parquet_write);
+-  using namespace flat_parquet;
+-  static constexpr Column cols[] = {
+-      {"user_id", 6, 0}, {"day", 1, 6},        {"sessions", 2},
+-      {"events", 2},     {"revenue_cents", 2}, {"top_category", 6, 0, true}};
+-  File file(path, cols);
+-  std::span<const UserDay> rows(data);
+-  std::array<Bytes, 6> pages;
+-  while (!rows.empty()) {
+-    size_t n = batch(rows, [](auto &r) {
+-      return (r.user.indirect() ? r.user.view().size() : 9) +
+-             (r.category ? r.category->size() : 0);
+-    });
+-    for (auto &p : pages) {
+-      p.clear();
+-      p.reserve(n * 12);
+-    }
+-    auto defs = levels(pages[5], n);
+-    for (size_t i = 0; i < n; ++i) {
+-      const auto &r = rows[i];
+-      std::array<char, 9> scratch;
+-      plain_string(pages[0], r.user.user_text(scratch));
+-      little(pages[1], r.day);
+-      little(pages[2], r.sessions);
+-      little(pages[3], r.events);
+-      little(pages[4], r.revenue);
+-      if (r.category) {
+-        auto &value = pages[5][defs + i / 8];
+-        value = char(static_cast<unsigned char>(value) | (1u << (i % 8)));
+-        plain_string(pages[5], *r.category);
+-      }
+-    }
+-    file.group(n);
+-    Bytes packed;
+-    for (size_t col = 0; col < pages.size(); ++col) {
+-      if (cols[col].physical == 6)
+-        file.page(pages[col]);
+-      else {
+-        packed.clear();
+-        packed.reserve(n * 4);
+-        if (cols[col].physical == 1)
+-          delta_pack<int32_t>(packed, pages[col]);
+-        else
+-          delta_pack<int64_t>(packed, pages[col]);
+-        file.page(packed, 5);
+-      }
+-    }
+-    rows = rows.subspan(n);
+-  }
+-  file.close();
+-}
++class UserFile {
++  using Bytes = flat_parquet::Bytes;
++  static constexpr flat_parquet::Column columns[] = {
++      {"user_id", 6, 0}, {"day", 1, 6}, {"sessions", 2}, {"events", 2},
++      {"revenue_cents", 2}, {"top_category", 6, 0, true}};
++  static constexpr size_t max_rows = 16384;
++  static constexpr size_t max_text_bytes = 8u << 20;
++
++  flat_parquet::File file;
++  std::array<Bytes, 6> values;
++  Bytes definitions, encoded;
++  size_t rows{}, text_bytes{};
++  std::array<char, 9> inline_name;
++  Key previous_user{};
++  Str user_name;
++
++  void flush() {
++    if (!rows)
++      return;
++    MEASURE(parquet_write);
++    file.group(rows);
++    file.page(values[0]);
++    for (size_t column = 1; column < 5; ++column) {
++      encoded.clear();
++      if (column == 1)
++        flat_parquet::delta_pack<int32_t>(encoded, values[column]);
++      else
++        flat_parquet::delta_pack<int64_t>(encoded, values[column]);
++      file.page(encoded, 5);
++    }
++    // Optional string pages place definition levels before the present values.
++    encoded.clear();
++    const size_t first = flat_parquet::levels(encoded, rows);
++    std::memcpy(encoded.data() + first, definitions.data(), definitions.size());
++    encoded.append(values[5]);
++    file.page(encoded);
++    for (auto &column : values)
++      column.clear();
++    definitions.clear();
++    rows = text_bytes = 0;
++  }
++
++public:
++  explicit UserFile(const fs::path &path) : file(path, columns) {
++    for (auto &column : values)
++      column.reserve(max_rows * 8);
++    definitions.reserve(max_rows / 8);
++    encoded.reserve(max_rows * 4);
++  }
++
++  void append(const UserDay &row) {
++    if (previous_user.bits != row.user.bits) {
++      user_name = row.user.user_text(inline_name);
++      previous_user = row.user;
++    }
++    const size_t extra = user_name.size() + (row.category ? row.category->size() : 0);
++    if (rows && (rows == max_rows || extra > std::max(max_text_bytes, text_bytes) - text_bytes))
++      flush();
++    text_bytes += extra;
++    flat_parquet::plain_string(values[0], user_name);
++    flat_parquet::little(values[1], row.day);
++    flat_parquet::little(values[2], row.sessions);
++    flat_parquet::little(values[3], row.events);
++    flat_parquet::little(values[4], row.revenue);
++    if (rows % 8 == 0)
++      definitions.push_back(0);
++    if (row.category) {
++      definitions.back() = char(static_cast<unsigned char>(definitions.back()) | (1u << (rows % 8)));
++      flat_parquet::plain_string(values[5], *row.category);
++    }
++    ++rows;
++  }
++
++  void close() {
++    flush();
++    file.close();
++  }
++};
++
+ inline void write_campaigns(const fs::path &path,
+                             const std::vector<CampaignDay> &data) {
+   using namespace flat_parquet;
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -164,7 +164,7 @@
+   ScratchArray<ActiveCampaign> activity;
+   ScratchArray<int64_t> spend;
+   std::vector<int> active, purchased;
+-  std::vector<UserDay> users;
++  std::unique_ptr<UserFile> user_file;
+   Totals sparse;
+   std::vector<Counts> table;
+   int32_t first_day{};
+@@ -185,20 +185,7 @@
+       return sparse[{campaign, day}];
+     return table[size_t(day - first_day) * campaigns + campaign];
+   }
+-  void merge_into(Totals &merged) const {
+-    auto add = [&](int campaign, int32_t day, const Counts &c) {
+-      auto &dest = merged[{campaign, day}];
+-      dest.sessions += c.sessions;
+-      dest.purchases += c.purchases;
+-      dest.revenue += c.revenue;
+-      dest.assists += c.assists;
+-    };
+-    for (auto &[k, c] : sparse)
+-      add(k.first, k.second, c);
+-    for (size_t i = 0; i < table.size(); ++i)
+-      if (table[i].sessions || table[i].assists)
+-        add(i % campaigns, first_day + int32_t(i / campaigns), table[i]);
+-  }
++
+ };
+ 
+ template <class Layout>
+@@ -233,11 +220,11 @@
+       auto &v = result.spend[k];
+       if (v > best || (v == best && cat.categories[k] < *daily.category)) {
+         best = v;
+-        daily.category = cat.categories[k];
++        daily.category = &cat.categories[k];
+       }
+       v = 0;
+     }
+-    result.users.push_back(daily);
++    result.user_file->append(daily);
+     result.purchased.clear();
+   };
+   auto begin_session = [&](Time start) {
+@@ -360,7 +347,7 @@
+       }
+     };
+     for (unsigned owner = 0; owner < workers.size(); ++owner) {
+-      auto &refs = workers[owner].candidates[b];
++      auto refs = workers[owner].candidates[b];
+       // Reserve zero for an empty slot. Six low bits identify one of at most
+       // 64 input workers, and the remaining bits locate its immutable revision.
+       for (size_t i = 0; i < refs.size(); ++i) {
+@@ -715,25 +702,13 @@
+           });
+           return;
+         }
+-        rows<7>(events[job].body(), [&](auto &r) {
+-          if (r[0].empty())
+-            return;
+-          Time ingest = ingest_time(r[3]);
+-          // Invalid revisions still take part in earliest-ingest selection.
+-          Key id = workers[t].pool.encode(r[0], 'e');
+-          Event e = validate(r, ingest, cat, window);
+-#ifdef SHOPPING_DIAGNOSTICS
+-          ++workers[t].revisions;
+-          workers[t].valid_events += e.ts != bad;
+-#endif
+-          Key user = e.ts == bad ? Key{} : workers[t].pool.encode(r[1], 'u');
++        auto put=[&](Key id, Key user, Event e, Time ingest) {
+           auto &w = workers[t];
+           uint64_t location = 0;
+           if (user.bits) {
+             size_t b = user.hash() % shards;
+-            auto &rows = w.events[b];
+-            location = uint64_t(rows.size()) * shards + b + 1;
+-            rows.emplace_back(Key{user.bits}, layout.pack(e));
++            size_t ordinal = w.events.append(b, Key{user.bits}, layout.pack(e));
++            location = uint64_t(ordinal) * shards + b + 1;
+           }
+           Time seconds = ingest / 1000;
+           Time relative = seconds - anchor;
+@@ -752,13 +727,46 @@
+             w.extended.push_back({seconds, location});
+           }
+           w.candidates[bucket(id)].push_back(ref);
++        };
++        auto generic_event=[&](auto const &r) __attribute__((noinline)) {
++          if(r[0].empty())return;
++          auto &w=workers[t];
++          Time ingest=ingest_time(r[3]);
++          Key id=w.pool.encode(r[0],'e');
++          Event e=validate(r,ingest,cat,window);
++#ifdef SHOPPING_DIAGNOSTICS
++          ++w.revisions;
++          w.valid_events+=e.ts!=bad;
++#endif
++          Key user=e.ts==bad?Key{}:w.pool.encode(r[1],'u');
++          put(id,user,e,ingest);
++        };
++        rows<7>(events[job].body(),[&](const auto &r){
++          auto type=r[4],id=r[0],user=r[1];
++          if((type=="view" || type=="cart") && !r[5].empty() && id.size()==9 && user.size()==9 &&
++             id[0]=='e' && user[0]=='u' && sizeof(uintptr_t)==8 && std::endian::native==std::endian::little) {
++            auto event_word=little_word(id.data()+1),user_word=little_word(user.data()+1);
++            if(uint8_t(event_word>>56)-1u<127u && uint8_t(user_word>>56)-1u<127u) {
++              Time ingest=ingest_time(r[3]), ts=timestamp(r[2]);
++              bool good=ts>=window.start && ts<window.end && ingest-ts<=day_ms;
++#ifdef SHOPPING_DIAGNOSTICS
++              ++workers[t].revisions;
++              workers[t].valid_events+=good;
++#endif
++              put(Key{uintptr_t(permute_key(event_word)<<1)},good?Key{uintptr_t(permute_key(user_word)<<1)}:Key{},
++                  Event{good?ts:bad,0,0},ingest);
++              return;
++            }
++          }
++          generic_event(r);
+         });
+       });
+   timer.mark("concurrent input, raw user partition and revision index");
+ #ifdef SHOPPING_DIAGNOSTICS
+   size_t revision_count = 0, revision_capacity = 0;
+-  for (const auto &worker : workers)
+-    for (const auto &bin : worker.candidates) {
++  for (auto &worker : workers)
++    for (size_t i = 0; i < shards; ++i) {
++      auto bin = worker.candidates[i];
+       revision_count += bin.size();
+       revision_capacity += bin.capacity();
+     }
+@@ -769,23 +777,42 @@
+   resolve_revisions(workers, threads, anchor);
+   timer.mark("global event dedup and loser removal");
+   std::vector<Result> results(threads);
+-  for (auto &result : results)
+-    result.configure(window, cat, threads);
+-  process_people(workers, results, cat, threads, timer, layout);
+   fs::create_directories(output / "user_daily");
+   fs::create_directories(output / "campaign_daily");
+   parallel(results.size(), threads, [&](size_t i, unsigned) {
+-    write_users(output / "user_daily" /
+-                    ("part-" + std::to_string(i) + ".parquet"),
+-                results[i].users);
++    auto &result = results[i];
++    result.configure(window, cat, threads);
++    result.user_file = std::make_unique<UserFile>(
++        output / "user_daily" / ("part-" + std::to_string(i) + ".parquet"));
+   });
+-  Totals merged;
+-  for (auto &r : results)
+-    r.merge_into(merged);
++  process_people(workers, results, cat, threads, timer, layout);
++  parallel(results.size(), threads, [&](size_t i, unsigned) {
++    results[i].user_file->close();
++  });
+   std::vector<CampaignDay> campaigns;
+-  for (auto &[key, c] : merged)
+-    campaigns.push_back(
+-        {cat.campaigns[key.first], cat.channels[key.first], key.second, c});
++  auto append = [&](size_t id, int32_t day, const Counts &counts) {
++    campaigns.push_back({cat.campaigns[id], cat.channels[id], day, counts});
++  };
++  const auto &first = results.front();
++  if (first.table.empty()) {
++    Totals merged;
++    for (const auto &part : results)
++      for (const auto &[key, counts] : part.sparse)
++        merged[key].add(counts);
++    for (const auto &[key, counts] : merged)
++      append(key.first, key.second, counts);
++  } else {
++    for (size_t start = 0; start < first.table.size(); start += first.campaigns) {
++      const int32_t day = first.first_day + int32_t(start / first.campaigns);
++      for (size_t id = 0; id < first.campaigns; ++id) {
++        Counts counts;
++        for (const auto &part : results)
++          counts.add(part.table[start + id]);
++        if (counts.sessions || counts.assists)
++          append(id, day, counts);
++      }
++    }
++  }
+   write_campaigns(output / "campaign_daily" / "part-0.parquet", campaigns);
+   timer.mark("merge and Parquet output");
+ #ifdef SHOPPING_DIAGNOSTICS
+--- a/cpp/output.hpp
++++ b/cpp/output.hpp
+@@ -3,10 +3,16 @@
+   Key user;
+   int32_t day;
+   int64_t sessions, events, revenue;
+-  std::optional<Str> category;
++  const Str *category{};
+ };
+ struct Counts {
+   int64_t sessions{}, purchases{}, revenue{}, assists{};
++  void add(const Counts &other) {
++    sessions += other.sessions;
++    purchases += other.purchases;
++    revenue += other.revenue;
++    assists += other.assists;
++  }
+ };
+ struct CampaignDay {
+   Str campaign, channel;
+--- a/cpp/partition_slab.hpp
++++ b/cpp/partition_slab.hpp
+@@ -1,59 +1,75 @@
+ #pragma once
+ #include <span>
+-template <class T> struct PartitionBucket {
++
++// Each scanner owns its partitions. The write positions are read on every
++// row, so keep them together and store the growable overflow buffers separately.
++template<class T> class PartitionSlab {
+   static_assert(std::is_trivially_destructible_v<T>);
+-  T *data{};
+-  size_t used{}, limit{};
+-  std::vector<T> tail;
+-  size_t size() const { return used + tail.size(); }
+-  size_t capacity() const { return limit + tail.capacity(); }
+-  T &operator[](size_t i) { return i < used ? data[i] : tail[i - used]; }
+-  auto spans() {
+-    return std::array{std::span<T>(data, used), std::span<T>(tail)};
+-  }
+-  template <class... Args> void emplace_back(Args &&...args) {
+-    if (used < limit)
+-      std::construct_at(data + used++, std::forward<Args>(args)...);
+-    else
+-      tail.emplace_back(std::forward<Args>(args)...);
+-  }
+-  void push_back(T v) { emplace_back(v); }
+-  void release() { std::vector<T>().swap(tail); }
+-};
+-template <class T> struct PartitionSlab {
+-  std::array<PartitionBucket<T>, shards> buckets;
++  std::array<size_t, shards> counts{};
++  std::array<T *, shards> starts{};
++  std::array<std::vector<T>, shards> overflow;
+   void *region = MAP_FAILED;
+-  size_t bytes{};
++  size_t bytes{}, capacity_per_shard{};
++
++public:
+   PartitionSlab() = default;
+   PartitionSlab(const PartitionSlab &) = delete;
++  ~PartitionSlab() { release(); }
++
+   void reserve(size_t count) {
+     if (!count)
+       return;
+-    size_t page = 4096;
+-    size_t stride = (count * sizeof(T) + page - 1) / page * page;
++    constexpr size_t page = 4096;
++    const size_t stride = (count * sizeof(T) + page - 1) / page * page;
+     bytes = stride * shards;
+-    region = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
+-                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++    region = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+     if (region == MAP_FAILED)
+       return;
+ #ifdef MADV_HUGEPAGE
+     madvise(region, bytes, MADV_HUGEPAGE);
+ #endif
+-    for (size_t i = 0; i < shards; ++i) {
+-      buckets[i].data =
+-          reinterpret_cast<T *>(static_cast<char *>(region) + i * stride);
+-      buckets[i].limit = stride / sizeof(T);
++    capacity_per_shard = stride / sizeof(T);
++    for (size_t i = 0; i < shards; ++i)
++      starts[i] = reinterpret_cast<T *>(static_cast<char *>(region) + i * stride);
++  }
++
++  template<class... Args> size_t append(size_t shard, Args &&...args) {
++    const size_t position = counts[shard];
++    if (position < capacity_per_shard)
++      std::construct_at(starts[shard] + position, std::forward<Args>(args)...);
++    else
++      overflow[shard].emplace_back(std::forward<Args>(args)...);
++    ++counts[shard];
++    return position;
++  }
++
++  class Bucket {
++    PartitionSlab &slab;
++    size_t shard;
++  public:
++    Bucket(PartitionSlab &slab, size_t shard) : slab(slab), shard(shard) {}
++    size_t size() const { return slab.counts[shard]; }
++    size_t capacity() const { return slab.capacity_per_shard + slab.overflow[shard].capacity(); }
++    auto spans() const {
++      return std::array{std::span<T>(slab.starts[shard], std::min(size(), slab.capacity_per_shard)),
++                        std::span<T>(slab.overflow[shard])};
+     }
+-  }
++    T &operator[](size_t i) const {
++      return i < slab.capacity_per_shard ? slab.starts[shard][i] : slab.overflow[shard][i - slab.capacity_per_shard];
++    }
++    template<class... Args> void emplace_back(Args &&...args) {
++      slab.append(shard, std::forward<Args>(args)...);
++    }
++    void push_back(T value) { slab.append(shard, std::move(value)); }
++    void release() { std::vector<T>().swap(slab.overflow[shard]); }
++  };
++  Bucket operator[](size_t shard) { return {*this, shard}; }
++
+   void release() {
+     if (region != MAP_FAILED) {
+       munmap(region, bytes);
+       region = MAP_FAILED;
++      capacity_per_shard = 0;
+     }
+   }
+-  ~PartitionSlab() { release(); }
+-  auto &operator[](size_t i) { return buckets[i]; }
+-  const auto &operator[](size_t i) const { return buckets[i]; }
+-  auto begin() const { return buckets.begin(); }
+-  auto end() const { return buckets.end(); }
+ };

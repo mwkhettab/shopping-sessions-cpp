@@ -20,6 +20,23 @@ for root in map(Path,sys.argv[1:]):
         notes=json.loads(report.read_text())
         keep=[re.sub(r' {2,}',' ',x) for x in notes if x.startswith(('Release pairs','Population structure','ThreadSanitizer','20M process PMU','Sampled branch-misses','Sampled cache-misses','Input probe'))]
         if keep:emit('Paired comparisons and profiles '+report.parent.name,' || '.join(keep)[:4000])
+    for report in sorted(root.rglob('all-notes.json')):
+        notes=json.loads(report.read_text())
+        ranked=[]
+        for scale in ('practice','final','holdout'):
+            values=[]
+            for entry in notes:
+                m=re.match(scale+r' (\S+) median ([0-9.]+) s, runs ([^]]+)]',entry)
+                if m:values.append((float(m[2]),m[1]))
+            if values:ranked.append(scale+' '+', '.join(f'{name} {value:.4f}' for value,name in sorted(values)))
+        if ranked:emit('Full-process medians '+report.parent.name,' || '.join(ranked))
+        details=[]
+        for entry in notes:
+            if entry.startswith('Workers '): details.append(entry.partition(', runs')[0])
+            elif entry.startswith('Input probe '):
+                head,_,tail=entry.partition(', runs');details.append(head+' digest '+tail.partition('digest ')[2])
+            elif entry.startswith(('Floor read','Floor lex','Hardware ','ThreadSanitizer ','Failure','Rejected ')):details.append(entry)
+        if details:emit('Workers and cumulative input probes '+report.parent.name,' || '.join(details)[:4000])
     for source in root.rglob('source-lines*.txt'):
         folder=source.parent
         records=[]

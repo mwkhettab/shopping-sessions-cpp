@@ -26,5 +26,15 @@ jobs:
           github-token: ${{ github.token }}
           run-id: ${{ steps.select.outputs.id }}
           path: ${{ runner.temp }}/previous-native
-      - name: Publish source samples and paired results
-        run: python3 perf/native/publish_profile.py "$RUNNER_TEMP/previous-native"
+      - name: Publish archived ubuntu-24.04 comparisons
+        run: |
+          data="$RUNNER_TEMP/previous-native/native-observations-ubuntu-24.04"
+          if test -d "$data"; then python3 perf/native/publish_profile.py "$data"; fi
+      - name: Publish archived ubuntu-22.04 comparisons
+        run: |
+          data="$RUNNER_TEMP/previous-native/native-observations-ubuntu-22.04"
+          if test -d "$data"; then python3 perf/native/publish_profile.py "$data"; fi
+      - name: Publish archived ubuntu-latest comparisons
+        run: |
+          data="$RUNNER_TEMP/previous-native/native-observations-ubuntu-latest"
+          if test -d "$data"; then python3 perf/native/publish_profile.py "$data"; fi

@@ -1,0 +1,369 @@
+--- a/cpp/input.hpp
++++ b/cpp/input.hpp
+@@ -147,8 +147,13 @@
+ #endif
+ #include "csv_x86.hpp"
+ #include "line_csv.hpp"
++#include "line_tile.hpp"
+ template <size_t N, class F> void parse_rows(Str data, F &&callback) {
+ #ifdef SHOPPING_X86_CSV
++  if (N == 7 && wide_csv_supported()) {
++    tiled_lines<N, 16>(data, callback);
++    return;
++  }
+   if (wide_csv_supported()) { line_csv_rows<N>(data,callback); return; }
+   if (wide_csv_supported()) {
+     wide_csv_rows<N>(data, callback);
+--- /dev/null
++++ b/cpp/line_tile.hpp
+@@ -0,0 +1,89 @@
++#pragma once
++// Find line endings in small groups; both the delimiter count and all
++// surrounding quotes are checked before a field reaches the event validator.
++#ifdef SHOPPING_X86_CSV
++inline uint64_t mask_to(unsigned n) {
++  return n >= 64 ? ~uint64_t{} : (uint64_t{1} << n) - 1;
++}
++template <size_t N, class F>
++__attribute__((target("avx2,bmi,popcnt"), always_inline)) inline void
++split_known_line(const char *p, size_t len, const char *end, F &fn) {
++  if (len >= 128 || end - p < 128) {
++    scalar_rows<N>(Str(p, len), fn);
++    return;
++  }
++  uint64_t lo, hi = 0, ql, qh = 0;
++  auto get = [&](unsigned at, uint64_t &commas,
++                 uint64_t &quotes) __attribute__((target("avx2,bmi,popcnt"),
++                                                  always_inline)) {
++    auto a = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(p + at));
++    auto b = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(p + at + 32));
++    auto comma = _mm256_set1_epi8(','), quote = _mm256_set1_epi8('"');
++    uint64_t c0 = unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, comma)));
++    uint64_t q0 = unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, quote)));
++    uint64_t c1 = unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, comma)));
++    uint64_t q1 = unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, quote)));
++    auto mask = mask_to(unsigned(len) - at);
++    commas = (c0 | (c1 << 32)) & mask;
++    quotes = (q0 | (q1 << 32)) & mask;
++  };
++  get(0, lo, ql);
++  if (len > 64)
++    get(64, hi, qh);
++  if (size_t(std::popcount(lo) + std::popcount(hi)) != N - 1)
++    return;
++  std::array<Str, N> fields;
++  unsigned start = 0, wrapped = 0;
++  for (unsigned i = 0; i < N; ++i) {
++    unsigned cut = unsigned(len);
++    if (i + 1 < N) {
++      if (lo) {
++        cut = std::countr_zero(lo);
++        lo &= lo - 1;
++      } else {
++        cut = 64 + std::countr_zero(hi);
++        hi &= hi - 1;
++      }
++    }
++    unsigned width = cut - start;
++    bool quotes = width >= 2 && ((p[start] == '"') & (p[cut - 1] == '"'));
++    wrapped += 2 * quotes;
++    fields[i] = {p + start + quotes, width - 2 * quotes};
++    start = cut + 1;
++  }
++  if (wrapped == unsigned(std::popcount(ql) + std::popcount(qh)))
++    fn(fields);
++}
++
++template <size_t N, unsigned Batch, class F>
++__attribute__((target("avx2,bmi,popcnt"))) void tiled_lines(Str data, F &fn) {
++  size_t from = 0, scan = 0;
++  std::array<size_t, Batch> ends;
++  unsigned n = 0;
++  auto flush = [&]() __attribute__((target("avx2,bmi,popcnt"), always_inline)) {
++    for (unsigned i = 0; i < n; ++i) {
++      auto to = ends[i];
++      split_known_line<N>(data.data() + from, to - from,
++                          data.data() + data.size(), fn);
++      from = to + 1;
++    }
++    n = 0;
++  };
++  auto lf = _mm256_set1_epi8('\n');
++  for (; scan + 32 <= data.size(); scan += 32) {
++    auto v = _mm256_loadu_si256(
++        reinterpret_cast<const __m256i *>(data.data() + scan));
++    auto mask = unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, lf)));
++    while (mask) {
++      ends[n++] = scan + std::countr_zero(mask);
++      mask &= mask - 1;
++      if (n == Batch)
++        flush();
++    }
++  }
++  if (n)
++    flush();
++  if (from < data.size())
++    line_csv_rows<N>(data.substr(from), fn);
++}
++#endif
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -8,6 +8,7 @@
+ 
+ size_t bucket(Key k) { return k.hash() % shards; }
+ #include "event_layout.hpp"
++struct alignas(std::atomic_ref<uint64_t>::required_alignment) AtomicClaimSlot {uint64_t code{};};
+ struct RevisionIndex {
+   Key id;
+   uint32_t ingest, location;
+@@ -25,7 +26,8 @@
+   using ClickData = typename Layout::C;
+   using Candidate = RevisionIndex;
+   std::vector<ExtendedRevision> extended;
+-  PartitionSlab<Candidate> candidates;
++  std::vector<Candidate> journal;
++  Bins<uint64_t> collisions;
+   PartitionSlab<std::pair<Key, EventData>> events;
+   PartitionSlab<std::pair<Key, ClickData>> clicks;
+   struct Vertex {
+@@ -233,7 +235,7 @@
+       auto &v = result.spend[k];
+       if (v > best || (v == best && cat.categories[k] < *daily.category)) {
+         best = v;
+-        daily.category = cat.categories[k];
++        daily.category = &cat.categories[k];
+       }
+       v = 0;
+     }
+@@ -331,72 +333,54 @@
+   }
+ };
+ template <class Layout>
+-void resolve_revisions(std::vector<ScanWorker<Layout>> &workers,
+-                       unsigned threads, Time anchor) {
+-  using Candidate = typename ScanWorker<Layout>::Candidate;
+-  parallel(shards, threads, [&](size_t b, [[maybe_unused]] unsigned t) {
+-    size_t count = 0;
+-    for (auto &w : workers)
+-      count += w.candidates[b].size();
+-    // The low hash bits selected this shard. Use the remaining bits
+-    // for open addressing and compare the original bytes on a hash match.
+-    size_t capacity = 1;
+-    while (capacity < count + count / 2)
+-      capacity *= 2;
++void resolve_claims(std::vector<ScanWorker<Layout>> &workers,unsigned threads,Time anchor,
++                    std::vector<AtomicClaimSlot> &first) {
++  parallel(shards,threads,[&](size_t b,[[maybe_unused]] unsigned t){
+     MEASURE(dedup);
+-    std::vector<uint64_t> best(capacity);
+-    auto seconds = [&](const Candidate &r, unsigned owner) {
+-      return r.ingest & 0x80000000u
+-                 ? workers[owner].extended[r.location].seconds
+-                 : Time(r.ingest) - Time(1u << 30) + anchor;
++    size_t count=0;
++    for(auto &w:workers)count+=w.collisions[b].size();
++    if(!count)return;
++    std::vector<uint64_t> secondary(std::bit_ceil(count+count/2+1));
++    auto candidate=[&](uint64_t code)->const RevisionIndex&{
++      --code;return workers[code&63].journal[code>>6];
+     };
+-    auto discard = [&](const Candidate &r, unsigned owner) {
+-      auto &w = workers[owner];
+-      uint64_t location =
+-          r.ingest & 0x80000000u ? w.extended[r.location].location : r.location;
+-      if (location) {
+-        --location;
+-        w.events[location % shards][location / shards].first.bits = 0;
+-      }
++    auto seconds=[&](const RevisionIndex &r,unsigned owner){
++      return r.ingest&0x80000000u?workers[owner].extended[r.location].seconds:Time(r.ingest)-Time(1u<<30)+anchor;
+     };
+-    for (unsigned owner = 0; owner < workers.size(); ++owner) {
+-      auto &refs = workers[owner].candidates[b];
+-      // Reserve zero for an empty slot. Six low bits identify one of at most
+-      // 64 input workers, and the remaining bits locate its immutable revision.
+-      for (size_t i = 0; i < refs.size(); ++i) {
+-        auto &r = refs[i];
+-        size_t at = (r.id.hash() / shards) & (capacity - 1);
+-        for (;;) {
+-          auto code = best[at];
+-          if (!code) {
+-            best[at] = 1 + (i << 6) + owner;
+-            break;
+-          }
+-          auto old_owner = unsigned((code - 1) & 63);
+-          auto &old = workers[old_owner].candidates[b][(code - 1) >> 6];
+-          if (old.id == r.id) {
++    auto drop=[&](const RevisionIndex &r,unsigned owner){
++      auto &w=workers[owner];
++      uint64_t pos=r.ingest&0x80000000u?w.extended[r.location].location:r.location;
++      if(pos){--pos;w.events[pos%shards][pos/shards].first.bits=0;}
++    };
++    for(unsigned owner=0;owner<workers.size();++owner){
++      auto &records=workers[owner].collisions[b];
++      for(auto i:records){
++        uint64_t code=(uint64_t(i)<<6)+owner+1;
++        const auto &r=workers[owner].journal[i];
++        const auto h=r.id.hash();
++        // The low hash bits own this slot exclusively after all readers join.
++        uint64_t *winner=&first[h&(first.size()-1)].code;
++        if(!(candidate(*winner).id==r.id)){
++          // The primary resident can change revision but never its exact ID.
++          size_t pos=(h/shards)&(secondary.size()-1);
++          while(secondary[pos] && !(candidate(secondary[pos]).id==r.id))pos=(pos+1)&(secondary.size()-1);
++          winner=&secondary[pos];
++          if(!*winner){*winner=code;continue;}
++        }
++        const auto &old=candidate(*winner);
++        auto prior=unsigned((*winner-1)&63);
+ #ifdef SHOPPING_DIAGNOSTICS
+-            ++workers[t].duplicates;
++        ++workers[t].duplicates;
+ #endif
+-            bool before = (r.ingest | old.ingest) & 0x80000000u
+-                              ? seconds(r, owner) < seconds(old, old_owner)
+-                              : r.ingest < old.ingest;
+-            if (before) {
+-              discard(old, old_owner);
+-              best[at] = 1 + (i << 6) + owner;
+-            } else
+-              discard(r, owner);
+-            break;
+-          }
+-          at = (at + 1) & (capacity - 1);
+-        }
+-      }
+-    }
+-    for (auto &w : workers)
+-      w.candidates[b].release();
++        bool earlier=(r.ingest|old.ingest)&0x80000000u?seconds(r,owner)<seconds(old,prior):r.ingest<old.ingest;
++        if(earlier){drop(old,prior);*winner=code;}
++        else drop(r,owner);
++      }
++      std::vector<uint64_t>().swap(records);
++    }
+   });
+-  for (auto &w : workers)
+-    w.candidates.release();
++  std::vector<AtomicClaimSlot>().swap(first);
++  for(auto &w:workers)std::vector<RevisionIndex>().swap(w.journal);
+ }
+ template <class Layout>
+ void process_people(std::vector<ScanWorker<Layout>> &workers,
+@@ -666,7 +650,9 @@
+   auto hint = [&](size_t count, size_t row_bytes, size_t budget) {
+     return std::min(count + count / 8, budget / row_bytes) / threads / shards;
+   };
+-  auto rev_hint = hint(event_count, sizeof(Candidate), size_t(1536) << 20);
++  size_t target=std::clamp<size_t>(event_count,shards,(size_t{1}<<27)/1);
++  std::vector<AtomicClaimSlot> claims(std::bit_ceil(target*1));
++  size_t journal_hint=std::min(event_count+event_count/8,(size_t(1536)<<20)/sizeof(Candidate))/threads;
+   auto event_hint =
+       hint(event_count, sizeof(std::pair<Key, typename Layout::E>),
+            size_t(1536) << 20);
+@@ -674,7 +660,7 @@
+       hint(click_count, sizeof(std::pair<Key, typename Layout::C>),
+            size_t(768) << 20);
+   for (auto &w : workers) {
+-    w.candidates.reserve(rev_hint);
++    w.journal.reserve(journal_hint);
+     w.events.reserve(event_hint);
+     w.clicks.reserve(click_hint);
+   }
+@@ -751,26 +737,35 @@
+             ref.location = uint32_t(w.extended.size());
+             w.extended.push_back({seconds, location});
+           }
+-          w.candidates[bucket(id)].push_back(ref);
++          const uint64_t i=w.journal.size();
++          w.journal.push_back(ref);
++          auto h=id.hash();
++          std::atomic_ref<uint64_t> cell(claims[h&(claims.size()-1)].code);
++          uint64_t prior=0;
++          // The CAS elects one owner. Payloads are only read after the barrier.
++          if(cell.load(std::memory_order_relaxed) ||
++             !cell.compare_exchange_strong(prior,(i<<6)+t+1,std::memory_order_relaxed))
++            w.collisions[h%shards].push_back(i);
+         });
+       });
+   timer.mark("concurrent input, raw user partition and revision index");
+ #ifdef SHOPPING_DIAGNOSTICS
+   size_t revision_count = 0, revision_capacity = 0;
+-  for (const auto &worker : workers)
+-    for (const auto &bin : worker.candidates) {
+-      revision_count += bin.size();
+-      revision_capacity += bin.capacity();
+-    }
++  for(const auto &w:workers){revision_count+=w.journal.size();revision_capacity+=w.journal.capacity();}
+   std::cerr << "revision storage " << revision_count * sizeof(Candidate)
+             << " used bytes, " << revision_capacity * sizeof(Candidate)
+             << " capacity bytes\n";
+ #endif
+-  resolve_revisions(workers, threads, anchor);
++  resolve_claims(workers,threads,anchor,claims);
+   timer.mark("global event dedup and loser removal");
+   std::vector<Result> results(threads);
+-  for (auto &result : results)
++  size_t rows_hint =
++      std::min<size_t>(event_count / 8, (size_t(512) << 20) / sizeof(UserDay)) /
++      threads;
++  for (auto &result : results) {
++    result.users.reserve(rows_hint);
+     result.configure(window, cat, threads);
++  }
+   process_people(workers, results, cat, threads, timer, layout);
+   fs::create_directories(output / "user_daily");
+   fs::create_directories(output / "campaign_daily");
+@@ -779,13 +774,35 @@
+                     ("part-" + std::to_string(i) + ".parquet"),
+                 results[i].users);
+   });
+-  Totals merged;
+-  for (auto &r : results)
+-    r.merge_into(merged);
+   std::vector<CampaignDay> campaigns;
+-  for (auto &[key, c] : merged)
+-    campaigns.push_back(
+-        {cat.campaigns[key.first], cat.channels[key.first], key.second, c});
++  auto append = [&](size_t id, int32_t day, const Counts &c) {
++    campaigns.push_back({cat.campaigns[id], cat.channels[id], day, c});
++  };
++  const auto &first = results.front();
++  if (!first.table.empty()) {
++    for (size_t start = 0; start < first.table.size();
++         start += first.campaigns) {
++      int32_t day = first.first_day + int32_t(start / first.campaigns);
++      for (size_t id = 0; id < first.campaigns; ++id) {
++        Counts c{};
++        for (const auto &r : results) {
++          const auto &part = r.table[start + id];
++          c.sessions += part.sessions;
++          c.purchases += part.purchases;
++          c.revenue += part.revenue;
++          c.assists += part.assists;
++        }
++        if (c.sessions || c.assists)
++          append(id, day, c);
++      }
++    }
++  } else {
++    Totals merged;
++    for (auto &r : results)
++      r.merge_into(merged);
++    for (auto &[key, c] : merged)
++      append(key.first, key.second, c);
++  }
+   write_campaigns(output / "campaign_daily" / "part-0.parquet", campaigns);
+   timer.mark("merge and Parquet output");
+ #ifdef SHOPPING_DIAGNOSTICS
+--- a/cpp/output.hpp
++++ b/cpp/output.hpp
+@@ -3,7 +3,7 @@
+   Key user;
+   int32_t day;
+   int64_t sessions, events, revenue;
+-  std::optional<Str> category;
++  const Str *category{};
+ };
+ struct Counts {
+   int64_t sessions{}, purchases{}, revenue{}, assists{};

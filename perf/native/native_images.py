@@ -58,9 +58,9 @@ def verify_images(root,area,best,run,note,env,scales):
             import hashlib
             assert hashlib.sha256(binary.read_bytes()).hexdigest()==fingerprint
             run(os.sys.executable,root/'verify.py',binary,area/'dev','--starter',area/'starter-pyspark','--answer',area/'dev-answer')
-            for suite in ('random_rules.py','interval_oracle.py','page_oracle.py','prefix_oracle.py'):
+            for suite in ('random_rules.py','interval_oracle.py','page_oracle.py','prefix_oracle.py','ordered_ids_oracle.py'):
                 run(os.sys.executable,root/'perf/native'/suite,binary)
-            note('Docker fixture binary '+best,f'{fingerprint} passed 36 fixtures, published 1M tables and all four independent differential suites.')
+            note('Docker fixture binary '+best,f'{fingerprint} passed 36 fixtures, published 1M tables and all five independent differential suites.')
     for scale,repeats in scales:
         data=area/scale
         totals={tag:[] for tag in tags}

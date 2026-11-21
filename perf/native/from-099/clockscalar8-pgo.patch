@@ -1,0 +1,360 @@
+--- a/cpp/input.hpp
++++ b/cpp/input.hpp
+@@ -147,8 +147,13 @@
+ #endif
+ #include "csv_x86.hpp"
+ #include "line_csv.hpp"
++#include "line_tile.hpp"
+ template <size_t N, class F> void parse_rows(Str data, F &&callback) {
+ #ifdef SHOPPING_X86_CSV
++  if (N == 7 && wide_csv_supported()) {
++    tiled_lines<N, 16>(data, callback);
++    return;
++  }
+   if (wide_csv_supported()) { line_csv_rows<N>(data,callback); return; }
+   if (wide_csv_supported()) {
+     wide_csv_rows<N>(data, callback);
+--- /dev/null
++++ b/cpp/line_tile.hpp
+@@ -0,0 +1,89 @@
++#pragma once
++// Find line endings in small groups; both the delimiter count and all
++// surrounding quotes are checked before a field reaches the event validator.
++#ifdef SHOPPING_X86_CSV
++inline uint64_t mask_to(unsigned n) {
++  return n >= 64 ? ~uint64_t{} : (uint64_t{1} << n) - 1;
++}
++template <size_t N, class F>
++__attribute__((target("avx2,bmi,popcnt"), always_inline)) inline void
++split_known_line(const char *p, size_t len, const char *end, F &fn) {
++  if (len >= 128 || end - p < 128) {
++    scalar_rows<N>(Str(p, len), fn);
++    return;
++  }
++  uint64_t lo, hi = 0, ql, qh = 0;
++  auto get = [&](unsigned at, uint64_t &commas,
++                 uint64_t &quotes) __attribute__((target("avx2,bmi,popcnt"),
++                                                  always_inline)) {
++    auto a = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(p + at));
++    auto b = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(p + at + 32));
++    auto comma = _mm256_set1_epi8(','), quote = _mm256_set1_epi8('"');
++    uint64_t c0 = unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, comma)));
++    uint64_t q0 = unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, quote)));
++    uint64_t c1 = unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, comma)));
++    uint64_t q1 = unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, quote)));
++    auto mask = mask_to(unsigned(len) - at);
++    commas = (c0 | (c1 << 32)) & mask;
++    quotes = (q0 | (q1 << 32)) & mask;
++  };
++  get(0, lo, ql);
++  if (len > 64)
++    get(64, hi, qh);
++  if (size_t(std::popcount(lo) + std::popcount(hi)) != N - 1)
++    return;
++  std::array<Str, N> fields;
++  unsigned start = 0, wrapped = 0;
++  for (unsigned i = 0; i < N; ++i) {
++    unsigned cut = unsigned(len);
++    if (i + 1 < N) {
++      if (lo) {
++        cut = std::countr_zero(lo);
++        lo &= lo - 1;
++      } else {
++        cut = 64 + std::countr_zero(hi);
++        hi &= hi - 1;
++      }
++    }
++    unsigned width = cut - start;
++    bool quotes = width >= 2 && ((p[start] == '"') & (p[cut - 1] == '"'));
++    wrapped += 2 * quotes;
++    fields[i] = {p + start + quotes, width - 2 * quotes};
++    start = cut + 1;
++  }
++  if (wrapped == unsigned(std::popcount(ql) + std::popcount(qh)))
++    fn(fields);
++}
++
++template <size_t N, unsigned Batch, class F>
++__attribute__((target("avx2,bmi,popcnt"))) void tiled_lines(Str data, F &fn) {
++  size_t from = 0, scan = 0;
++  std::array<size_t, Batch> ends;
++  unsigned n = 0;
++  auto flush = [&]() __attribute__((target("avx2,bmi,popcnt"), always_inline)) {
++    for (unsigned i = 0; i < n; ++i) {
++      auto to = ends[i];
++      split_known_line<N>(data.data() + from, to - from,
++                          data.data() + data.size(), fn);
++      from = to + 1;
++    }
++    n = 0;
++  };
++  auto lf = _mm256_set1_epi8('\n');
++  for (; scan + 32 <= data.size(); scan += 32) {
++    auto v = _mm256_loadu_si256(
++        reinterpret_cast<const __m256i *>(data.data() + scan));
++    auto mask = unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, lf)));
++    while (mask) {
++      ends[n++] = scan + std::countr_zero(mask);
++      mask &= mask - 1;
++      if (n == Batch)
++        flush();
++    }
++  }
++  if (n)
++    flush();
++  if (from < data.size())
++    line_csv_rows<N>(data.substr(from), fn);
++}
++#endif
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -8,6 +8,8 @@
+ 
+ size_t bucket(Key k) { return k.hash() % shards; }
+ #include "event_layout.hpp"
++#define SHOPPING_SCALAR_CLOCK_BATCH
++#include "row_clocks.hpp"
+ struct RevisionIndex {
+   Key id;
+   uint32_t ingest, location;
+@@ -233,7 +235,7 @@
+       auto &v = result.spend[k];
+       if (v > best || (v == best && cat.categories[k] < *daily.category)) {
+         best = v;
+-        daily.category = cat.categories[k];
++        daily.category = &cat.categories[k];
+       }
+       v = 0;
+     }
+@@ -715,18 +717,7 @@
+           });
+           return;
+         }
+-        rows<7>(events[job].body(), [&](auto &r) {
+-          if (r[0].empty())
+-            return;
+-          Time ingest = ingest_time(r[3]);
+-          // Invalid revisions still take part in earliest-ingest selection.
+-          Key id = workers[t].pool.encode(r[0], 'e');
+-          Event e = validate(r, ingest, cat, window);
+-#ifdef SHOPPING_DIAGNOSTICS
+-          ++workers[t].revisions;
+-          workers[t].valid_events += e.ts != bad;
+-#endif
+-          Key user = e.ts == bad ? Key{} : workers[t].pool.encode(r[1], 'u');
++        auto put=[&](Key id, Key user, Event e, Time ingest){
+           auto &w = workers[t];
+           uint64_t location = 0;
+           if (user.bits) {
+@@ -752,7 +743,44 @@
+             w.extended.push_back({seconds, location});
+           }
+           w.candidates[bucket(id)].push_back(ref);
++        };
++        auto emit=[&](const ClockRow &row,Time ts,Time ingest){
++          bool valid=row.user.bits && ts>=window.start && ts<window.end && ingest-ts<=day_ms;
++#ifdef SHOPPING_DIAGNOSTICS
++          ++workers[t].revisions;workers[t].valid_events+=valid;
++#endif
++          put(row.id,valid?row.user:Key{},Event{valid?ts:bad,row.price,row.category},ingest);
++        };
++        ClockBatch<13,8,decltype(emit)> epoch(emit);
++        ClockBatch<20,8,decltype(emit)> utc(emit);
++        ClockBatch<25,8,decltype(emit)> offset(emit);
++        rows<7>(events[job].body(),[&](auto const &r){
++          if(r[0].empty())return;
++          auto &pool=workers[t].pool;
++          Key id=pool.encode(r[0],'e');
++          auto event=r[2],arrival=r[3];
++          if(arrival.size()!=20 ||
++             (event.size()!=13 && ((event.size()!=20 && event.size()!=25)||event[4]!='-'))){
++            auto ingest=ingest_time(arrival);auto e=validate(r,ingest,cat,window);
++#ifdef SHOPPING_DIAGNOSTICS
++            ++workers[t].revisions;workers[t].valid_events+=e.ts!=bad;
++#endif
++            auto user=e.ts==bad?Key{}:pool.encode(r[1],'u');
++            put(id,user,e,ingest);return;
++          }
++          ClockRow row{id,{},event.data(),arrival.data(),0,0};
++          if(!r[1].empty() && !r[5].empty()){
++            if(r[4]=="view" || r[4]=="cart")row.user=pool.encode(r[1],'u');
++            else if(r[4]=="purchase"){
++              auto price=number(r[6],10000000);
++              if(price>=1){row.user=pool.encode(r[1],'u');row.price=int32_t(price);row.category=std::max(0,cat.product.find(r[5]));}
++            }
++          }
++          if(event.size()==13)epoch.add(row);
++          else if(event.size()==20)utc.add(row);
++          else offset.add(row);
+         });
++        epoch.flush();utc.flush();offset.flush();
+       });
+   timer.mark("concurrent input, raw user partition and revision index");
+ #ifdef SHOPPING_DIAGNOSTICS
+@@ -769,8 +797,13 @@
+   resolve_revisions(workers, threads, anchor);
+   timer.mark("global event dedup and loser removal");
+   std::vector<Result> results(threads);
+-  for (auto &result : results)
++  size_t rows_hint =
++      std::min<size_t>(event_count / 8, (size_t(512) << 20) / sizeof(UserDay)) /
++      threads;
++  for (auto &result : results) {
++    result.users.reserve(rows_hint);
+     result.configure(window, cat, threads);
++  }
+   process_people(workers, results, cat, threads, timer, layout);
+   fs::create_directories(output / "user_daily");
+   fs::create_directories(output / "campaign_daily");
+@@ -779,13 +812,35 @@
+                     ("part-" + std::to_string(i) + ".parquet"),
+                 results[i].users);
+   });
+-  Totals merged;
+-  for (auto &r : results)
+-    r.merge_into(merged);
+   std::vector<CampaignDay> campaigns;
+-  for (auto &[key, c] : merged)
+-    campaigns.push_back(
+-        {cat.campaigns[key.first], cat.channels[key.first], key.second, c});
++  auto append = [&](size_t id, int32_t day, const Counts &c) {
++    campaigns.push_back({cat.campaigns[id], cat.channels[id], day, c});
++  };
++  const auto &first = results.front();
++  if (!first.table.empty()) {
++    for (size_t start = 0; start < first.table.size();
++         start += first.campaigns) {
++      int32_t day = first.first_day + int32_t(start / first.campaigns);
++      for (size_t id = 0; id < first.campaigns; ++id) {
++        Counts c{};
++        for (const auto &r : results) {
++          const auto &part = r.table[start + id];
++          c.sessions += part.sessions;
++          c.purchases += part.purchases;
++          c.revenue += part.revenue;
++          c.assists += part.assists;
++        }
++        if (c.sessions || c.assists)
++          append(id, day, c);
++      }
++    }
++  } else {
++    Totals merged;
++    for (auto &r : results)
++      r.merge_into(merged);
++    for (auto &[key, c] : merged)
++      append(key.first, key.second, c);
++  }
+   write_campaigns(output / "campaign_daily" / "part-0.parquet", campaigns);
+   timer.mark("merge and Parquet output");
+ #ifdef SHOPPING_DIAGNOSTICS
+--- a/cpp/output.hpp
++++ b/cpp/output.hpp
+@@ -3,7 +3,7 @@
+   Key user;
+   int32_t day;
+   int64_t sessions, events, revenue;
+-  std::optional<Str> category;
++  const Str *category{};
+ };
+ struct Counts {
+   int64_t sessions{}, purchases{}, revenue{}, assists{};
+--- /dev/null
++++ b/cpp/row_clocks.hpp
+@@ -0,0 +1,96 @@
++#pragma once
++struct ClockRow {
++  Key id,user;
++  const char *instant,*arrival;
++  int32_t price,category;
++};
++#ifdef SHOPPING_X86_CSV
++#define CLOCK_AVX __attribute__((target("avx2"),always_inline)) inline
++template<bool arrival>
++CLOCK_AVX __m256i four_load(const ClockRow *r,int off) {
++  auto load=[&](unsigned i){return std::bit_cast<int64_t>(little_word((arrival?r[i].arrival:r[i].instant)+off));};
++  return _mm256_set_epi64x(load(3),load(2),load(1),load(0));
++}
++CLOCK_AVX __m256i tenfold(__m256i x){return _mm256_add_epi64(_mm256_slli_epi64(x,3),_mm256_slli_epi64(x,1));}
++CLOCK_AVX __m256i clock_invalid_digits(__m256i x,uint64_t hi,uint64_t add,uint64_t limit){
++  return _mm256_or_si256(_mm256_and_si256(x,_mm256_set1_epi64x(hi)),
++      _mm256_and_si256(_mm256_add_epi64(x,_mm256_set1_epi64x(add)),_mm256_set1_epi64x(limit)));
++}
++template<bool arrival>
++CLOCK_AVX __m256i four_seconds(const ClockRow *r) {
++  auto d=_mm256_xor_si256(four_load<arrival>(r,11),_mm256_set1_epi64x(0x30303a30303a3030ULL));
++  auto pairs=_mm256_add_epi64(tenfold(d),_mm256_srli_epi64(d,8)),mask=_mm256_set1_epi64x(255);
++  auto h=_mm256_and_si256(pairs,mask);
++  auto m=_mm256_and_si256(_mm256_srli_epi64(pairs,24),mask);
++  auto s=_mm256_and_si256(_mm256_srli_epi64(pairs,48),mask);
++  auto result=_mm256_add_epi64(s,_mm256_add_epi64(_mm256_mul_epu32(h,_mm256_set1_epi64x(3600)),
++                                                 _mm256_mul_epu32(m,_mm256_set1_epi64x(60))));
++  if constexpr(!arrival){
++    auto bad=clock_invalid_digits(d,0xf0f0fff0f0fff0f0ULL,0x0606000606000606ULL,0x1010001010001010ULL);
++    auto invalid=_mm256_or_si256(_mm256_cmpgt_epi64(h,_mm256_set1_epi64x(23)),_mm256_cmpgt_epi64(m,_mm256_set1_epi64x(59)));
++    invalid=_mm256_or_si256(invalid,_mm256_cmpgt_epi64(s,_mm256_set1_epi64x(59)));
++    auto okay=_mm256_cmpeq_epi64(_mm256_or_si256(bad,invalid),_mm256_setzero_si256());
++    result=_mm256_blendv_epi8(_mm256_set1_epi64x(-1),result,okay);
++  }
++  return result;
++}
++CLOCK_AVX __m256i four_decimal(__m256i x){
++  auto d=_mm256_and_si256(x,_mm256_set1_epi64x(0x0f0f0f0f0f0f0f0fULL));
++  auto pairs=_mm256_and_si256(_mm256_add_epi64(tenfold(d),_mm256_srli_epi64(d,8)),_mm256_set1_epi64x(0x00ff00ff00ff00ffULL));
++  auto hundreds=_mm256_add_epi64(_mm256_slli_epi64(pairs,6),_mm256_add_epi64(_mm256_slli_epi64(pairs,5),_mm256_slli_epi64(pairs,2)));
++  auto quads=_mm256_and_si256(_mm256_add_epi64(hundreds,_mm256_srli_epi64(pairs,16)),_mm256_set1_epi64x(0x0000ffff0000ffffULL));
++  return _mm256_add_epi64(_mm256_mul_epu32(quads,_mm256_set1_epi64x(10000)),_mm256_srli_epi64(quads,32));
++}
++CLOCK_AVX __m256i four_epoch(const ClockRow *r) {
++  auto first=four_load<false>(r,0),last=four_load<false>(r,5),zero=_mm256_set1_epi64x(0x3030303030303030ULL);
++  auto bad0=clock_invalid_digits(_mm256_xor_si256(first,zero),0xf0f0f0f0f0f0f0f0ULL,0x0606060606060606ULL,0x1010101010101010ULL);
++  auto bad1=clock_invalid_digits(_mm256_xor_si256(last,zero),0xf0f0f0f0f0f0f0f0ULL,0x0606060606060606ULL,0x1010101010101010ULL);
++  auto left=_mm256_mul_epu32(four_decimal(first),_mm256_set1_epi64x(100000));
++  auto right=four_decimal(_mm256_and_si256(last,_mm256_set1_epi64x(~0xffffffULL)));
++  auto okay=_mm256_cmpeq_epi64(_mm256_or_si256(bad0,bad1),_mm256_setzero_si256());
++  return _mm256_blendv_epi8(_mm256_set1_epi64x(bad),_mm256_add_epi64(left,right),okay);
++}
++template<int form>
++__attribute__((target("avx2"))) void clock_block(const ClockRow *r,Time *event,Time *ingested) {
++  alignas(32) int64_t arrival_s[4],event_s[4];
++  _mm256_store_si256(reinterpret_cast<__m256i*>(arrival_s),four_seconds<true>(r));
++  if constexpr(form==13)_mm256_storeu_si256(reinterpret_cast<__m256i*>(event),four_epoch(r));
++  else _mm256_store_si256(reinterpret_cast<__m256i*>(event_s),four_seconds<false>(r));
++  for(unsigned i=0;i<4;++i){
++    Time ad=midnight(r[i].arrival);ingested[i]=ad==bad?bad:ad+arrival_s[i]*1000;
++    if constexpr(form!=13){
++      auto p=r[i].instant;
++      bool valid=p[10]=='T' && event_s[i]>=0;
++      int offset=0;
++      if constexpr(form==25){
++        int h=pair_digits(p+20),m=pair_digits(p+23);
++        valid=valid && (p[19]=='+' || p[19]=='-') && p[22]==':' && unsigned(h)<24 && unsigned(m)<60;
++        if(valid)offset=(h*3600+m*60)*(p[19]=='+'?1:-1);
++      }else valid=valid && p[19]=='Z';
++      Time ed=valid?midnight(p):bad;
++      event[i]=ed==bad?bad:ed+(event_s[i]-offset)*1000;
++    }
++  }
++}
++#undef CLOCK_AVX
++#endif
++template<int width,unsigned Batch,class F> struct ClockBatch {
++  std::array<ClockRow,Batch> rows;
++  unsigned count=0;
++  F &emit;
++  explicit ClockBatch(F &f):emit(f){}
++  void flush() {
++    unsigned i=0;
++#if defined(SHOPPING_X86_CSV) && !defined(SHOPPING_SCALAR_CLOCK_BATCH)
++    if(__builtin_cpu_supports("avx2")){
++      for(;i+4<=count;i+=4){
++        Time event[4],ingest[4];clock_block<width>(rows.data()+i,event,ingest);
++        for(unsigned k=0;k<4;++k)emit(rows[i+k],event[k],ingest[k]);
++      }
++    }
++#endif
++    for(;i<count;++i)emit(rows[i],timestamp(Str(rows[i].instant,width)),ingest_time(Str(rows[i].arrival,20)));
++    count=0;
++  }
++  void add(ClockRow r){rows[count++]=r;if(count==Batch)flush();}
++};
