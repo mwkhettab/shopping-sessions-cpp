@@ -1,9 +1,30 @@
 {
   "base": "29ee0cc5c26291c511cad44aec18c6531f050f79",
   "variants": {
-    "paired-events": ["paired-events"],
-    "click-pairs": ["click-pairs"],
-    "stage192": ["stage192"],
-    "sparse-groups": ["sparse-groups"]
-  }
+    "mapped-release": [
+      "input-release"
+    ],
+    "packed-events": [
+      "stage192",
+      "packed12",
+      "event12-scatter"
+    ],
+    "packed-events-32k": [
+      "stage192",
+      "packed12",
+      "event12-scatter",
+      "bb15"
+    ],
+    "combined-reader": [
+      "stage192",
+      "packed12",
+      "event12-scatter",
+      "bb15",
+      "input-release",
+      "paired-events",
+      "click-pairs",
+      "sparse-groups"
+    ]
+  },
+  "reference_revision": "2398c62544e81903c91ba1aa564d8d0ac02ca80a"
 }

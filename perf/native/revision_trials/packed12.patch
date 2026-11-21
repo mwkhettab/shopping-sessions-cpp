@@ -1,0 +1,507 @@
+diff --git a/cpp/pipeline/parse_event12.hpp b/cpp/pipeline/parse_event12.hpp
+new file mode 100644
+--- /dev/null
++++ b/cpp/pipeline/parse_event12.hpp
+@@ -0,0 +1,212 @@
++#pragma once
++#include "parse_part.hpp"
++#include <concepts>
++
++namespace pipeline::parse {
++#ifndef SHOP_PACKED_EVENTS
++#define SHOP_PACKED_EVENTS 1
++#endif
++inline constexpr bool PACKED_EVENTS=SHOP_PACKED_EVENTS!=0;
++inline constexpr u64 R12_MASK=(u64{1}<<59)-1;
++inline constexpr u64 R12_USER_LIMIT=u64{1}<<22;
++inline constexpr std::size_t R12_BYTES=12,R12_STAGE=192;
++static_assert(BB<=15 && NALIAS<=16 && LINK_OFF%R12_STAGE==0);
++
++inline Rec unpack_event12(const u8* p) {
++    u64 q;u32 h;
++    std::memcpy(&q,p,8);std::memcpy(&h,p+8,4);
++    return {(u64(h)<<32)|(q>>59),q&R12_MASK};
++}
++
++class EvPart {
++    struct alignas(64) Stage {std::array<u8,R12_STAGE> bytes;};
++    struct alignas(64) Page {u8 data[LINK_OFF];Page* next;};
++    static constexpr std::size_t esc_size=1024,esc_bytes=1008;
++    struct alignas(64) Esc {Rec rows[esc_bytes/sizeof(Rec)];Esc* next;};
++    static_assert(sizeof(Page)==CHUNK && sizeof(Esc)==esc_size);
++    std::vector<Stage> stages_;
++    std::vector<u16> fill_;
++    std::vector<Page*> head_;
++    std::vector<std::uintptr_t> cur_;
++    std::vector<u32> pages_,counts_;
++    std::vector<Esc*> escapes_;
++    std::vector<std::uintptr_t> esc_cur_;
++    std::vector<u8> sink_storage_;
++    u8* sink_page_{};
++    u8* block_{};
++    u8* block_end_{};
++    u8* esc_next_{};
++    void* arena_{};
++    u8* (*alloc_)(void*,std::size_t){};
++    bool populate_{};
++    std::array<u64,NB+8> pending_{};
++    std::array<std::array<u64,3>,NB> slow_{};
++    std::size_t nslow_{};
++
++    explicit EvPart(std::size_t n)
++        :stages_(n+1),fill_(n+1),head_(n),cur_(n+1,LINK_OFF),pages_(n),counts_(n),
++         escapes_(n),esc_cur_(n,esc_bytes),sink_storage_(2*CHUNK),populate_(popw()) {
++        void* p=sink_storage_.data();auto space=sink_storage_.size();
++        sink_page_=static_cast<u8*>(std::align(CHUNK,CHUNK,p,space));
++    }
++    [[gnu::noinline]] u8* take4k() {
++        if(block_==block_end_) {
++            block_=alloc_(arena_,BLOCK);block_end_=block_+BLOCK;
++#ifdef __linux__
++            if(populate_) ::madvise(block_,BLOCK,23);
++#endif
++        }
++        auto* out=block_;block_+=CHUNK;return out;
++    }
++    [[gnu::noinline]] std::uintptr_t next_page(std::size_t b,std::uintptr_t old) {
++        if(b==head_.size()) return reinterpret_cast<std::uintptr_t>(sink_page_);
++        auto* next=::new(take4k()) Page;
++        if(old==LINK_OFF) head_[b]=next;
++        else reinterpret_cast<Page*>(old-LINK_OFF)->next=next;
++        ++pages_[b];
++        return reinterpret_cast<std::uintptr_t>(next);
++    }
++    [[gnu::noinline]] std::uintptr_t next_escape(std::size_t b,std::uintptr_t old) {
++        if((reinterpret_cast<std::uintptr_t>(esc_next_)&(CHUNK-1))==0) esc_next_=take4k();
++        auto* next=::new(esc_next_) Esc;esc_next_+=esc_size;
++        if(old==esc_bytes) escapes_[b]=next;
++        else reinterpret_cast<Esc*>(old-esc_bytes)->next=next;
++        return reinterpret_cast<std::uintptr_t>(next);
++    }
++    std::uintptr_t destination(std::size_t b,std::size_t bytes) {
++        auto p=cur_[b];
++        if((p&(CHUNK-1))==LINK_OFF) p=next_page(b,p);
++        cur_[b]=p+bytes;fill_[b]=0;return p;
++    }
++#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
++    template<bool Stream> __attribute__((target("avx512f")))
++    void flush_native(std::size_t n) {
++        for(std::size_t i=0;i<n;++i) {
++            const auto b=pending_[i];
++            auto* dst=reinterpret_cast<__m512i*>(destination(b,R12_STAGE));
++            auto* src=reinterpret_cast<const __m512i*>(stages_[b].bytes.data());
++            for(std::size_t j=0;j<R12_STAGE/64;++j) {
++                const auto value=_mm512_load_si512(src+j);
++                if constexpr(Stream) _mm512_stream_si512(dst+j,value);
++                else _mm512_store_si512(dst+j,value);
++            }
++        }
++    }
++#endif
++    [[gnu::noinline]] void flush(std::size_t n) {
++#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
++        if(__builtin_cpu_supports("avx512f")) {
++            if(NT) flush_native<true>(n);else flush_native<false>(n);
++            return;
++        }
++#endif
++        for(std::size_t i=0;i<n;++i) {
++            auto b=pending_[i];
++            std::memcpy(reinterpret_cast<void*>(destination(b,R12_STAGE)),stages_[b].bytes.data(),R12_STAGE);
++        }
++    }
++    template<class Store> inline void batch(std::size_t n,const u64* bs,const u64* lp,
++                                            const std::array<u64,2>* records,Store store) {
++        std::size_t pending=0;
++        for(std::size_t i=0;i<n;++i) {
++            const auto b=bs[i];auto f=fill_[b];
++            if(f==R12_STAGE) {flush(pending);pending=0;f=0;}
++            store(reinterpret_cast<u8*>(std::uintptr_t(lp[i]))+f,records+i);
++            f+=R12_BYTES;fill_[b]=f;
++            pending_[pending]=b;pending+=f==R12_STAGE;
++        }
++        if(pending) flush(pending);
++    }
++#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
++    __attribute__((target("avx512f,avx512bw,avx512vl")))
++    void native_batch(std::size_t n,const u64* bs,const u64* lp,const std::array<u64,2>* records) {
++        batch(n,bs,lp,records,[](u8* out,const auto* rec) __attribute__((target("avx512f,avx512bw,avx512vl"))) {
++            _mm_mask_storeu_epi8(out,0xfff,_mm_load_si128(reinterpret_cast<const __m128i*>(rec)));
++        });
++    }
++#endif
++public:
++    EvPart()=default;
++    EvPart(const EvPart&)=delete;
++    EvPart& operator=(const EvPart&)=delete;
++    EvPart(EvPart&&)=default;
++    EvPart& operator=(EvPart&&)=default;
++    static EvPart new_unbound(std::size_t n) {return EvPart(n);}
++    template<class Arena> void set_arena(Arena& arena) {
++        arena_=&arena;alloc_=[](void* p,std::size_t n){return static_cast<Arena*>(p)->alloc(n);};
++    }
++    template<class Arena> EvPart(Arena& arena,std::size_t n):EvPart(n) {set_arena(arena);}
++    const u8* lines_ptr() const {return reinterpret_cast<const u8*>(stages_.data());}
++    std::size_t sink_bucket() const {return head_.size();}
++    void push(std::size_t b,u64 w0,u64 w1) {
++        auto p=esc_cur_[b];
++        if((p&(esc_size-1))==esc_bytes) p=next_escape(b,p);
++        *reinterpret_cast<Rec*>(p)={w0,w1};esc_cur_[b]=p+sizeof(Rec);
++    }
++    void defer(std::size_t b,u64 w0,u64 w1) {
++        slow_[nslow_++]={b,w0,w1};
++    }
++    void flush_escapes() {
++        for(std::size_t i=0;i<nslow_;++i){const auto& r=slow_[i];push(r[0],r[1],r[2]);}
++        nslow_=0;
++    }
++    void push_encoded(std::size_t n,const u64* bs,const u64* lp,const std::array<u64,2>* records) {
++#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
++        if(__builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("avx512vl")) {
++            native_batch(n,bs,lp,records);return;
++        }
++#endif
++        batch(n,bs,lp,records,[](u8* dst,const auto* row){std::memcpy(dst,row,R12_BYTES);});
++    }
++    void finish() {
++        for(std::size_t b=0;b<head_.size();++b) {
++            const auto n=fill_[b];
++            if(n) std::memcpy(reinterpret_cast<void*>(destination(b,n)),stages_[b].bytes.data(),n);
++            if(head_[b]) {
++                auto last=(cur_[b]-1)&~std::uintptr_t(CHUNK-1);
++                counts_[b]=(pages_[b]-1)*u32(LINK_OFF/R12_BYTES)+u32((cur_[b]-last)/R12_BYTES);
++            }
++        }
++#if defined(__x86_64__) || defined(_M_X64)
++        if(NT) _mm_sfence();
++#endif
++    }
++    template<class F> requires std::invocable<F&,const u8*,std::size_t,const i8*>
++    void for_each_chunk(std::size_t b,F&& f) const {
++        if(b>=head_.size() || !head_[b]) return;
++        const auto last=(cur_[b]-1)&~std::uintptr_t(CHUNK-1);
++        auto* p=head_[b];
++        while(reinterpret_cast<std::uintptr_t>(p)!=last) {
++            auto* next=p->next;f(p->data,LINK_OFF/R12_BYTES,reinterpret_cast<const i8*>(next));p=next;
++        }
++        f(p->data,(cur_[b]-last)/R12_BYTES,nullptr);
++    }
++    template<class F> void for_each_esc(std::size_t b,F&& f) const {
++        if(b>=escapes_.size() || !escapes_[b]) return;
++        auto* p=escapes_[b];
++        const auto last=(esc_cur_[b]-1)&~std::uintptr_t(esc_size-1);
++        while(reinterpret_cast<std::uintptr_t>(p)!=last) {
++            for(const auto& row:p->rows) f(row);
++            p=p->next;
++        }
++        for(std::size_t i=0;i<(esc_cur_[b]-last)/sizeof(Rec);++i) f(p->rows[i]);
++    }
++    template<class F> void for_each_rec(std::size_t b,F&& f) const {
++        for_each_chunk(b,[&](const u8* p,std::size_t n,const i8*){
++            for(std::size_t i=0;i<n;++i) f(unpack_event12(p+i*R12_BYTES));
++        });
++        for_each_esc(b,f);
++    }
++    // The portable stage can consume bounded synchronous spans as before.
++    template<class F> void for_each(std::size_t b,F&& f) const {
++        std::array<Rec,64> out;std::size_t n=0;
++        for_each_rec(b,[&](Rec r){
++            out[n++]=r;
++            if(n==out.size()) {f(std::span<const Rec>(out));n=0;}
++        });
++        if(n) f(std::span<const Rec>(out.data(),n));
++    }
++    std::size_t count(std::size_t b) const {return counts_[b];}
++};
++using EventPart=std::conditional_t<PACKED_EVENTS,EvPart,Part>;
++}
+diff --git a/cpp/pipeline/model.hpp b/cpp/pipeline/model.hpp
+--- a/cpp/pipeline/model.hpp
++++ b/cpp/pipeline/model.hpp
+@@ -1,13 +1,14 @@
+ #pragma once
+ #include "links_uf.hpp"
+-#include "parse_part.hpp"
++#include "parse_event12.hpp"
+ #include <memory>
+ #include <tuple>
+ #include <unordered_map>
+ 
+ namespace pipeline {
+ struct TState {
+-    parse::Part ev,us;
++    parse::EventPart ev;
++    parse::Part us;
+     std::vector<std::pair<u64,u32>> raws;
+     std::vector<u8> rawbuf;
+     std::vector<u64> odd_users;
+diff --git a/cpp/pipeline/parse.hpp b/cpp/pipeline/parse.hpp
+--- a/cpp/pipeline/parse.hpp
++++ b/cpp/pipeline/parse.hpp
+@@ -87,7 +87,7 @@
+ #endif
+     auto& t=g.t(tid);
+     if(PARTS_READY.load(std::memory_order_relaxed)){t.ev.set_arena(g.ev_arena);t.us.set_arena(g.us_arena);}
+-    else{t.ev=Part(g.ev_arena,g.nb);t.us=Part(g.us_arena,g.nub);}
++    else{t.ev=std::remove_cvref_t<decltype(t.ev)>(g.ev_arena,g.nb);t.us=Part(g.us_arena,g.nub);}
+     if(!CORE_READY.load(std::memory_order_relaxed))t.core=core::Core(g.nc,g.nd,g.row_cap,g.ws_mod,g.day0);
+     auto eb=std::make_unique<EvBatch>();auto cb=std::make_unique<CkBatch>();auto out=std::make_unique<Out>();const auto& tb=tabs(g);
+     const bool use_rd=d.rd && FDS.size()==g.files.size();auto* rb=use_rd?sys::anon(d.rd+8192)+4096:nullptr;
+diff --git a/cpp/pipeline/setup.hpp b/cpp/pipeline/setup.hpp
+--- a/cpp/pipeline/setup.hpp
++++ b/cpp/pipeline/setup.hpp
+@@ -87,12 +87,12 @@
+     auto click_sample=[&]{if(cbytes.done.load(std::memory_order_acquire) && !ctaken.exchange(true,std::memory_order_acq_rel)){keyrec::Sample s;s.add_click_lines(cbytes.get(),4000);crows.set(std::move(s.clicks));}};
+     auto sample_piece=[&](auto j){keyrec::Sample sample;sample.add_event_lines(piece(sbytes.get(),j,ks),5000);spieces[j].set(std::move(sample));};
+     const auto upart=sys::SETUP_PARTS.load(std::memory_order_relaxed);const auto q_ord=2+kp,q_merge=3+kp,q_part=4+kp,q_core=q_part+(upart?1:0),nq=q_core+nt;
+-    std::vector<Slot<std::pair<parse::Part,parse::Part>>> parts(upart?nt:0);
++    std::vector<Slot<std::pair<parse::EventPart,parse::Part>>> parts(upart?nt:0);
+     auto task=[&](std::size_t i){if(i==1)camps.set(campaigns(data));else if(i==0)ptxt.set(map_file(data/"products.csv"));
+         else if(i<q_ord)pparts[i-2].set(products_part(piece(body(ptxt.get()),i-2,kp)));
+         else if(i==q_ord){if(parse::pin_mode())(void)parse::cpu_order();}
+         else if(i>=q_core){const auto nc=camps.get().nc;cores[i-q_core].set(core::Core(nc,nd,rowcap.get(),ws_mod,day0));}
+-        else if(i==q_part){auto [nb,nub]=nbs.get();for(auto& p:parts)p.set(std::pair{parse::Part::new_unbound(nb),parse::Part::new_unbound(nub)});}
++        else if(i==q_part){auto [nb,nub]=nbs.get();for(auto& p:parts)p.set(std::pair{parse::EventPart::new_unbound(nb),parse::Part::new_unbound(nub)});}
+         else if(i==q_merge){std::vector<std::optional<ProdPart>> pv;pv.reserve(kp);for(auto& s:pparts)pv.push_back(s.take());auto prod=products_merge(pv);auto& camp=camps.get().camp;
+             parse::init_tabs_shared(prod.prod.data(),prod.prod.size(),camp.data(),camp.size());lookups.set(std::move(prod));}};
+     auto help=[&]{click_sample();if(sbytes.done.load(std::memory_order_acquire)){for(;;){auto j=snext.fetch_add(1,std::memory_order_relaxed);if(j>=ks)break;sample_piece(j);}}
+diff --git a/cpp/pipeline/parse_packets.hpp b/cpp/pipeline/parse_packets.hpp
+--- a/cpp/pipeline/parse_packets.hpp
++++ b/cpp/pipeline/parse_packets.hpp
+@@ -1,5 +1,6 @@
+ #pragma once
+ #include "ckix.hpp"
++#include "parse_event12.hpp"
+ 
+ namespace pipeline::parse {
+ struct alignas(64) Out {
+@@ -12,6 +13,7 @@
+     u64 wlen, ukey, ekey, ucap, ecap;
+     const u8* ptab;
+     const u8* lines;
++    u64 sinkb{};
+ };
+ struct CkP {
+     i64 cbase;
+@@ -20,11 +22,11 @@
+     std::optional<std::pair<u64,u64>> crange;
+     const u8* lines;
+ };
+-struct EvMasks { u64 regular, special; bool bad_ingest; };
++struct EvMasks { u64 regular, special; bool bad_ingest; u64 purchases{}; };
+ struct CkMasks { u64 regular, special; };
+ 
+-template<bool CheckBad> inline EvMasks ev_scalar(const EvBatch& eb, Out& out, std::size_t n,const EvP& p) {
+-    u64 regular=0;
++template<bool CheckBad,bool Packed=false> inline EvMasks ev_scalar(const EvBatch& eb, Out& out, std::size_t n,const EvP& p) {
++    u64 regular=0,purchases=0;
+     bool bad=false;
+     for(std::size_t i=0;i<n;++i) {
+         const u64 ing=u64(eb.ing[i])-u64(p.ing_base),rel=u64(eb.ts[i])-u64(p.ws);
+@@ -36,16 +38,26 @@
+         const bool normal=eb.uid[i]<=keyrec::MASK && user<p.ucap && alias<NALIAS;
+         const u64 event=keyrec::unscramble(eb.eid[i],p.ekey);
+         const bool evok=eb.eid[i]<=keyrec::MASK && event<p.ecap;
+-        if(evok && (!valid || normal)) regular |= u64{1}<<i;
++        const bool keep=evok && (!valid || normal);
++        if(keep) regular |= u64{1}<<i;
+         u64 word0=valid ? (rel<<33)|(price<<9)|alias : UINT64_MAX;
+-        if(valid && price) word0 |= u64(p.ptab[std::min<std::size_t>(u32(eb.pp[i]),PBOUND)])<<4;
++        if(valid && price) {
++            if constexpr(Packed) purchases|=u64{1}<<i;
++            else word0|=u64(p.ptab[std::min<std::size_t>(u32(eb.pp[i]),PBOUND)])<<4;
++        }
+         // This multiply is exact on the supported ingest interval.
+         const u64 ing_s=(u64(u32(ing))*274877907ull)>>38;
+-        out.rec[i]={word0,(event&(BSIZE-1))|(ing_s<<16)|((valid?user:0)<<37)};
+-        out.ob[i]=event>>BB;
+-        out.lp[i]=u64(std::uintptr_t(p.lines))+out.ob[i]*PART_STAGE_BYTES;
+-    }
+-    return {regular,~regular&active_mask(n),bad};
++        const auto word1=(event&(BSIZE-1))|(ing_s<<16)|((valid?user:0)<<37);
++        if constexpr(Packed) {
++            out.rec[i]={word1|((valid?alias:0)<<59),std::rotl(word0,32)};
++            out.ob[i]=keep?event>>BB:p.sinkb;
++        } else {
++            out.rec[i]={word0,word1};
++            out.ob[i]=event>>BB;
++        }
++        out.lp[i]=u64(std::uintptr_t(p.lines))+out.ob[i]*(Packed?R12_STAGE:PART_STAGE_BYTES);
++    }
++    return {regular,~regular&active_mask(n),bad,purchases};
+ }
+ template<bool Ranged,bool ModeA> inline CkMasks ck_scalar(const CkBatch& cb, Out& out, std::size_t n,const CkP& p) {
+     u64 regular=0,keep=0;
+@@ -66,7 +78,7 @@
+ }
+ 
+ #if defined(__x86_64__)
+-template<bool CheckBad,bool Ifma>
++template<bool CheckBad,bool Ifma,bool Packed=false>
+ PIPELINE_ROUTING_X64 inline EvMasks ev_packet(const EvBatch& eb,Out& out,std::size_t n,const EvP& p) {
+     const auto user_key=splat8(p.ukey&keyrec::MASK), event_key=splat8(p.ekey&keyrec::MASK);
+     const auto even=_mm512_setr_epi64(0,8,1,9,2,10,3,11),odd=_mm512_setr_epi64(4,12,5,13,6,14,7,15);
+@@ -100,16 +112,23 @@
+                      _mm512_or_si512(_mm512_slli_epi64(ins,16),_mm512_slli_epi64(userv,37)));
+         auto ok=__mmask8(~(valid & ~normal) & evok);
+         auto bucket=_mm512_srli_epi64(v,BB);
++        if constexpr(Packed) {
++            const auto q=_mm512_or_si512(word1,_mm512_slli_epi64(_mm512_maskz_mov_epi64(valid,alias),59));
++            word1=_mm512_rol_epi64(word0,32);
++            word0=q;
++            bucket=_mm512_mask_blend_epi64(ok,splat8(p.sinkb),bucket);
++        }
+         _mm512_store_si512(out.rec.data()+j,_mm512_permutex2var_epi64(word0,even,word1));
+         _mm512_store_si512(out.rec.data()+j+4,_mm512_permutex2var_epi64(word0,odd,word1));
+         _mm512_store_si512(out.ob.data()+j,bucket);
+-        _mm512_store_si512(out.lp.data()+j,_mm512_add_epi64(mulu32_8(bucket,splat8(PART_STAGE_BYTES)),splat8(std::uintptr_t(p.lines))));
++        _mm512_store_si512(out.lp.data()+j,_mm512_add_epi64(mulu32_8(bucket,splat8(Packed?R12_STAGE:PART_STAGE_BYTES)),splat8(std::uintptr_t(p.lines))));
+         badb |= u64(bad)<<j;
+         purchases |= u64(pm)<<j;
+         regular |= u64(ok)<<j;
+     }
+     auto active=active_mask(n);
+     purchases &= active;
++    if constexpr(Packed) return {regular&active,~regular&active,(badb&active)!=0,purchases};
+     while(purchases) {
+         const auto i=std::countr_zero(purchases);
+         purchases &= purchases-1;
+@@ -165,14 +184,14 @@
+ }
+ #endif
+ 
+-template<bool CheckBad> inline EvMasks ev_vec(const EvBatch& eb,Out& out,std::size_t n,const EvP& p) {
++template<bool CheckBad,bool Packed=false> inline EvMasks ev_vec(const EvBatch& eb,Out& out,std::size_t n,const EvP& p) {
+ #if defined(__x86_64__)
+     if(routing_x64()) {
+-        if(__builtin_cpu_supports("avx512ifma")) return ev_packet<CheckBad,true>(eb,out,n,p);
+-        return ev_packet<CheckBad,false>(eb,out,n,p);
++        if(__builtin_cpu_supports("avx512ifma")) return ev_packet<CheckBad,true,Packed>(eb,out,n,p);
++        return ev_packet<CheckBad,false,Packed>(eb,out,n,p);
+     }
+ #endif
+-    return ev_scalar<CheckBad>(eb,out,n,p);
++    return ev_scalar<CheckBad,Packed>(eb,out,n,p);
+ }
+ template<bool Ranged,bool ModeA>
+ inline CkMasks ck_vec(const CkBatch& cb,Out& out,std::size_t n,const CkP& p) {
+diff --git a/cpp/pipeline/parse_sink.hpp b/cpp/pipeline/parse_sink.hpp
+--- a/cpp/pipeline/parse_sink.hpp
++++ b/cpp/pipeline/parse_sink.hpp
+@@ -81,11 +81,25 @@
+     [[gnu::noinline]] void ev_flush() {
+         const auto n=std::exchange(eb.n,0); if(!n) return;
+         t.n_ev_rows+=n;
+-        const EvP p{g.ing_base,g.ws,g.wlen,g.ukey,g.ekey,g.ucap,g.ecap,tb.prod.data(),t.ev.lines_ptr()};
+-        const auto [regular,special,bad]=u64(TS_BAD)-u64(p.ing_base)>=ING_MAX*1000 ? ev_vec<false>(eb,out,n,p) : ev_vec<true>(eb,out,n,p);
+-        if(bad) sys::fallback("ingest_ts bad or out of range");
+-        t.ev.push_many(regular,n,out.ob.data(),out.lp.data(),out.rec.data());
+-        for(auto m=special;m;m&=m-1) ev_one(eb.row(std::countr_zero(m)));
++        constexpr bool packed=requires{t.ev.sink_bucket();};
++        EvP p{g.ing_base,g.ws,g.wlen,g.ukey,g.ekey,g.ucap,g.ecap,tb.prod.data(),t.ev.lines_ptr()};
++        if constexpr(packed) {p.ucap=std::min(p.ucap,R12_USER_LIMIT);p.sinkb=t.ev.sink_bucket();}
++        const auto masks=u64(TS_BAD)-u64(p.ing_base)>=ING_MAX*1000
++            ? ev_vec<false,packed>(eb,out,n,p) : ev_vec<true,packed>(eb,out,n,p);
++        if(masks.bad_ingest) sys::fallback("ingest_ts bad or out of range");
++        if constexpr(packed) {
++            const auto sink=std::uintptr_t(p.lines)+p.sinkb*R12_STAGE;
++            for(auto m=masks.purchases&masks.regular;m;m&=m-1) {
++                const auto i=std::countr_zero(m);
++                const auto cat=p.ptab[std::min<std::size_t>(u32(eb.pp[i]),PBOUND)];
++                const auto [q,x]=out.rec[i];
++                t.ev.defer(out.ob[i],std::rotl(x,32)|(u64(cat)<<4),q&R12_MASK);
++                out.ob[i]=p.sinkb;out.lp[i]=sink;
++            }
++            t.ev.push_encoded(n,out.ob.data(),out.lp.data(),out.rec.data());
++            t.ev.flush_escapes();
++        } else t.ev.push_many(masks.regular,n,out.ob.data(),out.lp.data(),out.rec.data());
++        for(auto m=masks.special;m;m&=m-1) ev_one(eb.row(std::countr_zero(m)));
+     }
+     [[gnu::noinline]] void ck_one(const ClRow& r) {
+         const auto rel=u64(r.ts)-u64(g.cbase);
+diff --git a/tests/pipeline/routing_event12.cpp b/tests/pipeline/routing_event12.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/pipeline/routing_event12.cpp
+@@ -0,0 +1,81 @@
++#include "../../cpp/pipeline/parse_packets.hpp"
++#include <cassert>
++#include <cstdio>
++#include <random>
++
++using namespace pipeline;
++struct Arena {
++    std::vector<void*> blocks;
++    u8* alloc(std::size_t n) {
++        auto* p=std::aligned_alloc(parse::CHUNK,n);if(!p) throw std::bad_alloc{};
++        blocks.push_back(p);return static_cast<u8*>(p);
++    }
++    ~Arena(){for(auto* p:blocks)std::free(p);}
++};
++static bool same(Rec a,Rec b) {
++    return a.w1==b.w1 && (a.w0==b.w0 || ((a.w0>>33)==INVALID_TS && (b.w0>>33)==INVALID_TS));
++}
++int main() {
++    constexpr std::size_t nb=5;constexpr u64 uk=0xd795630ab,ek=0xa67340235;
++    constexpr i64 base=1700000000000;
++    std::vector<u8> products(PBOUND+65,8);products[4]=14;
++    for(bool nt:{false,true}) {
++        Arena arena;parse::NT=nt;parse::EvPart part(arena,nb);
++        std::array<std::vector<Rec>,nb> packed,esc;
++        std::mt19937_64 rng(58571);
++        auto in=std::make_unique<EvBatch>();auto scalar=std::make_unique<parse::Out>();
++        auto raw=std::make_unique<parse::Out>();auto vec=std::make_unique<parse::Out>();
++        parse::EvP args{base,base,1209600000,uk,ek,parse::R12_USER_LIMIT,nb*BSIZE,products.data(),
++                        part.lines_ptr(),nb};
++        for(std::size_t t=0;t<900;++t) {
++            const auto n=1+t%64;
++            for(std::size_t i=0;i<n;++i) {
++                auto w=t*64+i,b=(t%4==0?0:rng()%nb);
++                auto slot=(i%9==0?BSIZE-1:rng()%BSIZE);
++                const auto v=w%27;
++                const u64 u=v==0?parse::R12_USER_LIMIT:(v==1?parse::R12_USER_LIMIT-1:rng()%1000);
++                in->eid[i]=v==2?odd_id(i,6):keyrec::scramble(b*BSIZE+slot,ek);
++                in->uid[i]=v==3?ID_EMPTY:v==4?odd_id(i,3):keyrec::scramble((u<<9)|(rng()%NALIAS),uk);
++                in->ts[i]=v==5?TS_BAD:base+i64(rng()%args.wlen);
++                in->ing[i]=base+i64((v==6?0:v==7?ING_MAX-1:rng()%(ING_MAX-1))*1000);
++                in->pp[i]=ev_pp(v%5==1?KIND_PURCHASE:(v==8?KIND_OTHER:KIND_VIEW),v==9?PROD_EMPTY:4,
++                                v%5==1?u32(1+rng()%10000000):0);
++            }
++            const auto a=parse::ev_scalar<true,true>(*in,*scalar,n,args);
++            const auto v=parse::ev_vec<true,true>(*in,*vec,n,args);
++            const auto w=parse::ev_scalar<true,false>(*in,*raw,n,args);
++            assert(a.regular==v.regular && a.special==v.special && a.purchases==v.purchases &&
++                   a.bad_ingest==v.bad_ingest && a.regular==w.regular && !a.bad_ingest);
++            for(std::size_t i=0;i<n;++i) {
++                assert(scalar->rec[i]==vec->rec[i] && scalar->ob[i]==vec->ob[i] && scalar->lp[i]==vec->lp[i]);
++                if(!(a.regular>>i&1)) {assert(vec->ob[i]==nb);continue;}
++                const auto b=vec->ob[i];const Rec expected{raw->rec[i][0],raw->rec[i][1]};
++                if(a.purchases>>i&1) {
++                    const auto [q,x]=vec->rec[i];const auto cat=products[std::min<std::size_t>(u32(in->pp[i]),PBOUND)];
++                    Rec full{std::rotl(x,32)|(u64(cat)<<4),q&parse::R12_MASK};
++                    assert(same(full,expected));part.defer(b,full.w0,full.w1);esc[b].push_back(expected);
++                    vec->ob[i]=nb;vec->lp[i]=std::uintptr_t(args.lines)+nb*parse::R12_STAGE;
++                } else packed[b].push_back(expected);
++            }
++            part.push_encoded(n,vec->ob.data(),vec->lp.data(),vec->rec.data());part.flush_escapes();
++            if(t%5==0) {
++                const auto b=t%nb;Rec full{rng(),(ODDU<<37)|u64(t%BSIZE)};
++                part.push(b,full.w0,full.w1);esc[b].push_back(full);
++            }
++        }
++        part.finish();
++        for(std::size_t b=0;b<nb;++b) {
++            std::size_t i=0,j=0,links=0;const i8* expect=nullptr;
++            part.for_each_chunk(b,[&](const u8* p,std::size_t n,const i8* next){
++                if(expect) assert(reinterpret_cast<const i8*>(p)==expect);
++                assert(n<=parse::LINK_OFF/12 && n);
++                if(next) {++links;assert(n==parse::LINK_OFF/12);}
++                for(std::size_t k=0;k<n;++k) assert(same(parse::unpack_event12(p+12*k),packed[b].at(i++)));
++                expect=next;
++            });
++            part.for_each_esc(b,[&](Rec r){assert(same(r,esc[b].at(j++)));});
++            assert(i==packed[b].size() && j==esc[b].size() && part.count(b)==i && !expect && links>0);
++        }
++    }
++    std::puts("12-byte packets, full escape records, page chains, sink buckets and both store modes passed");
++}

@@ -125,7 +125,13 @@ static void paired_errors() {
 
 int main(int argc,char **argv) {
 #ifdef REQUIRE_NATIVE_EVENT_KERNEL
-    if(!k_free::detail::available()){std::puts("SKIP hardware wide event kernel is unavailable");return 77;}
+    if(!k_free::detail::available()){
+        if(std::getenv("CHECK_SCALAR_FALLBACK")){
+            cases<true>();cases<false>();exhaustive_times();
+            std::puts("Portable fallback matched both references. Paired assembly was skipped on this CPU.");return 0;
+        }
+        std::puts("SKIP hardware wide event kernel is unavailable");return 77;
+    }
 #endif
     cases<true>();cases<false>();exhaustive_times();paired_errors();
 #ifdef ORACLE_INSTRUMENT

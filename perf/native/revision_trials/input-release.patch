@@ -1,0 +1,143 @@
+diff --git a/cpp/pipeline/input_release.hpp b/cpp/pipeline/input_release.hpp
+new file mode 100644
+--- /dev/null
++++ b/cpp/pipeline/input_release.hpp
+@@ -0,0 +1,50 @@
++#pragma once
++#include "model_types.hpp"
++#include <atomic>
++#include <memory>
++#include <span>
++
++namespace pipeline::parse {
++#ifndef SHOP_INPUT_RELEASE_GROUP
++#define SHOP_INPUT_RELEASE_GROUP 8
++#endif
++#ifndef SHOP_INPUT_ADVICE
++#define SHOP_INPUT_ADVICE 2
++#endif
++class InputRelease {
++    std::size_t group_,lag_;
++    std::unique_ptr<std::atomic_bool[]> done_;
++    std::atomic<std::size_t> front_{};
++public:
++    InputRelease(std::size_t n,std::size_t group,std::size_t lag)
++        :group_(std::max<std::size_t>(1,group)),lag_(lag),
++         done_(group_>1?std::make_unique<std::atomic_bool[]>(n):nullptr) {}
++    bool grouped() const {return group_>1;}
++    template<class Release> void finish(std::span<const FileInfo> files,std::span<const Chunk> q,
++                                         std::size_t i,Release&& release) {
++        const auto bounds=[&](std::size_t j){
++            const auto& c=q[j];const auto& f=files[c.file];
++            return std::pair{f.off+c.a,f.off+std::min(c.b,f.len)};
++        };
++        done_[i].store(true,std::memory_order_release);
++        auto f=front_.load(std::memory_order_acquire);
++        if(lag_ && i>=f && i-f>=lag_) {
++            auto [a,b]=bounds(i);if(b>a) release(a,b);
++        }
++        while(f<q.size()) {
++            const auto end=f+std::min(group_,q.size()-f);
++            for(std::size_t j=f;j<end;++j)
++                if(!done_[j].load(std::memory_order_acquire)) return;
++            if(!front_.compare_exchange_weak(f,end,std::memory_order_acq_rel,std::memory_order_acquire)) continue;
++            auto [a,b]=bounds(f);
++            for(std::size_t j=f+1;j<end;++j) {
++                auto [start,stop]=bounds(j);
++                if(start>=b && start-b<=4u*1024*1024) b=stop;
++                else {if(b>a) release(a,b);a=start;b=stop;}
++            }
++            if(b>a) release(a,b);
++            f=end;
++        }
++    }
++};
++}
+diff --git a/cpp/pipeline/parse.hpp b/cpp/pipeline/parse.hpp
+--- a/cpp/pipeline/parse.hpp
++++ b/cpp/pipeline/parse.hpp
+@@ -2,6 +2,7 @@
+ #include "k_free.hpp"
+ #include "links.hpp"
+ #include "parse_links.hpp"
++#include "input_release.hpp"
+ #include <charconv>
+ #include <fstream>
+ #include <numeric>
+@@ -91,16 +92,22 @@
+     if(!CORE_READY.load(std::memory_order_relaxed))t.core=core::Core(g.nc,g.nd,g.row_cap,g.ws_mod,g.day0);
+     auto eb=std::make_unique<EvBatch>();auto cb=std::make_unique<CkBatch>();auto out=std::make_unique<Out>();const auto& tb=tabs(g);
+     const bool use_rd=d.rd && FDS.size()==g.files.size();auto* rb=use_rd?sys::anon(d.rd+8192)+4096:nullptr;
+-    const auto& [q,nckl]=work_queue(g);bool us_open=true;links::Scratch sc;
++    const auto& [q,nckl]=work_queue(g);
++    static InputRelease pages(q.size(),env_size("XL_RELK",SHOP_INPUT_RELEASE_GROUP),env_size("XL_FRLAG",32));
++    const bool grouped=RELEASE && pages.grouped();
++    auto done=[&](std::size_t i) {
++        pages.finish(g.files,q,i,[&](auto a,auto b){sys::release(g.region+a,b-a);});
++    };
++    bool us_open=true;links::Scratch sc;
+     for(;;){if(d.st2q&&!us_open)while(links::job(g,t,sc)){}
+         const auto i=g.qnext.fetch_add(1,std::memory_order_relaxed);
+         if(us_open&&i>=nckl){us_open=false;t.us.finish();if(g.ccap)ckix::flush(out->pd,g.csr);links::us_finished(g,out->pd.end,d.st2q);if(d.st2q)while(links::job(g,t,sc)){};}
+         if(i>=q.size())break;const auto& c=q[i];const auto& f=g.files[c.file];
+-        if(use_rd&&FDS[c.file]>=0){chunk_rd(g,t,*eb,*cb,*out,tb,tid,f,c,FDS[c.file],rb,d.rd);continue;}
++        if(use_rd&&FDS[c.file]>=0){chunk_rd(g,t,*eb,*cb,*out,tb,tid,f,c,FDS[c.file],rb,d.rd);if(grouped)done(i);continue;}
+         std::string_view data(reinterpret_cast<const char*>(g.region+f.off),f.len);
+-        const auto s=c.a==f.hdr?c.a:next_line_start(data,c.a-1),e=c.b>=f.len?f.len:next_line_start(data,c.b-1);if(s>=e)continue;
++        const auto s=c.a==f.hdr?c.a:next_line_start(data,c.a-1),e=c.b>=f.len?f.len:next_line_start(data,c.b-1);if(s>=e){if(grouped)done(i);continue;}
+         parse_buf(g,t,*eb,*cb,*out,tb,tid,f,data.substr(s,e-s),s);
+-        if(RELEASE)sys::release(g.region+f.off+s,e-s);
++        if(grouped) done(i);else if(RELEASE) sys::release(g.region+f.off+s,e-s);
+     }
+     t.ev.finish();if(d.st2q)for(;;){if(links::job(g,t,sc))continue;if(links::done(g))break;sys::spin_loop();}
+     if(rb)::madvise(rb-4096,d.rd+8192,MADV_DONTNEED);
+diff --git a/cpp/pipeline/setup.hpp b/cpp/pipeline/setup.hpp
+--- a/cpp/pipeline/setup.hpp
++++ b/cpp/pipeline/setup.hpp
+@@ -32,6 +32,9 @@
+         chain.bytes[std::size_t(f.kind)]+=f.len;chain.files.push_back({f.kind,off,f.len,SIZE_MAX});if(parallel)parse::set_fd(i,fd);else parse::keep_fd(fd);
+         mapped(f.kind,file_view(chain,chain.files.back()));off+=padded(f.len);
+     }
++    const auto advice=parse::env_size("XL_IOADV",SHOP_INPUT_ADVICE);
++    if(advice==1 || advice==2)
++        ::madvise(chain.region,off,advice==2?MADV_SEQUENTIAL:MADV_RANDOM);
+     sys::lap("s.mmap");return chain;
+ }
+ inline void make_queue(Chain& c,std::size_t nt){auto size=std::clamp<std::size_t>((c.bytes[0]+c.bytes[1]+c.bytes[2])/(nt*16),64u<<10,2u<<20);
+diff --git a/tests/pipeline/routing_input_release.cpp b/tests/pipeline/routing_input_release.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/pipeline/routing_input_release.cpp
+@@ -0,0 +1,32 @@
++#include "../../cpp/pipeline/input_release.hpp"
++#include <array>
++#include <atomic>
++#include <barrier>
++#include <cassert>
++#include <mutex>
++#include <thread>
++#include <vector>
++using namespace pipeline;
++int main() {
++    const std::array<FileInfo,3> files{{{Kind::Ev,2u<<20,8u<<20,0},{Kind::Ck,16u<<20,8u<<20,0},
++                                       {Kind::Lk,32u<<20,8u<<20,0}}};
++    std::vector<Chunk> q;
++    for(unsigned file:{1u,2u,0u}) for(unsigned i=0;i<16;++i) q.push_back({file,i*524288u,(i+1)*524288u});
++    for(std::size_t group:{2u,8u,128u}) for(std::size_t lag:{0u,7u,32u}) {
++        parse::InputRelease r(q.size(),group,lag);
++        std::mutex mutex;std::vector<std::pair<std::size_t,std::size_t>> ranges;
++        std::array<std::thread,8> workers;std::barrier start{8};
++        for(unsigned t=0;t<8;++t) workers[t]=std::thread([&,t]{
++            start.arrive_and_wait();
++            for(std::size_t i=t;i<q.size();i+=8) r.finish(files,q,q.size()-1-i,[&](auto a,auto b){
++                assert(a<b);std::lock_guard lock(mutex);ranges.emplace_back(a,b);});
++        });
++        for(auto& t:workers)t.join();
++        for(const auto& c:q) {
++            auto a=files[c.file].off+c.a,e=files[c.file].off+c.b;
++            assert(std::any_of(ranges.begin(),ranges.end(),[&](auto r){return r.first<=a && r.second>=e;}));
++        }
++        if(!lag && group==8) assert(ranges.size()==6);
++    }
++    parse::InputRelease original(48,1,32);assert(!original.grouped());
++}

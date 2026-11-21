@@ -32,6 +32,8 @@ def build(source_archive, name, changes, output):
         flags = []
         if "sparse-groups" in changes:
             flags.append("-DSHOP_SPARSE_USER_OUTPUT=1")
+        if "event12-scatter" in changes:
+            flags.append("-DSHOP_R12_SCATTER=1")
         if flags:
             tag = "set -- -std=c++20 -O3"
             replace_one(tree / "build.sh", tag, tag + " " + " ".join(flags))
@@ -70,13 +72,23 @@ def build(source_archive, name, changes, output):
                             "--output", "type=local,dest="+str(output/name), tree], stdout=stream, stderr=subprocess.STDOUT, check=True)
             for test, _ in checks:
                 subprocess.run([output/name/"tests"/test], stdout=stream, stderr=subprocess.STDOUT, check=True)
+            cpp_tests = []
             if "stage192" in changes:
-                for test in ("routing_part","routing_packets","routing_sinks"):
-                    exe=tree/test
-                    subprocess.run(["g++-12","-std=c++20","-O2","-pthread","-Wno-ignored-attributes",
-                                    "-Icpp/pipeline","tests/pipeline/"+test+".cpp","cpp/pipeline/sys_global_alloc.cpp","-o",exe],
-                                   cwd=tree,stdout=stream,stderr=subprocess.STDOUT,check=True)
-                    subprocess.run([exe],stdout=stream,stderr=subprocess.STDOUT,check=True)
+                cpp_tests.extend(("routing_part", "routing_packets", "routing_sinks"))
+            if "input-release" in changes:
+                cpp_tests.append("routing_input_release")
+            if "packed12" in changes:
+                cpp_tests.append("routing_event12")
+            if "event12-scatter" in changes:
+                shutil.copy2(HERE / "edge_packets.cpp", tree / "tests/pipeline")
+                cpp_tests.append("edge_packets")
+            for test in cpp_tests:
+                exe = tree / test
+                subprocess.run(["g++-12", "-std=c++20", "-O2", "-pthread", "-Wno-ignored-attributes",
+                                *flags, "-Icpp/pipeline", f"tests/pipeline/{test}.cpp",
+                                "cpp/pipeline/sys_global_alloc.cpp", "-o", exe],
+                               cwd=tree, stdout=stream, stderr=subprocess.STDOUT, check=True)
+                subprocess.run([exe], stdout=stream, stderr=subprocess.STDOUT, check=True)
             if "sparse-groups" in changes:
                 exe=tree/"check-user-groups"
                 subprocess.run(["g++-12","-std=c++20","-O2","-pthread","-Wno-ignored-attributes",
