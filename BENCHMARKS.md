@@ -53,6 +53,22 @@ Four alternatives ran against the corrected GCC control on another four-vCPU Xeo
 
 The first aligned-scanner run landed on an AMD EPYC 7763 with AVX2. Its CPU dispatch selected the portable CSV reader for every binary. All three variants matched the complete output at both sizes. Those timings describe fallback execution. [Portable scanner and parser telemetry](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44949153367/job/136983043827)
 
+Two Xeon 6975P-C runners then confirmed execution of the changed AVX-512 instructions. At 20M the aligned scanner increased paired elapsed time by 14.37% and 14.00%. Using the x86 SHRD instruction to extract a row's mask across two registers increased elapsed time by 13.04% and 13.33% against the scored release. Both variants lost every warm pair at both scales on both hosts, including all 20 final-size comparisons. All tables matched. The release keeps its overlapping row loads.
+
+Four instrumented rounds per host sampled every sixteenth work chunk. Four workers read the same resident inputs. Event field decoding includes callback overhead. The table gives summed worker time. Concurrent work prevents these values from being added directly to elapsed time.
+
+| Parser measurement | 20M, two Xeons | 60M, two Xeons |
+| --- | ---: | ---: |
+| Event field decoding | 508–516 worker-ms | 1,518–1,527 worker-ms |
+| Event classification | 53–54 worker-ms | 157–159 worker-ms |
+| Writing events to partitions | 126 worker-ms | 412–419 worker-ms |
+| Click field decoding | 79–81 worker-ms | 228–234 worker-ms |
+| Writing clicks to partitions | 34–45 worker-ms | 105–107 worker-ms |
+| Reading links | 20–22 worker-ms | 51 worker-ms |
+| First parser worker entry to last exit | 257–259 ms elapsed | 760–761 ms elapsed |
+
+At 20M the sampling changed whole-process time by −0.5% and +0.4% relative to the shipping binary in the same rounds. At 60M the changes were +1.8% and +0.4%. The slowest worker's final flush and wait took at most 0.12 ms in the median round. [First Intel scanner and component profile](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44951545002/job/136990357949) · [Independent Intel repeat](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44951545002/job/136990358243)
+
 ## Partitioned C++ pipeline qualification
 
 The release sources at `faf1047c6cb00cc8099572f5e067d18076375571` decode batches of 64 rows, partition event revisions by ID, build a per-user click index, reconcile sessions across partition boundaries and write the two Parquet tables while processing the remaining people. The executable restarts on its general parser when an input exceeds the compact representation. The Linux build checks CPU features before entering each specialized instruction path.
