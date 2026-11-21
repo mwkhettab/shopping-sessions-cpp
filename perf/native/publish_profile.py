@@ -37,5 +37,5 @@ for root in map(Path,sys.argv[1:]):
         if rows:emit('Top CPU symbols '+report.parent.name,' / '.join(rows[:9]))
     for report in root.rglob('all-notes.json'):
         notes=json.loads(report.read_text())
-        selected=[x for x in notes if x.startswith(('Sampled branch-misses','Sampled cache-misses','20M process PMU','ThreadSanitizer','Sampled source lines','Source line mapping','Line profile unavailable','Docker holdout'))]
+        selected=[x for x in notes if x.startswith(('Sampled branch-misses','Sampled cache-misses','20M process PMU','ThreadSanitizer','Sampled source lines','Source line mapping','Line profile unavailable','Docker practice','Docker final','Docker holdout','Image binary'))]
         if selected:emit('Image, counters and race checks', ' || '.join(selected)[:46500])
