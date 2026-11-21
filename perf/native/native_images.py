@@ -20,6 +20,11 @@ def verify_images(root,area,best,run,note,env):
     if pgo:
         (src/'perf').mkdir(exist_ok=True)
         shutil.copy2(root/'perf/native/train.py',src/'perf/train.py')
+    settings=root/'perf/native/build-settings'/best
+    if settings.is_dir():
+        shutil.copy2(settings/'build.sh',src/'build.sh')
+        shutil.copy2(settings/'Dockerfile',src/'Dockerfile')
+        shutil.copy2(settings/'train.py',src/'perf/train.py')
     control=area/'base'
     for f in ('build.sh','Dockerfile','.dockerignore'):
         shutil.copy2(root/'perf/native'/('image-pgo-'+f.lstrip('.')),control/f)

@@ -37,6 +37,10 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/shopping-python"
           "$RUNNER_TEMP/shopping-python/bin/pip" install --quiet pyarrow==21.0.0 polars==2.1.0
           if ! command -v g++-12; then sudo apt-get -qq update && sudo apt-get install -y g++-12; fi
+          if ! command -v llvm-profdata-16 || ! command -v clang++-16 || ! command -v ld.lld-16; then
+            sudo apt-get -qq update
+            sudo apt-get install -y clang-16 llvm-16 lld-16 || true
+          fi
           lscpu
           df -h .
       - name: Validate and measure fresh processes

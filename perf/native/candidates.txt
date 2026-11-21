@@ -1,1 +1,1 @@
-base fin-slabkey-pgo spanbins-pgo chaincompact-pgo chainbins-pgo
+base fin-slabkey-pgo keystripe-pgo tagprobe-pgo quotient-pgo quotientscalar-pgo quotienttag-pgo gcctune-pgo gcclto-pgo gccdiverse-pgo clang16-pgo clang16thin-pgo
