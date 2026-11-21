@@ -30,7 +30,11 @@ template<int mode> void probe(const fs::path &dir,unsigned threads) {
           d.semantics+=static_cast<uint64_t>(ingest)+static_cast<uint64_t>(e.ts)+e.price+e.category;
           ++d.rows;
           if constexpr(mode>=2) {
+            #if __has_include("packed_event_id.hpp")
+            d.keys+=EventIds::encode(r[0],d.ids).hash();
+#else
             d.keys+=d.ids.encode(r[0],'e').hash();
+#endif
             if(e.ts!=bad) d.keys+=d.ids.encode(r[1],'u').hash();
           }
         }

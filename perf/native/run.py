@@ -136,6 +136,12 @@ def main():
                 run(unit)
             if name.startswith('dest'):
                 run(python,root/'perf/native/dest_oracle.py',binary)
+            for trigger,suite in [('packed_revision12.hpp','packed_revision_test.cpp'),('user_plane.hpp','user_plane_test.cpp'),('exact_revision_slots.hpp','exact_revision_slots_test.cpp'),('sparse_raw_events.hpp','raw_payload_test.cpp')]:
+                if (src/'cpp'/trigger).is_file():
+                    opts=['-DSHOP_TEST_WORD'] if trigger=='sparse_raw_events.hpp' and (src/'cpp/raw_event_words.hpp').is_file() else []
+                    run(compiler,'-std=c++20','-O2','-fsanitize=undefined','-fno-sanitize-recover=all',*opts,'-I',src/'cpp',root/'perf/native'/suite,'-o',unit)
+                    run(unit)
+            if (src/'cpp/exact_revision_slots.hpp').is_file():run(python,root/'perf/native/packed_id_oracle.py',binary)
             binaries.append(binary)
         except (subprocess.CalledProcessError,OSError) as exc:
             if name in ('base',release_control): raise
@@ -290,9 +296,16 @@ def main():
         if (area/'bin'/label).is_file():collect(root,area,label,note,run,env)
     baseline_digests=json.loads((outcomes/'input-probe-base.json').read_text())['digests']
     for filepath in outcomes.glob('input-probe-*.json'):
-        if json.loads(filepath.read_text())['digests']!=baseline_digests:
-            raise ValueError('different row, time or key digests: '+filepath.name)
-    note('Cumulative input digests','The released reader and selected challenger matched all control digests.')
+        data=json.loads(filepath.read_text());digests=data['digests']
+        variant=area/data['variant']
+        for mode,digest in digests.items():
+            fields=digest.split();reference=baseline_digests[mode].split()
+            # Hash sums are meaningful only for the same reversible encoding.
+            # Row, length and semantic checksums remain directly comparable.
+            if (variant/'cpp/user_plane.hpp').is_file() or (variant/'cpp/packed_event_id.hpp').is_file():
+                fields.pop(2);reference.pop(2)
+            if fields!=reference:raise ValueError('different observable input checksums: '+filepath.name)
+    note('Cumulative input digests','Full row, length and semantic checksums match. Hash sums are compared for identical encodings. Both complete output tables are compared for every candidate.')
     from phase_pmu import collect as phase_counters
     for label in dict.fromkeys([release_control,practice_winner]):
         if (area/'bin'/label).is_file():phase_counters(root,area,label,note,run,env)
