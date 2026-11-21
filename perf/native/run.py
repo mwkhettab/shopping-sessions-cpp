@@ -141,16 +141,22 @@ def main():
             note('Alternating '+scale+' '+binary.name,f'median {statistics.median(times):.4f} s, runs {times}.')
         # Request eviction only for this job's generated CSVs and record the
         # actual residency before the executable starts.
-        for b in [binary0,best]:
-            os.sync()
-            for csv in data.rglob('*.csv'):
-                with csv.open('rb') as stream:
-                    os.posix_fadvise(stream.fileno(),0,0,os.POSIX_FADV_DONTNEED)
-            cold=outcomes/(scale+'-cold-'+b.name+'.jsonl')
-            run(python,root/'perf/measure.py',data,b,'--runs','1','--warmup','0','--residency','--profile','--output-parent',area,'--log',cold)
-            rec=json.loads(cold.read_text())
-            note('Eviction '+scale+' '+b.name,f"{rec['wall_s']:.3f} s, starting residency {rec['resident_before']:.3f}, major faults {rec['major']}, input blocks {rec['inblock']}.")
+        selected=[b for b in binaries if b.name in ('base','fin-slabrange-pgo','fin-slabprefetch-pgo','fin-slabadvice-pgo')]
+        if best not in selected: selected.append(best)
+        observations={b:[] for b in selected}
+        for iteration in range(3):
+            start_index=iteration%len(selected)
+            for b in selected[start_index:]+selected[:start_index]:
+                os.sync()
+                for csv in data.rglob('*.csv'):
+                    with csv.open('rb') as stream: os.posix_fadvise(stream.fileno(),0,0,os.POSIX_FADV_DONTNEED)
+                cold=outcomes/(scale+'-cold-'+b.name+'-'+str(iteration)+'.jsonl')
+                run(python,root/'perf/measure.py',data,b,'--runs','1','--warmup','0','--residency','--profile','--output-parent',area,'--log',cold)
+                rec=json.loads(cold.read_text())
+                observations[b].append((round(rec['wall_s'],3),round(rec['resident_before'],3),rec['major']))
+        for b,obs in observations.items(): note('Eviction '+scale+' '+b.name,f"(seconds, starting residency, major faults) {obs}")
         if scale=='practice':
+            practice_winner=best.name
             src=area/best.name
             run('sh','build.sh',cwd=src,extra={'CXX':shutil.which('g++-12'),'PYTHON':python,'DIAGNOSTICS':'1'})
             with tempfile.TemporaryDirectory(dir=area) as temp:
@@ -158,14 +164,20 @@ def main():
                 (outcomes/'profile.txt').write_text(proc.stderr)
                 note('Profile '+best.name,' '.join(proc.stderr.splitlines()[-12:])[-1150:])
         publish()
+    from native_images import verify_images
+    try:
+        verify_images(root,area,practice_winner,run,note,env)
+    except Exception as exc:
+        note('Docker qualification error',repr(exc))
+        raise
 
 published=0
 def publish():
     global published
     while published<len(notes):
-        payload=' || '.join(notes[published:published+4]).replace('%','%25').replace('\r','%0D').replace('\n','%0A')
+        payload=' || '.join(notes[published:published+6]).replace('%','%25').replace('\r','%0D').replace('\n','%0A')
         print(f'::notice file=BENCHMARKS.md,line=1,title=Native results {published+1}::{payload}',flush=True)
-        published+=min(4,len(notes)-published)
+        published+=min(6,len(notes)-published)
 if __name__=='__main__':
     try: main()
     except BaseException as exc:

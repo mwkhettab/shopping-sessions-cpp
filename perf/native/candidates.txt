@@ -1,1 +1,1 @@
-base clean-index clean-radix clean-graph clean-graphpages clean-slab clean-pages release-key release-keyindex release-keyradix release-range release-few release-all release-rangegraph release-rangeradix release-rangeindex release-range-pgo release-range-lto release-rangeradix-pgo clean-index-pgo
+base clean-graphpages fin-slabkey fin-slabrange fin-slabfew fin-slaball fin-slabrangeonly fin-slabkey-pgo fin-slabrange-pgo fin-slabfew-pgo fin-slaball-pgo fin-slabprefetch-pgo fin-slabadvice-pgo
