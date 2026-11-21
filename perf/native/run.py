@@ -30,7 +30,7 @@ def main():
     cpu=Path('/proc/cpuinfo').read_text().splitlines()
     model=next(x.split(':',1)[1].strip() for x in cpu if x.startswith('model name'))
     flags=next(x.split(':',1)[1].split() for x in cpu if x.startswith('flags'))
-    note('Hardware',f'{model}, {env["NCPU"]} workers, affinity {sorted(os.sched_getaffinity(0))}, AVX-512BW {"avx512bw" in flags}.')
+    note('Hardware',f'{model}, {env["NCPU"]} workers, affinity {sorted(os.sched_getaffinity(0))}, AVX-512BW {"avx512bw" in flags}, VBMI2 {"avx512_vbmi2" in flags}.')
     note("Control","Official 0.99-second commit 33fb788bf962900617e8c0455d366f7f0a5d7eeb, byte-checked sources. A second independently trained build measures build variance.")
     candidates=(root/'perf/native/candidates.txt').read_text().split()
     if 'avx512bw' not in flags: candidates=[n for n in candidates if not n.startswith('v512')]
@@ -102,7 +102,7 @@ def main():
         note('Floor '+mode,str([round(x,4) for x in times]))
     final_list=(root/'perf/native/final.txt').read_text().split()
     performance={}
-    for scale in (['practice','final'] if final_list else ['practice']):
+    for scale in (['practice','final','holdout'] if final_list else ['practice']):
         if scale=='final':
             ranked=sorted((n for n in performance if n!='base'),key=performance.get)
             if '@best' in final_list: final_list+=ranked[:2]
@@ -117,8 +117,11 @@ def main():
             for part in range(3):
                 run(exe,'--seed','1','--events','1000000','--clicks','250000','--threads','4','--output',area/'dev-check',extra={'PART_CLASSES':'3','PART_CLASS':str(part)})
             run('diff','-qr',area/'dev',area/'dev-check')
+        if scale in ('final', 'holdout'):
+            seed = '47' if scale=='final' else '733'
+            note('60M population '+scale, 'Public generator seed '+seed+', sixty million requested events and fifteen million requested clicks.')
             for part in range(3):
-                run(exe,'--seed','47','--events','60000000','--clicks','15000000','--threads','4','--output',area/'final',extra={'PART_CLASSES':'3','PART_CLASS':str(part)})
+                run(exe,'--seed',seed,'--events','60000000','--clicks','15000000','--threads','4','--output',area/scale,extra={'PART_CLASSES':'3','PART_CLASS':str(part)})
         data=area/scale
         ref=area/(scale+'-oracle')
         binary0=area/'bin/base'
@@ -128,8 +131,11 @@ def main():
             with tempfile.TemporaryDirectory(dir=area) as d:
                 run(b,data,d)
                 run(python,root/'perf/native/compare_large.py',d,ref)
+        import pyarrow.parquet as pq
+        row_counts = {table:sum(pq.ParquetFile(file).metadata.num_rows for file in (ref/table).glob('*.parquet')) for table in ('user_daily','campaign_daily')}
+        note('Exact '+scale,str(row_counts)+' compared by schema, unique daily keys, nulls and every value.')
         path=outcomes/(scale+'.jsonl')
-        run(python,root/'perf/measure.py',data,*binaries,'--profile','--preload','--runs','3' if scale=='final' else '5',
+        run(python,root/'perf/measure.py',data,*binaries,'--profile','--preload','--runs','5' if scale=='practice' else '3',
             '--warmup','1','--output-parent',area,'--log',path)
         for b in binaries:
             rows=[r for r in map(json.loads,path.read_text().splitlines()) if r['round']>=0 and r['binary']==str(b)]
@@ -150,12 +156,13 @@ def main():
         for binary in (binary0,best):
             times=[round(x['wall_s'],4) for x in pairs if x['round']>=0 and x['binary']==str(binary)]
             note('Alternating '+scale+' '+binary.name,f'median {statistics.median(times):.4f} s, runs {times}.')
+        publish()
         # Request eviction only for this job's generated CSVs and record the
         # actual residency before the executable starts.
         selected=[b for b in binaries if b.name in ('base','fin-slabkey-pgo')]
         if best not in selected: selected.append(best)
         observations={b:[] for b in selected}
-        for iteration in range(3):
+        for iteration in range(0 if scale=='holdout' else 3):
             start_index=iteration%len(selected)
             for b in selected[start_index:]+selected[:start_index]:
                 os.sync()
@@ -165,7 +172,8 @@ def main():
                 run(python,root/'perf/measure.py',data,b,'--runs','1','--warmup','0','--residency','--profile','--output-parent',area,'--log',cold)
                 rec=json.loads(cold.read_text())
                 observations[b].append((round(rec['wall_s'],3),round(rec['resident_before'],3),rec['major']))
-        for b,obs in observations.items(): note('Eviction '+scale+' '+b.name,f"(seconds, starting residency, major faults) {obs}")
+        for b,obs in observations.items():
+            if obs: note('Eviction '+scale+' '+b.name,f"(seconds, starting residency, major faults) {obs}")
         if scale=='practice':
             practice_winner=best.name
             src=area/best.name
@@ -174,17 +182,18 @@ def main():
                 proc=subprocess.run([src/'build/shopping-profile',data,temp],env=env|{'PROFILE':'1'},capture_output=True,text=True,check=True)
                 (outcomes/'profile.txt').write_text(proc.stderr)
                 note('Profile '+best.name,' '.join(proc.stderr.splitlines()[-12:])[-1150:])
+        if scale in ('final', 'holdout'):
+            from native_images import verify_images
+            scales = [('practice',5),('final',3)] if scale=='final' else [('holdout',3)]
+            verify_images(root,area,practice_winner,run,note,env,scales)
+            if scale=='final':
+                # This job generated these input files and finished all seed-47 comparisons.
+                shutil.rmtree(data)
         publish()
     from input_profile import collect
     collect(root,area,'base',note,run,env)
     from extra_checks import scaling, race
     scaling(root,area,practice_winner,note,run,env)
-    from native_images import verify_images
-    try:
-        verify_images(root,area,practice_winner,run,note,env)
-    except Exception as exc:
-        note('Docker qualification error',repr(exc))
-        raise
     race(root,area,practice_winner,note,run,env)
 
 published=0

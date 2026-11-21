@@ -1,1 +1,1 @@
-base fin-slabkey-pgo direct512-pgo streamavx2-pgo stream512-pgo @best
+base fin-slabkey-pgo packedrows-pgo shortkeys-pgo endkeys-pgo @best

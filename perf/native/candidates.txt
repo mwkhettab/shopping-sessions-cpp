@@ -1,1 +1,1 @@
-base fin-slabkey-pgo direct512-pgo streamavx2-pgo stream512-pgo keystripe-pgo
+base fin-slabkey-pgo teampool-pgo teampin-pgo teambatch-pgo packedrows-pgo shortkeys-pgo endkeys-pgo

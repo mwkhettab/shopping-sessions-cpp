@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from statistics import median
 
-def verify_images(root,area,best,run,note,env):
+def verify_images(root,area,best,run,note,env,scales):
     meter=area/'image-meter'
     run('gcc','-O2','-static',root/'perf/native/meter.c','-o',meter)
     tags=['shopping-native:baseline','shopping-native:candidate']
@@ -34,7 +34,7 @@ def verify_images(root,area,best,run,note,env):
     run('docker','build','--platform','linux/amd64','-t',tags[1],src)
     fingerprint=subprocess.check_output(['docker','run','--rm','--platform','linux/amd64','--entrypoint','sha256sum',tags[1],'/app/shopping'],text=True).split()[0]
     note('Image binary '+best,f'sha256 {fingerprint}')
-    for scale,repeats in [('practice',5),('final',3)]:
+    for scale,repeats in scales:
         data=area/scale
         totals={tag:[] for tag in tags}
         for round_num in range(-1,repeats):
