@@ -46,6 +46,10 @@ struct alignas(BATCH_ALIGN) EvBatch {
     EvBatch() {
         scratch.fill(SCRATCH_INIT);
         scratch[2] = scratch[3] = 0;
+#if defined(SHOP_PAIRED_EVENT_KERNEL)
+        // Commas hash to day slot 48. Its initial key must reject eleven commas.
+        scratch[48*4+1] ^= u64(','^'-')<<8;
+#endif
     }
     EvRow row(std::size_t i) const {
         const u64 p = pp[i];

@@ -1,6 +1,10 @@
 #include "k_free.hpp"
 #if defined(__x86_64__)
 #include "k_free_tables.hpp"
+#if defined(__ELF__) && defined(SHOP_PAIRED_EVENT_KERNEL) && defined(SHOP_KERNEL_ABSOLUTE_TABLES)
+#define SHOP_HAVE_PAIRED_EVENT_KERNEL
+#include "k_free_event_tables.hpp"
+#endif
 #include <bit>
 #include <cstring>
 #include <immintrin.h>
@@ -356,8 +360,8 @@ inline Step ev_d(Cx<EvBatch> &cx,P p,const EvSt &st,P next,std::size_t &w) {
     auto ksub=_mm256_testn_epi64_mask(d,ld2(j.f.ksel.data()));
     auto r=_mm256_add_epi64(_mm256_mask_sub_epi64(_mm256_add_epi64(t,f),ksub,t,f),st.days);
     cx.b->ts[w]=_mm_extract_epi64(_mm256_castsi256_si128(r),1);
-    auto dst=reinterpret_cast<u8 *>(cx.b)+offsetof(EvBatch,ing)+8*w;
-    _mm_storeu_si128(reinterpret_cast<V *>(dst),_mm256_extracti128_si256(r,1));
+    // The next ingest slot can already hold the other half of a decoded pair.
+    cx.b->ing[w]=_mm_cvtsi128_si64(_mm256_extracti128_si256(r,1));
     if (nz(_mm256_ternarylogic_epi64(ba,bb,st.bad2,0xfe))) {
         auto other=_mm256_or_si256(st.bad,_mm256_and_si256(_mm256_or_si256(ba,bb),_mm256_set_epi64x(-1,-1,0,0)));
         if (nz(other)) return {ev_cold(cx,p,w),true};
@@ -431,6 +435,23 @@ inline P cl_fast(Cx<CkBatch> &cx,P p,CkMasks k,std::size_t &w) {
     return ck_cold(cx,p,w);
 }
 #if defined(__ELF__)
+#ifdef SHOP_HAVE_PAIRED_EVENT_KERNEL
+struct EventExit { u64 code; P line; i64 *write; };
+struct EventResume { P line; i64 *write; };
+static_assert(sizeof(EventExit)==24 && sizeof(EventResume)==16);
+extern "C" void shopping_kernel_event_loop(P,i64 *,EvBatch *,Cx<EvBatch> *,P,Sink<EvBatch> *,EventExit *);
+extern "C" [[gnu::used,gnu::noinline]] void shopping_kernel_event_flush(Sink<EvBatch> *s) {
+    s->ev_flush();
+}
+extern "C" [[gnu::used,gnu::noinline]] u64 shopping_kernel_event_purchase(P,P next,u64 *output) {
+    return ev_purchase(next,*output);
+}
+extern "C" [[gnu::used,gnu::noinline]] EventResume shopping_kernel_event_redo(Cx<EvBatch> *cx,P line,i64 *write) {
+    auto slot=std::size_t(write-cx->b->ts.data());
+    auto next=ev_fast(*cx,line,ev_masks(line),slot);
+    return {next,cx->b->ts.data()+slot};
+}
+#endif
 struct ClickExit {u64 code; P line; i64 *write;};
 static_assert(sizeof(ClickExit)==24);
 extern "C" void shopping_kernel_click_loop(P,i64 *,void *,ClickExit *);
@@ -447,6 +468,19 @@ void events_x86(Bytes buf,Sink<EvBatch> sink,bool chain) {
     constexpr std::size_t reach=3*(40+64)+2,far=(NB+1)*(40+64+1);
     if (!chain && buf.size()>=reach+far) {
         auto limit=cx.end-reach-far;
+#ifdef SHOP_HAVE_PAIRED_EVENT_KERNEL
+        while (p<=limit) {
+            if (w&1) {
+                p=ev_fast(cx,p,ev_masks(p),w);
+                continue;
+            }
+            EventExit out;
+            shopping_kernel_event_loop(p,cx.b->ts.data()+w,cx.b,&cx,limit,&cx.sink,&out);
+            p=out.line;
+            w=std::size_t(out.write-cx.b->ts.data());
+            if (out.code==1) p=ev_fast(cx,p,ev_masks(p),w);
+        }
+#else
         while (p<=limit) {
             auto k=ev_masks(p);auto p1=k.next(p);
             EvSt st;
@@ -464,6 +498,7 @@ void events_x86(Bytes buf,Sink<EvBatch> sink,bool chain) {
                 k1=k2;
             }
         }
+#endif
     }
     constexpr std::size_t lookahead=2*(40+64)+1;
     while (cx.end-p>=std::ptrdiff_t(lookahead)) {
