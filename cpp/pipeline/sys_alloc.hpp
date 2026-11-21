@@ -13,14 +13,23 @@ inline bool a_mine(void *p) {
     const auto base=A_BASE.load(relaxed), n=reinterpret_cast<std::uintptr_t>(p);
     return base && n>=base && n<A_END.load(relaxed);
 }
+inline void* system_allocate(std::size_t n,std::size_t al,bool zero) noexcept {
+    n=std::max<std::size_t>(n,1);
+    if (!std::has_single_bit(al)) return nullptr;
+    if (al<=alignof(std::max_align_t)) return zero ? std::calloc(1,n) : std::malloc(n);
+    void* p=nullptr;
+    if (::posix_memalign(&p,al,n)) return nullptr;
+    if (zero) std::memset(p,0,n);
+    return p;
+}
 class RegionResource final:public std::pmr::memory_resource {
     void *do_allocate(std::size_t n,std::size_t al) override {return get(n,al,false);}
     void do_deallocate(void *p,std::size_t n,std::size_t al) override {deallocate_block(p,n,al);}
     bool do_is_equal(const memory_resource &rhs) const noexcept override {return this==&rhs;}
 public:
-    static void *get(std::size_t n,std::size_t al,bool zero) {
+    static void *try_region(std::size_t n,std::size_t al,bool zero) noexcept {
         const auto c=a_class(n,al);
-        if (A_BASE.load(relaxed) && al<=4096 && c<sizeof(std::size_t)*8) {
+        if (A_BASE.load(std::memory_order_acquire) && al<=4096 && std::has_single_bit(al) && c<sizeof(std::size_t)*8) {
             auto &tl=local_alloc;
             const auto sz=std::size_t{1}<<c;
             if (auto h=tl.free[c]) {
@@ -42,16 +51,22 @@ public:
                 if (a) {tl.cur=a+sz; return reinterpret_cast<void*>(a);}
             } else if (auto addr=a_region(sz,sz>=HP?HP:4096)) return reinterpret_cast<void*>(addr);
         }
-        auto *result=std::pmr::new_delete_resource()->allocate(n,al);
-        if (zero) std::memset(result,0,n);
-        return result;
+        return nullptr;
+    }
+    static void *get(std::size_t n,std::size_t al,bool zero) {
+        if (auto* p=try_region(n,al,zero)) {
+            protect_managed(reinterpret_cast<std::uintptr_t>(p),std::size_t{1}<<a_class(n,al));
+            return p;
+        }
+        if (auto* p=system_allocate(n,al,zero)) return p;
+        throw std::bad_alloc{};
     }
     static void deallocate_block(void *p,std::size_t n,std::size_t al) {
         if (a_mine(p)) {
             auto &head=local_alloc.free[a_class(n,al)];
             std::memcpy(p,&head,sizeof(head));
             head=reinterpret_cast<std::uintptr_t>(p);
-        } else std::pmr::new_delete_resource()->deallocate(p,n,al);
+        } else std::free(p);
     }
 };
 inline RegionResource region_resource;

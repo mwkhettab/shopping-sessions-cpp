@@ -29,6 +29,22 @@ inline std::array<std::atomic_bool,16> PINNED{};
 inline std::atomic<u64> SPIN_TICKS{100000};
 inline std::atomic<std::size_t> SETUP_KP{}, A_BASE{}, A_END{}, A_NEXT{};
 
+// A page with live C++ storage must survive the final output-page release. New
+// allocations wait only if another thread is discarding that particular page.
+inline constexpr u8 A_UNCLAIMED=0,A_MANAGED_PAGE=1,A_DISCARDING=2;
+inline std::array<std::atomic<u8>, A_REGION/HP> A_MANAGED{};
+inline void protect_managed(std::uintptr_t p,std::size_t n) noexcept {
+    const auto off=p-A_BASE.load(relaxed),lo=off/HP,hi=(off+n-1)/HP;
+    for (auto i=lo;i<=hi;++i) {
+        auto state=A_MANAGED[i].load(std::memory_order_acquire);
+        while (state!=A_MANAGED_PAGE) {
+            if (state==A_UNCLAIMED && A_MANAGED[i].compare_exchange_weak(state,A_MANAGED_PAGE,
+                  std::memory_order_acq_rel,std::memory_order_acquire)) break;
+            state=A_MANAGED[i].load(std::memory_order_acquire);
+        }
+    }
+}
+
 inline void detect_pages() {
     std::ifstream f("/sys/kernel/mm/transparent_hugepage/enabled");
     std::string modes;
@@ -50,9 +66,20 @@ inline void release(const u8 *p,std::size_t bytes) {
 inline void release_heap_part(std::size_t tid,std::size_t nt) {
     const auto base=A_BASE.load(relaxed);
     if (!base) return;
-    const auto used=(A_NEXT.load(relaxed)-base)/HP+1;
-    const auto a=used*tid/nt*HP, b=used*(tid+1)/nt*HP;
-    release(reinterpret_cast<const u8*>(base+a),b-a);
+    const auto used=(A_NEXT.load(relaxed)-base+HP-1)/HP;
+    const auto lo=used*tid/nt,hi=used*(tid+1)/nt;
+    auto discard=[&](std::size_t a,std::size_t b){
+        if (a==b) return;
+        release(reinterpret_cast<const u8*>(base+a*HP),(b-a)*HP);
+        for (auto j=a;j<b;++j) A_MANAGED[j].store(A_UNCLAIMED,std::memory_order_release);
+    };
+    auto start=lo;
+    for (auto i=lo;i<hi;++i) {
+        u8 state=A_UNCLAIMED;
+        if (A_MANAGED[i].compare_exchange_strong(state,A_DISCARDING,std::memory_order_acq_rel)) continue;
+        discard(start,i);start=i+1;
+    }
+    discard(start,hi);
 }
 inline bool pin_to(std::size_t cpu) {
 #if defined(__linux__)
@@ -110,8 +137,10 @@ inline std::size_t a_region(std::size_t size,std::size_t alignment) {
     }
 }
 inline void alloc_enable() {
+    static std::atomic_flag installing{};
+    if (A_BASE.load(std::memory_order_acquire) || installing.test_and_set(std::memory_order_acquire)) return;
     void *p=::mmap(nullptr,A_REGION+HP,PROT_READ|PROT_WRITE,anonymous_flags,-1,0);
-    if (p==MAP_FAILED) return;
+    if (p==MAP_FAILED) {installing.clear(std::memory_order_release);return;}
     const auto a=(reinterpret_cast<std::uintptr_t>(p)+HP-1)&~(HP-1);
     advise_pages(reinterpret_cast<void*>(a),A_REGION,HUGE_PAGES.load(relaxed));
     A_NEXT.store(a); A_END.store(a+A_REGION); A_BASE.store(a);
