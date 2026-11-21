@@ -1,0 +1,16 @@
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -769,8 +769,11 @@
+   resolve_revisions(workers, threads, anchor);
+   timer.mark("global event dedup and loser removal");
+   std::vector<Result> results(threads);
+-  for (auto &result : results)
+-    result.configure(window, cat, threads);
++  size_t rows_hint=std::min<size_t>(event_count/8,(size_t(512)<<20)/sizeof(UserDay))/threads;
++  for (auto &result : results) {
++    result.users.reserve(rows_hint);
++    result.configure(window,cat,threads);
++  }
+   process_people(workers, results, cat, threads, timer, layout);
+   fs::create_directories(output / "user_daily");
+   fs::create_directories(output / "campaign_daily");

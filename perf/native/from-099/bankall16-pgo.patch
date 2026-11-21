@@ -1,0 +1,88 @@
+--- /dev/null
++++ b/cpp/bank_buffer.hpp
+@@ -0,0 +1,23 @@
++#pragma once
++template<class T,size_t Banks,size_t Capacity> struct BankBuffer {
++  static_assert(std::has_single_bit(Banks) && shards%Banks==0);
++  struct Bank {
++    std::array<T,Capacity> records;
++    std::array<uint16_t,Capacity> shard;
++    size_t used{};
++  };
++  std::array<Bank,Banks> banks;
++  void flush(Bank &bank,PartitionSlab<T> &target) {
++    for(size_t i=0;i<bank.used;++i)
++      target[bank.shard[i]].push_back(bank.records[i]);
++    bank.used=0;
++  }
++  void append(size_t shard,T value,PartitionSlab<T> &target) {
++    auto &bank=banks[shard/(shards/Banks)];
++    size_t at=bank.used++;
++    bank.records[at]=value;
++    bank.shard[at]=uint16_t(shard);
++    if(bank.used==Capacity)flush(bank,target);
++  }
++  void finish(PartitionSlab<T> &target){for(auto &bank:banks)flush(bank,target);}
++};
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -20,6 +20,7 @@
+ };
+ template <class T> using Bins = std::array<std::vector<T>, shards>;
+ #include "partition_slab.hpp"
++#include "bank_buffer.hpp"
+ template <class Layout> struct ScanWorker {
+   using EventData = typename Layout::E;
+   using ClickData = typename Layout::C;
+@@ -28,6 +29,10 @@
+   PartitionSlab<Candidate> candidates;
+   PartitionSlab<std::pair<Key, EventData>> events;
+   PartitionSlab<std::pair<Key, ClickData>> clicks;
++  BankBuffer<Candidate,16,256> revision_bank;
++  BankBuffer<std::pair<Key, EventData>,16,256> event_bank;
++  BankBuffer<std::pair<Key, ClickData>,16,256> click_bank;
++  std::array<size_t,shards> issued{};
+   struct Vertex {
+     Key name;
+     Vertex *parent, *next;
+@@ -709,9 +714,9 @@
+ #ifdef SHOPPING_DIAGNOSTICS
+             ++workers[t].valid_clicks;
+ #endif
+-            workers[t].clicks[alias.hash() % shards].emplace_back(
+-                Key{alias.bits},
+-                layout.click(workers[t].pool.encode(r[0], 'k'), ts, c));
++            auto &w=workers[t];
++            w.click_bank.append(alias.hash()%shards,
++                {Key{alias.bits},layout.click(w.pool.encode(r[0],'k'),ts,c)},w.clicks);
+           });
+           return;
+         }
+@@ -731,9 +736,8 @@
+           uint64_t location = 0;
+           if (user.bits) {
+             size_t b = user.hash() % shards;
+-            auto &rows = w.events[b];
+-            location = uint64_t(rows.size()) * shards + b + 1;
+-            rows.emplace_back(Key{user.bits}, layout.pack(e));
++            location=uint64_t(w.issued[b]++)*shards+b+1;
++            w.event_bank.append(b,{Key{user.bits},layout.pack(e)},w.events);
+           }
+           Time seconds = ingest / 1000;
+           Time relative = seconds - anchor;
+@@ -751,9 +755,14 @@
+             ref.location = uint32_t(w.extended.size());
+             w.extended.push_back({seconds, location});
+           }
+-          w.candidates[bucket(id)].push_back(ref);
++          w.revision_bank.append(bucket(id),ref,w.candidates);
+         });
+       });
++  parallel(workers.size(),threads,[&](size_t i,unsigned){
++    auto &w=workers[i];
++    w.revision_bank.finish(w.candidates);
++    w.event_bank.finish(w.events);w.click_bank.finish(w.clicks);
++  });
+   timer.mark("concurrent input, raw user partition and revision index");
+ #ifdef SHOPPING_DIAGNOSTICS
+   size_t revision_count = 0, revision_capacity = 0;

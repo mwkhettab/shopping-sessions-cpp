@@ -1,1 +1,1 @@
-base fin-slabkey-pgo short1-pgo short4-pgo short8-pgo fewclicks-pgo bitassists-pgo indexassists-pgo allassists-pgo indirect32-pgo smallrows-pgo packedrows-pgo teampin-pgo
+base fin-slabkey-pgo maingroups6-pgo groupscatter-pgo ptrcategory-pgo outreserve-pgo streamout-pgo bankall16-pgo bankraw-pgo schema-pgo cutlist-pgo partials-pgo partialprices-pgo

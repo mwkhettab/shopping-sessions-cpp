@@ -1,0 +1,268 @@
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -20,6 +20,7 @@
+ };
+ template <class T> using Bins = std::array<std::vector<T>, shards>;
+ #include "partition_slab.hpp"
++struct PartialStore;
+ template <class Layout> struct ScanWorker {
+   using EventData = typename Layout::E;
+   using ClickData = typename Layout::C;
+@@ -31,8 +32,8 @@
+   struct Vertex {
+     Key name;
+     Vertex *parent, *next;
+-    size_t weight;
+-    std::span<EventData> events;
++    const PartialStore *partial;
++    size_t first,pieces;
+     std::span<ClickData> clicks;
+   };
+   std::vector<std::array<Vertex *, 2>> edges;
+@@ -201,15 +202,18 @@
+   }
+ };
+ 
++#define SHOPPING_REDUCE_PRICES 1
++#include "partial_sessions.hpp"
+ template <class Layout>
+ void summarize(Key user, std::span<typename Layout::E> events,
+                std::span<typename Layout::C> clicks, const Catalog &cat,
+-               Result &result, Layout layout) {
+-  if (events.empty())
++               Result &result, Layout layout,std::span<const PartialRef> pieces={}) {
++  if (events.empty() && pieces.empty())
+     return;
+ #ifdef SHOPPING_DIAGNOSTICS
+   ++result.people;
+   result.events_seen += events.size();
++  for(const auto &p:pieces)result.events_seen+=p.segment->count;
+   result.clicks_seen += clicks.size();
+   result.max_events = std::max(result.max_events, events.size());
+   result.max_clicks = std::max(result.max_clicks, clicks.size());
+@@ -254,7 +258,7 @@
+       result.purchased.push_back(category);
+     value += price;
+   };
+-  auto end_session = [&](Time start, int64_t count, int64_t revenue) {
++  auto end_session = [&](Time start, [[maybe_unused]] Time last, int64_t count, int64_t revenue) {
+     auto day = daily.day;
+     ++daily.sessions;
+     daily.events += count;
+@@ -289,7 +293,9 @@
+     for (int campaign : result.active)
+       ++result.at(campaign, day).assists;
+   };
+-  if (use_bins) {
++  if (!pieces.empty()) {
++    merge_aliases(pieces,begin_session,spend,end_session);
++  } else if (use_bins) {
+     MEASURE(session);
+     result.bins.scan(events, begin_session, spend, end_session, layout);
+   } else {
+@@ -311,7 +317,7 @@
+                  layout.time(events[i]) - layout.time(events[i - 1]) <=
+                      session_gap);
+       }
+-      end_session(start, i - first, revenue);
++      end_session(start, layout.time(events[i-1]), i - first, revenue);
+     }
+   }
+   finish_day();
+@@ -409,6 +415,7 @@
+   struct Store {
+     std::vector<E> events;
+     std::vector<C> clicks;
++    PartialStore partial;
+   };
+   std::array<Store, shards> storage;
+   std::array<std::vector<Vertex>, shards> vertices;
+@@ -518,12 +525,15 @@
+                     .subspan(click_offset, g.click_end - click_offset);
+       if (g.vertex) {
+         auto &v = nodes[g.vertex - 1];
+-        v = {g.key, &v, &v, 1, ev, cl};
++        size_t first=store.partial.segments.size();
++        collapse_alias(ev,layout,results[t],store.partial);
++        v={g.key,&v,&v,&store.partial,first,store.partial.segments.size()-first,cl};
+       } else
+         summarize(g.key, ev, cl, cat, results[t], layout);
+       event_offset = g.event_end;
+       click_offset = g.click_end;
+     }
++    std::vector<E>().swap(store.events);
+   });
+   for (auto &w : workers) {
+     w.events.release();
+@@ -584,54 +594,37 @@
+   });
+   timer.mark("linked components");
+   parallel(shards, threads, [&](size_t b, unsigned t) {
+-    std::vector<E> events_buffer;
++    std::vector<PartialRef> pieces;
+     std::vector<C> click_buffer;
+-    for (auto &head : vertices[b]) {
+-      if (head.parent != &head)
+-        continue;
+-      std::span<E> ev;
++    for(auto &head:vertices[b]) {
++      if(head.parent!=&head)continue;
++      size_t np=0,nc=0,aliases=0;
+       std::span<C> cl;
+-      size_t event_count = 0, click_count = 0;
+-      Vertex *v = &head;
++      Vertex *v=&head;
+       do {
+-        if (!v->events.empty()) {
+-          ev = v->events;
+-          event_count += ev.size();
+-        }
+-        if (!v->clicks.empty()) {
+-          cl = v->clicks;
+-          click_count += cl.size();
+-        }
+-        v = v->next;
+-      } while (v != &head);
+-      if (!event_count)
+-        continue;
+-      if (event_count > ev.size() || click_count > cl.size()) {
+-        bool merge_e = event_count > ev.size(),
+-             merge_c = click_count > cl.size();
+-        events_buffer.clear();
+-        click_buffer.clear();
+-        if (merge_e)
+-          events_buffer.reserve(event_count);
+-        if (merge_c)
+-          click_buffer.reserve(click_count);
+-        do {
+-          if (merge_e)
+-            events_buffer.insert(events_buffer.end(), v->events.begin(),
+-                                 v->events.end());
+-          if (merge_c)
+-            click_buffer.insert(click_buffer.end(), v->clicks.begin(),
+-                                v->clicks.end());
+-          v = v->next;
+-        } while (v != &head);
+-        if (merge_e)
+-          ev = events_buffer;
+-        if (merge_c)
+-          cl = click_buffer;
+-      }
+-      summarize(head.name, ev, cl, cat, results[t], layout);
++        np+=v->pieces;aliases+=v->pieces!=0;
++        if(!v->clicks.empty()){cl=v->clicks;nc+=cl.size();}
++        v=v->next;
++      }while(v!=&head);
++      if(!np)continue;
++      pieces.clear();pieces.reserve(np);
++      bool merge_clicks=nc>cl.size();
++      if(merge_clicks){click_buffer.clear();click_buffer.reserve(nc);}
++      do {
++        for(size_t i=0;i<v->pieces;++i)pieces.push_back({v->partial,&v->partial->segments[v->first+i]});
++        if(merge_clicks)click_buffer.insert(click_buffer.end(),v->clicks.begin(),v->clicks.end());
++        v=v->next;
++      }while(v!=&head);
++      if(aliases>1)std::sort(pieces.begin(),pieces.end(),[](PartialRef a,PartialRef b){return a.segment->first<b.segment->first;});
++      if(merge_clicks)cl=click_buffer;
++      summarize(head.name,std::span<E>{},cl,cat,results[t],layout,std::span<const PartialRef>(pieces));
+     }
+   });
++#ifdef SHOPPING_DIAGNOSTICS
++  size_t units=0,buy=0;
++  for(auto &store:storage){units+=store.partial.segments.size();buy+=store.partial.purchases.size();}
++  std::cerr<<"linked alias intervals "<<units<<", category entries "<<buy<<"\n";
++#endif
+   timer.mark("linked-person sessions, attribution and aggregation");
+ }
+ 
+--- /dev/null
++++ b/cpp/partial_sessions.hpp
+@@ -0,0 +1,68 @@
++#pragma once
++struct PartialStore {
++  struct Segment {Time first,last;int64_t count,revenue;size_t purchase_begin,purchase_end;};
++  struct Buy {int category;int64_t cents;};
++  std::vector<Segment> segments;
++  std::vector<Buy> purchases;
++};
++struct PartialRef {const PartialStore *store;const PartialStore::Segment *segment;};
++
++template<class E,class Layout>
++void collapse_alias(std::span<E> events,Layout layout,Result &scratch,PartialStore &out) {
++  if(events.empty())return;
++  size_t purchase_begin=out.purchases.size();
++  auto begin=[&](Time){purchase_begin=out.purchases.size();};
++  auto spend=[&](int category,int64_t cents){
++#ifdef SHOPPING_REDUCE_PRICES
++    auto &sum=scratch.spend[category];
++    if(!sum)scratch.purchased.push_back(category);
++    sum+=cents;
++#else
++    out.purchases.push_back({category,cents});
++#endif
++  };
++  auto end=[&](Time first,Time last,int64_t count,int64_t revenue){
++#ifdef SHOPPING_REDUCE_PRICES
++    for(int cat:scratch.purchased) {
++      auto &value=scratch.spend[cat];out.purchases.push_back({cat,value});value=0;
++    }
++    scratch.purchased.clear();
++#endif
++    out.segments.push_back({first,last,count,revenue,purchase_begin,out.purchases.size()});
++  };
++  if(events.size()>=32 && !scratch.bins.cells.empty()) {
++    scratch.bins.scan(events,begin,spend,end,layout);
++  } else {
++    std::sort(events.begin(),events.end(),[&](E a,E b){return layout.less(a,b);});
++    size_t i=0;
++    while(i<events.size()) {
++      size_t first=i;Time start=layout.time(events[i]),last=start;begin(start);
++      int64_t revenue=0;
++      do {
++        auto e=layout.unpack(events[i++]);
++        last=e.ts;
++        if(e.price){spend(e.category,e.price);revenue+=e.price;}
++      } while(i<events.size() && layout.time(events[i])-last<=session_gap);
++      end(start,last,int64_t(i-first),revenue);
++    }
++  }
++}
++
++template<class Begin,class Spend,class End>
++void merge_aliases(std::span<const PartialRef> refs,Begin begin,Spend spend,End end) {
++  Time first=0,last=0;
++  int64_t count=0,revenue=0;
++  for(auto &ref:refs) {
++    const auto &piece=*ref.segment;
++    if(!count || piece.first-last>session_gap) {
++      if(count)end(first,last,count,revenue);
++      first=piece.first;last=piece.last;begin(first);count=0;revenue=0;
++    } else last=std::max(last,piece.last);
++    count+=piece.count;revenue+=piece.revenue;
++    for(size_t j=piece.purchase_begin;j<piece.purchase_end;++j) {
++      const auto &p=ref.store->purchases[j];
++      spend(p.category,p.cents);
++    }
++  }
++  if(count)end(first,last,count,revenue);
++}
+--- a/cpp/session_bins.hpp
++++ b/cpp/session_bins.hpp
+@@ -61,7 +61,7 @@
+         // All times within one half-open bin are less than one gap apart.
+         if (!count || cell.first - last > session_gap) {
+           if (count)
+-            end(start, count, revenue);
++            end(start, last, count, revenue);
+           start = cell.first;
+           begin(start);
+           count = revenue = 0;
+@@ -74,7 +74,7 @@
+         cell.count = 0;
+       }
+     }
+-    end(start, count, revenue);
++    end(start, last, count, revenue);
+     purchases.clear();
+   }
+ };

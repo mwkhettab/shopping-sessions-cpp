@@ -1,0 +1,72 @@
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -419,37 +419,22 @@
+       size_t event_end{}, click_end{};
+       size_t vertex{};
+     };
+-    struct Slot {
+-      Key key;
+-      size_t group;
+-    };
+-    std::vector<Group> groups;
+-    size_t n = 0;
+-    for (auto &w : workers)
+-      n += w.events[b].size() + w.clicks[b].size();
+-    size_t initial = std::bit_ceil(std::clamp<size_t>(n / 12, 128, 65536));
+-    std::vector<Slot> slots(initial);
+-    auto locate = [&](Key k) {
+-      size_t at = (k.hash() / shards) & (slots.size() - 1);
+-      while (slots[at].key.bits && !(slots[at].key == k))
+-        at = (at + 1) & (slots.size() - 1);
+-      return at;
+-    };
+-    auto intern = [&](Key k) {
+-      if (groups.size() * 10 >= slots.size() * 7) {
+-        auto old = std::move(slots);
+-        slots.clear();
+-        slots.resize(old.size() * 2);
+-        for (auto &x : old)
+-          if (x.key.bits)
+-            slots[locate(x.key)] = x;
+-      }
+-      auto &x = slots[locate(k)];
+-      if (!x.key.bits) {
+-        x = {k, groups.size()};
+-        groups.push_back({k});
+-      }
+-      return x.group;
++    size_t n=0;
++    for(auto &w:workers)n+=w.events[b].size()+w.clicks[b].size();
++    size_t capacity=std::bit_ceil(std::clamp<size_t>(n/6,128,262144));
++    std::vector<Group> groups(capacity);
++    std::unordered_map<Key,size_t,KeyHash> overflow;
++    auto intern=[&](Key key) {
++      size_t start=(key.hash()/shards)&(capacity-1);
++      for(size_t i=0;i<5;++i) {
++        size_t at=(start+i)&(capacity-1);
++        auto &slot=groups[at];
++        if(!slot.key.bits){slot.key=key;return at;}
++        if(slot.key==key)return at;
++      }
++      auto [it,inserted]=overflow.try_emplace(key,groups.size());
++      if(inserted)groups.push_back({key});
++      return it->second;
+     };
+     // First count each alias, then scatter into disjoint contiguous spans.
+     // A linked person may own spans in several of these raw-user shards.
+@@ -493,6 +478,7 @@
+     store.clicks.resize(click_count);
+     size_t event_offset = 0, click_offset = 0;
+     for (auto &g : groups) {
++      if(!g.key.bits)continue;
+       auto events_in_group = g.event_end, clicks_in_group = g.click_end;
+       g.event_end = event_offset;
+       g.click_end = click_offset;
+@@ -512,6 +498,7 @@
+     }
+     event_offset = click_offset = 0;
+     for (auto &g : groups) {
++      if(!g.key.bits)continue;
+       auto ev = std::span(store.events)
+                     .subspan(event_offset, g.event_end - event_offset);
+       auto cl = std::span(store.clicks)

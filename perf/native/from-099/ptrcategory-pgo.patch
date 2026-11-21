@@ -1,0 +1,22 @@
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -233,7 +233,7 @@
+       auto &v = result.spend[k];
+       if (v > best || (v == best && cat.categories[k] < *daily.category)) {
+         best = v;
+-        daily.category = cat.categories[k];
++        daily.category = &cat.categories[k];
+       }
+       v = 0;
+     }
+--- a/cpp/output.hpp
++++ b/cpp/output.hpp
+@@ -3,7 +3,7 @@
+   Key user;
+   int32_t day;
+   int64_t sessions, events, revenue;
+-  std::optional<Str> category;
++  const Str *category{};
+ };
+ struct Counts {
+   int64_t sessions{}, purchases{}, revenue{}, assists{};

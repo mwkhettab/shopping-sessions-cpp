@@ -1,0 +1,125 @@
+--- a/cpp/input.hpp
++++ b/cpp/input.hpp
+@@ -147,13 +147,10 @@
+ #endif
+ #include "csv_x86.hpp"
+ #include "line_csv.hpp"
++#include "schema_csv.hpp"
+ template <size_t N, class F> void parse_rows(Str data, F &&callback) {
+ #ifdef SHOPPING_X86_CSV
+-  if (wide_csv_supported()) { line_csv_rows<N>(data,callback); return; }
+-  if (wide_csv_supported()) {
+-    wide_csv_rows<N>(data, callback);
+-    return;
+-  }
++  if(wide_csv_supported()){schema_rows<N>(data,callback);return;}
+ #endif
+ #if defined(__SSE2__) || defined(__aarch64__)
+   if (data.empty())
+--- /dev/null
++++ b/cpp/schema_csv.hpp
+@@ -0,0 +1,104 @@
++#pragma once
++#ifdef SHOPPING_X86_CSV
++struct SketchedFields {
++  const char *p;
++  alignas(32) std::array<int,8> begin,end;
++  Str operator[](size_t i) const {return {p+begin[i],size_t(end[i]-begin[i])};}
++  template<size_t N> operator std::array<Str,N>() const {
++    std::array<Str,N> a;for(size_t i=0;i<N;++i)a[i]=(*this)[i];return a;
++  }
++};
++
++template<size_t N,class F>
++__attribute__((target("avx2,bmi,popcnt"),always_inline)) inline void deliver_schema(
++    const char *p,const std::array<int,8> &cuts,unsigned quote_count,F &callback) {
++#ifdef SHOPPING_GATHER_FIELDS
++  SketchedFields row{p,{},cuts};
++  for(size_t i=1;i<N;++i)row.begin[i]=cuts[i-1]+1;
++  if(quote_count) {
++    auto start=_mm256_load_si256(reinterpret_cast<const __m256i*>(row.begin.data()));
++    auto end=_mm256_load_si256(reinterpret_cast<const __m256i*>(row.end.data()));
++    auto last=_mm256_max_epi32(_mm256_sub_epi32(end,_mm256_set1_epi32(1)),_mm256_setzero_si256());
++    // All source loads, including the three bytes following a gathered byte,
++    // lie inside the 160 readable bytes checked by the row loop.
++    auto a=_mm256_i32gather_epi32(reinterpret_cast<const int*>(p),start,1);
++    auto b=_mm256_i32gather_epi32(reinterpret_cast<const int*>(p),last,1);
++    auto quotes=_mm256_set1_epi32('"'),mask=_mm256_set1_epi32(255);
++    auto paired=_mm256_and_si256(_mm256_cmpeq_epi32(_mm256_and_si256(a,mask),quotes),
++                                _mm256_cmpeq_epi32(_mm256_and_si256(b,mask),quotes));
++    auto trim=_mm256_and_si256(paired,_mm256_cmpgt_epi32(_mm256_sub_epi32(end,start),_mm256_set1_epi32(1)));
++    unsigned lanes=unsigned(_mm256_movemask_ps(_mm256_castsi256_ps(trim))) & ((1u<<N)-1);
++    if(2*std::popcount(lanes)!=quote_count)return;
++    _mm256_store_si256(reinterpret_cast<__m256i*>(row.begin.data()),_mm256_sub_epi32(start,trim));
++    _mm256_store_si256(reinterpret_cast<__m256i*>(row.end.data()),_mm256_add_epi32(end,trim));
++  }
++  callback(row);
++#else
++  std::array<Str,N> fields;
++  unsigned start=0;
++  if(!quote_count) {
++    for(unsigned i=0;i<N;++i){unsigned end=unsigned(cuts[i]);fields[i]={p+start,end-start};start=end+1;}
++  } else {
++    unsigned expected=0;
++    for(unsigned i=0;i<N;++i) {
++      unsigned end=unsigned(cuts[i]),len=end-start;
++      bool q=len>=2 && ((p[start]=='"') & (p[end-1]=='"'));
++      fields[i]={p+start+q,len-2*q};
++      expected+=2*q;start=end+1;
++    }
++    if(expected!=quote_count)return;
++  }
++  callback(fields);
++#endif
++}
++
++template<size_t N,class F>
++__attribute__((target("avx2,bmi,popcnt"))) void schema_rows(Str data,F &callback) {
++  while(data.size()>=160) {
++    const char *p=data.data();
++    uint64_t lo=0,hi=0;
++    unsigned quotes=0,end=0;
++    for(unsigned at=0;at<128;at+=32) {
++      auto m=row_mask32(p+at);
++      auto valid=m.lf?(m.lf&-m.lf)-1:~0u;
++      uint64_t add=uint64_t(m.comma&valid)<<(at%64);
++      if(at<64)lo|=add;else hi|=add;
++      quotes+=std::popcount(m.quotes&valid);
++      if(m.lf){end=at+std::countr_zero(m.lf);break;}
++    }
++    if(!end && p[0]!='\n') {
++      size_t lf=data.find('\n',128);size_t bytes=lf==Str::npos?data.size():lf+1;
++      wide_csv_rows<N>(data.substr(0,bytes),callback);data.remove_prefix(bytes);continue;
++    }
++    data.remove_prefix(end+1);
++    unsigned lc=std::popcount(lo);
++    if(lc+std::popcount(hi)!=N-1)continue;
++    std::array<int,8> cuts{};
++    cuts[N-1]=int(end);
++#ifndef SHOPPING_BOUNDARIES_ONLY
++    if constexpr(N==7) {
++      if(lc>=3) {
++        uint64_t rem=lo;
++        for(unsigned i=0;i<3;++i){cuts[i]=std::countr_zero(rem);rem&=rem-1;}
++        unsigned ingest=unsigned(cuts[2])+1;
++        unsigned c3=ingest+20+2*(p[ingest]=='"');
++        unsigned type=c3+1,q=p[type]=='"';
++        unsigned c4=type+q*2+(p[type+q]=='p'?8:4);
++        unsigned c5=hi?127-std::countl_zero(hi):63-std::countl_zero(lo);
++        auto marked=[&](unsigned bit){return ((bit<64?lo:hi)>>(bit%64))&1;};
++        if(c4<c5 && marked(c3) && marked(c4)) {
++          cuts[3]=int(c3);cuts[4]=int(c4);cuts[5]=int(c5);
++          deliver_schema<N>(p,cuts,quotes,callback);
++          continue;
++        }
++      }
++    }
++#endif
++    unsigned i=0;
++    while(lo){cuts[i++]=std::countr_zero(lo);lo&=lo-1;}
++    while(hi){cuts[i++]=64+std::countr_zero(hi);hi&=hi-1;}
++    deliver_schema<N>(p,cuts,quotes,callback);
++  }
++  line_csv_rows<N>(data,callback);
++}
++#endif
