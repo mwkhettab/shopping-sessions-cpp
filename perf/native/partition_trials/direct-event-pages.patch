@@ -1,0 +1,162 @@
+diff --git a/cpp/pipeline/parse_packets.hpp b/cpp/pipeline/parse_packets.hpp
+--- a/cpp/pipeline/parse_packets.hpp
++++ b/cpp/pipeline/parse_packets.hpp
+@@ -11,7 +11,6 @@
+     i64 ing_base, ws;
+     u64 wlen, ukey, ekey, ucap, ecap;
+     const u8* ptab;
+-    const u8* lines;
+ };
+ struct CkP {
+     i64 cbase;
+@@ -43,7 +42,6 @@
+         const u64 ing_s=(u64(u32(ing))*274877907ull)>>38;
+         out.rec[i]={word0,(event&(BSIZE-1))|(ing_s<<16)|((valid?user:0)<<37)};
+         out.ob[i]=event>>BB;
+-        out.lp[i]=u64(std::uintptr_t(p.lines))+(out.ob[i]<<6);
+     }
+     return {regular,~regular&active_mask(n),bad};
+ }
+@@ -103,7 +101,6 @@
+         _mm512_store_si512(out.rec.data()+j,_mm512_permutex2var_epi64(word0,even,word1));
+         _mm512_store_si512(out.rec.data()+j+4,_mm512_permutex2var_epi64(word0,odd,word1));
+         _mm512_store_si512(out.ob.data()+j,bucket);
+-        _mm512_store_si512(out.lp.data()+j,_mm512_add_epi64(_mm512_slli_epi64(bucket,6),splat8(std::uintptr_t(p.lines))));
+         badb |= u64(bad)<<j;
+         purchases |= u64(pm)<<j;
+         regular |= u64(ok)<<j;
+diff --git a/cpp/pipeline/parse_part.hpp b/cpp/pipeline/parse_part.hpp
+--- a/cpp/pipeline/parse_part.hpp
++++ b/cpp/pipeline/parse_part.hpp
+@@ -158,6 +158,30 @@
+ 
+     inline const u8* lines_ptr() const { return reinterpret_cast<const u8*>(lines_.data()); }
+ 
++    inline void push_event(std::size_t bucket, u64 first, u64 second) {
++        auto address = cur_[bucket];
++        if ((address & (CHUNK - 1)) == LINK_OFF)
++            address = new_chunk(bucket, address);
++        *reinterpret_cast<Rec*>(address) = {first, second};
++        cur_[bucket] = address + sizeof(Rec);
++    }
++
++    inline void push_events(u64 mask, std::size_t n, const u64* buckets,
++                            const std::array<u64,2>* rows) {
++        const auto append = [&](std::size_t index) {
++            push_event(buckets[index], rows[index][0], rows[index][1]);
++        };
++        const u64 all = n == 64 ? UINT64_MAX : (u64{1} << n) - 1;
++        if (mask == all) {
++            for (std::size_t i = 0; i < n; ++i) append(i);
++        } else {
++            while (mask) {
++                append(std::countr_zero(mask));
++                mask &= mask - 1;
++            }
++        }
++    }
++
+     inline void push(std::size_t bucket, u64 w0, u64 w1) {
+         const auto offset = fill_[bucket];
+         lines_[bucket].rows[offset / sizeof(Rec)] = {w0, w1};
+diff --git a/cpp/pipeline/parse_sink.hpp b/cpp/pipeline/parse_sink.hpp
+--- a/cpp/pipeline/parse_sink.hpp
++++ b/cpp/pipeline/parse_sink.hpp
+@@ -72,7 +72,7 @@
+         }
+         if(r.eid<=keyrec::MASK) {
+             if(auto v=keyrec::unscramble(r.eid,g.ekey);v<g.ecap) {
+-                t.ev.push(v>>BB,w0,(v&(BSIZE-1))|((ing/1000)<<16)|(user<<37)); return;
++                t.ev.push_event(v>>BB,w0,(v&(BSIZE-1))|((ing/1000)<<16)|(user<<37)); return;
+             }
+         }
+         t.odd_events.push_back({token(r.eid),r.ingest,w0,user});
+@@ -81,10 +81,10 @@
+     [[gnu::noinline]] void ev_flush() {
+         const auto n=std::exchange(eb.n,0); if(!n) return;
+         t.n_ev_rows+=n;
+-        const EvP p{g.ing_base,g.ws,g.wlen,g.ukey,g.ekey,g.ucap,g.ecap,tb.prod.data(),t.ev.lines_ptr()};
++        const EvP p{g.ing_base,g.ws,g.wlen,g.ukey,g.ekey,g.ucap,g.ecap,tb.prod.data()};
+         const auto [regular,special,bad]=u64(TS_BAD)-u64(p.ing_base)>=ING_MAX*1000 ? ev_vec<false>(eb,out,n,p) : ev_vec<true>(eb,out,n,p);
+         if(bad) sys::fallback("ingest_ts bad or out of range");
+-        t.ev.push_many(regular,n,out.ob.data(),out.lp.data(),out.rec.data());
++        t.ev.push_events(regular,n,out.ob.data(),out.rec.data());
+         for(auto m=special;m;m&=m-1) ev_one(eb.row(std::countr_zero(m)));
+     }
+     [[gnu::noinline]] void ck_one(const ClRow& r) {
+diff --git a/tests/pipeline/routing_packets.cpp b/tests/pipeline/routing_packets.cpp
+--- a/tests/pipeline/routing_packets.cpp
++++ b/tests/pipeline/routing_packets.cpp
+@@ -24,14 +24,14 @@
+             cl.camp[i]=v%17==0 ? CBOUND : v%12;
+         }
+         const std::size_t n=seed%(NB+1);
+-        parse::EvP p{i64(base),i64(base),99999,uk,ek,17,820000,cats.data(),cats.data()};
++        parse::EvP p{i64(base),i64(base),99999,uk,ek,17,820000,cats.data()};
+         const auto x=parse::ev_vec<true>(ev,*a,n,p); const auto y=parse::ev_scalar<true>(ev,*b,n,p);
+         assert(x.regular==y.regular && x.special==y.special && x.bad_ingest==y.bad_ingest);
+         for(std::size_t i=0;i<n;++i) {
+             const u64 user=keyrec::unscramble(ev.uid[i],uk),id=keyrec::unscramble(ev.eid[i],ek);
+             const bool valid=ev.uid[i]!=ID_EMPTY && u64(ev.ts[i])-base<p.wlen && !(ev.pp[i]&PP_INVALID) && std::bit_cast<i64>(u64(ev.ing[i])-u64(ev.ts[i]))<=DAY_MS;
+             const bool regular=ev.eid[i]<=keyrec::MASK && id<p.ecap && (!valid || (ev.uid[i]<=keyrec::MASK && (user>>9)<p.ucap && (user&511)<NALIAS));
+-            assert(bool((x.regular>>i)&1)==regular && a->rec[i]==b->rec[i] && a->ob[i]==id/BSIZE && a->lp[i]==b->lp[i]);
++            assert(bool((x.regular>>i)&1)==regular && a->rec[i]==b->rec[i] && a->ob[i]==id/BSIZE && b->ob[i]==id/BSIZE);
+             if(regular && !valid) assert(a->rec[i][0]==UINT64_MAX);
+         }
+         for(bool range:{false,true}) {
+diff --git a/tests/pipeline/routing_part.cpp b/tests/pipeline/routing_part.cpp
+--- a/tests/pipeline/routing_part.cpp
++++ b/tests/pipeline/routing_part.cpp
+@@ -17,7 +17,7 @@
+ };
+ 
+ int main() {
+-    for (bool nt : {false,true}) for (std::size_t buckets : {1, 19, 522}) {
++    for (bool direct : {false,true}) for (bool nt : {false,true}) for (std::size_t buckets : {1, 19, 522}) {
+         Arena arena;
+         auto part = parse::Part::new_unbound(buckets);
+         part.set_arena(arena);
+@@ -37,10 +37,12 @@
+                 records[j] = {rng(),rng()};
+                 if ((mask >> j) & 1) expected[b].push_back(records[j]);
+             }
+-            part.push_many(mask,n,offsets,pointers,records);
++            if (direct) part.push_events(mask,n,offsets,records);
++            else part.push_many(mask,n,offsets,pointers,records);
+             const auto b = rng()%buckets;
+             const std::array<u64,2> pair{rng(),rng()};
+-            part.push(b,pair[0],pair[1]);
++            if (direct) part.push_event(b,pair[0],pair[1]);
++            else part.push(b,pair[0],pair[1]);
+             expected[b].push_back(pair);
+         }
+         part.finish();
+diff --git a/tests/pipeline/routing_sinks.cpp b/tests/pipeline/routing_sinks.cpp
+--- a/tests/pipeline/routing_sinks.cpp
++++ b/tests/pipeline/routing_sinks.cpp
+@@ -10,6 +10,10 @@
+     std::array<u8,64> buf{};
+     const u8* lines_ptr() const {return buf.data();}
+     void push(u64 b,u64 w0,u64 w1) {rows.push_back({b,w0,w1});}
++    void push_event(u64 b,u64 w0,u64 w1) {push(b,w0,w1);}
++    void push_events(u64 m,std::size_t,const u64* b,const std::array<u64,2>* r) {
++        for (;m;m&=m-1) {auto i=std::countr_zero(m);push(b[i],r[i][0],r[i][1]);}
++    }
+     void push_indexed(u64 b,u64 w0,u64 w1){push(b,w0,w1);}
+     void push_indexed_many(u64 m,std::size_t n,const u64* b,const u64* p,const std::array<u64,2>* r){push_many(m,n,b,p,r);}
+     void push_many(u64 mask,std::size_t,const u64* bs,const u64* ptr,const std::array<u64,2>* rec) {
+diff --git a/tests/pipeline/session_dense_limits.cpp b/tests/pipeline/session_dense_limits.cpp
+--- a/tests/pipeline/session_dense_limits.cpp
++++ b/tests/pipeline/session_dense_limits.cpp
+@@ -61,9 +61,9 @@
+         const u32 alias=std::countr_zero(u32(utab[u]&MASK));const u32 cat=(i+3*u)%32,price=(i%4)?17+((i+u)%60):0;
+         const u64 w=(u64(ts)<<33)|(u64(price)<<9)|(cat<<4)|alias;
+         const u64 w1=(u64(u)<<37)|(3ull<<16)|slot;
+-        auto& t=g.t((slot^b)&1);t.ev.push(b,w,w1);++t.n_ev_rows;
++        auto& t=g.t((slot^b)&1);t.ev.push_event(b,w,w1);++t.n_ev_rows;
+         records[u].push_back({w,w1});
+-        if (i%47==0) {g.t(((slot^b)&1)^1).ev.push(b,0,(u64(100)<<37)|(5ull<<16)|slot);}
++        if (i%47==0) {g.t(((slot^b)&1)^1).ev.push_event(b,0,(u64(100)<<37)|(5ull<<16)|slot);}
+     };
+     // Dense 16,384-slot bucket, one complete digest-only boundary bucket and a long
+     // seam. Interior groups exercise both pending-work flush thresholds and all lanes.
