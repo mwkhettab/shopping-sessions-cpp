@@ -148,8 +148,20 @@ inline std::pair<unsigned, unsigned> delimiters(const char *p) {
 #include "csv_x86.hpp"
 #include "line_csv.hpp"
 #include "line_tile.hpp"
+#include "marked_events.hpp"
 template <size_t N, class F> void parse_rows(Str data, F &&callback) {
 #ifdef SHOPPING_X86_CSV
+  if constexpr (N == 7) {
+    if (wide_csv_supported() && __builtin_cpu_supports("bmi2") &&
+        __builtin_cpu_supports("pclmul")) {
+      if (__builtin_cpu_supports("avx512f") &&
+          __builtin_cpu_supports("avx512bw") &&
+          __builtin_cpu_supports("avx512vbmi2")) {
+        marked_events_vbmi2(data, callback);
+        return;
+      }
+    }
+  }
   if (N == 7 && wide_csv_supported()) {
     tiled_lines<N, 16>(data, callback);
     return;

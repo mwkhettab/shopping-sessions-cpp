@@ -6,9 +6,10 @@
 #include <regex>
 #include <span>
 
-template <class Generic, class Common> struct EventCallbacks {
+template <class Generic, class Common, class Rich> struct EventCallbacks {
   Generic generic;
   Common common;
+  Rich rich;
   template <class Row> void operator()(const Row &row) { generic(row); }
 };
 size_t bucket(Key k) { return k.hash() % shards; }
@@ -818,7 +819,48 @@ void run_layout(const fs::path &data, const fs::path &output, unsigned threads,
                    Event{good ? ts : bad, 0, 0}, ingest);
                return true;
              };
-             auto callbacks = EventCallbacks{generic_event, common_event};
+             auto rich_event = [&](const char *id, unsigned id_width,
+                                   const char *user, unsigned user_width,
+                                   Str event_time, Str arrival, Str type,
+                                   Str product, Str price) {
+               if constexpr (sizeof(uintptr_t) != 8 ||
+                             std::endian::native != std::endian::little)
+                 return false;
+               if (id[0] != 'e' || user[0] != 'u')
+                 return false;
+               auto load = [](const char *p, unsigned n) {
+                 const uint64_t mask = UINT64_MAX >> (8 * (9 - n));
+                 return little_word(p + 1) & mask;
+               };
+               auto event_word = load(id, id_width),
+                    user_word = load(user, user_width);
+               if ((event_word | user_word) >> 63 || !id[id_width - 1] ||
+                   !user[user_width - 1])
+                 return false;
+               Time ingest = ingest_time(arrival);
+               bool purchase = type == "purchase";
+               Time cents = purchase ? number(price, 10000000) : 0;
+               bool useful =
+                   !product.empty() && ((purchase && cents >= 1) ||
+                                        type == "cart" || type == "view");
+               Time ts = useful ? timestamp(event_time) : bad;
+               bool good = useful && ts >= window.start && ts < window.end &&
+                           ingest - ts <= day_ms;
+#ifdef SHOPPING_DIAGNOSTICS
+               ++workers[t].revisions;
+               workers[t].valid_events += good;
+#endif
+               put(Key{uintptr_t(permute_key(event_word) << 1)},
+                   good ? Key{uintptr_t(permute_key(user_word) << 1)} : Key{},
+                   Event{good ? ts : bad, good && purchase ? int32_t(cents) : 0,
+                         good && purchase
+                             ? std::max(0, cat.product.find(product))
+                             : 0},
+                   ingest);
+               return true;
+             };
+             auto callbacks =
+                 EventCallbacks{generic_event, common_event, rich_event};
              rows<7>(events[job].body(), callbacks);
            });
   timer.mark("concurrent input, raw user partition and revision index");

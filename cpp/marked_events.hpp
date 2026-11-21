@@ -1,0 +1,157 @@
+#pragma once
+#ifdef SHOPPING_X86_CSV
+// A certified tile has seven fields per row and quotes only in matching
+// pairs at field boundaries. Reject the complete tile before emitting rows
+// when either check fails. The scalar grammar handles long or irregular input.
+struct OrdinalMasks {
+  uint64_t separators, quotes, newlines;
+};
+
+template <size_t N>
+inline constexpr auto ordinal_newlines = [] {
+  std::array<uint64_t, N> out{};
+  for (unsigned phase = 0; phase < N; ++phase)
+    for (unsigned bit = 0; bit < 64; ++bit)
+      if ((phase + bit + 1) % N == 0)
+        out[phase] |= uint64_t{1} << bit;
+  return out;
+}();
+
+__attribute__((target("avx512f,avx512bw"), always_inline)) inline OrdinalMasks
+ordinal_masks_wide(const char *p) {
+  auto text = _mm512_loadu_si512(p);
+  uint64_t lf = _mm512_cmpeq_epi8_mask(text, _mm512_set1_epi8('\n'));
+  return {lf | _mm512_cmpeq_epi8_mask(text, _mm512_set1_epi8(',')),
+          _mm512_cmpeq_epi8_mask(text, _mm512_set1_epi8('"')), lf};
+}
+
+__attribute__((target("avx2,pclmul"), always_inline)) inline uint64_t
+quote_prefix(uint64_t q) {
+  auto value = _mm_cvtsi64_si128(std::bit_cast<int64_t>(q));
+  return uint64_t(
+      _mm_cvtsi128_si64(_mm_clmulepi64_si128(value, _mm_set1_epi64x(-1), 0)));
+}
+
+// Each word encodes twice the position just after a separator, plus one if
+// its field ends in a quote. A certified field then has the same flag at
+// its opening and closing ends, even for an empty quoted value.
+struct MarkedEventFields {
+  const char *data;
+  std::array<uint16_t, 8> begins, lengths;
+  MarkedEventFields(const char *text, const uint16_t *cuts) : data(text) {
+    auto words = _mm_loadu_si128(reinterpret_cast<const __m128i *>(cuts - 1));
+    auto end = _mm_srli_si128(words, 2), begin = _mm_srli_epi16(words, 1);
+    auto ones = _mm_set1_epi16(1), trim = _mm_and_si128(end, ones);
+    auto width =
+        _mm_sub_epi16(_mm_sub_epi16(_mm_srli_epi16(end, 1), ones), begin);
+    _mm_storeu_si128(reinterpret_cast<__m128i *>(begins.data()),
+                     _mm_add_epi16(begin, trim));
+    _mm_storeu_si128(reinterpret_cast<__m128i *>(lengths.data()),
+                     _mm_sub_epi16(width, _mm_add_epi16(trim, trim)));
+  }
+  Str operator[](size_t i) const { return {data + begins[i], lengths[i]}; }
+  operator std::array<Str, 7>() const {
+    constexpr size_t N = 7;
+    std::array<Str, N> values;
+    for (size_t i = 0; i < N; ++i)
+      values[i] = (*this)[i];
+    return values;
+  }
+};
+__attribute__((target("avx512f,avx512bw,avx512vbmi2"),
+               always_inline)) inline void
+save_trimmed_positions(uint16_t *out, unsigned base, uint64_t separators,
+                       uint64_t closed) {
+  alignas(64) static constexpr auto sequence = [] {
+    std::array<uint8_t, 64> values{};
+    for (unsigned i = 0; i < 64; ++i)
+      values[i] = uint8_t(2 * i);
+    return values;
+  }();
+  auto base_offsets = _mm512_load_si512(sequence.data());
+  auto marked = _mm512_mask_add_epi8(base_offsets, closed, base_offsets,
+                                     _mm512_set1_epi8(1));
+  auto packed = _mm512_maskz_compress_epi8(separators, marked);
+  auto origin = _mm512_set1_epi16(short(2 * (base + 1)));
+  auto lower = _mm512_cvtepu8_epi16(_mm512_castsi512_si256(packed));
+  _mm512_storeu_si512(out, _mm512_add_epi16(lower, origin));
+  if (std::popcount(separators) > 32) {
+    auto high = _mm512_shuffle_i64x2(packed, packed, 0xee);
+    auto upper = _mm512_cvtepu8_epi16(_mm512_castsi512_si256(high));
+    _mm512_storeu_si512(out + 32, _mm512_add_epi16(upper, origin));
+  }
+}
+template <class F>
+inline void emit_marked_event(const MarkedEventFields &row, F &fn) {
+  if constexpr (requires {
+                  fn.rich(row[0].data(), 0u, row[1].data(), 0u, row[2], row[3],
+                          row[4], row[5], row[6]);
+                }) {
+    Str id = row[0], user = row[1], arrival = row[3];
+    if (id.size() - 2 <= 7 && user.size() - 2 <= 7 && arrival.size() == 20 &&
+        fn.rich(id.data(), unsigned(id.size()), user.data(),
+                unsigned(user.size()), row[2], arrival, row[4], row[5], row[6]))
+      return;
+  }
+  fn(row);
+}
+template <class F>
+__attribute__((
+    target("avx2,bmi,bmi2,popcnt,pclmul,avx512f,avx512bw,avx512vbmi2"))) void
+marked_events_vbmi2(Str data, F &fn) {
+  constexpr unsigned Bytes = 1024, N = 7;
+  constexpr unsigned Words = Bytes / 64;
+  alignas(64) std::array<uint16_t, Bytes + 64> positions;
+  positions[0] = 0;
+  uint16_t *cuts = positions.data() + 1;
+  while (data.size() >= Bytes) {
+    const char *text = data.data();
+    std::array<OrdinalMasks, Words> masks;
+    for (unsigned k = 0; k < Words; ++k) {
+      masks[k] = ordinal_masks_wide(text + 64 * k);
+    }
+    unsigned words = Words;
+    while (words && !masks[words - 1].newlines)
+      --words;
+    if (!words) {
+      auto lf = data.find('\n', Bytes);
+      size_t take = lf == Str::npos ? data.size() : lf + 1;
+      scalar_rows<N>(data.substr(0, take), fn);
+      data.remove_prefix(take);
+      continue;
+    }
+    auto &last = masks[words - 1];
+    unsigned length = words * 64 - std::countl_zero(last.newlines);
+    uint64_t tail = mask_to(length - (words - 1) * 64);
+    last.separators &= tail;
+    last.quotes &= tail;
+    uint64_t inside = 0, previous = 1, invalid = 0;
+    unsigned nc = 0;
+    for (unsigned b = 0; b < words; ++b) {
+      auto [sep, q, lf] = masks[b];
+      unsigned count = std::popcount(sep);
+      uint64_t want = ordinal_newlines<N>[nc % N] & mask_to(count);
+      invalid |= _pext_u64(lf, sep) ^ want;
+      uint64_t closed = (q << 1) | (b ? (masks[b - 1].quotes >> 63) : 0);
+      uint64_t parity = quote_prefix(q) ^ inside;
+      uint64_t next = b + 1 < words ? (masks[b + 1].separators & 1) : 1;
+      invalid |= ((q & parity) & ~((sep << 1) | previous)) |
+                 ((q & ~parity) & ~((sep >> 1) | (next << 63))) |
+                 (sep & parity);
+      inside = uint64_t(0) - (parity >> 63);
+      previous = sep >> 63;
+      save_trimmed_positions(cuts + nc, 64 * b, sep, closed);
+
+      nc += count;
+    }
+    if (invalid || inside || nc % N) {
+      tiled_lines<N, 16>(data.substr(0, length), fn);
+    } else
+      for (unsigned i = 0; i < nc; i += N) {
+        emit_marked_event(MarkedEventFields{text, cuts + i}, fn);
+      }
+    data.remove_prefix(length);
+  }
+  tiled_lines<N, 16>(data, fn);
+}
+#endif
