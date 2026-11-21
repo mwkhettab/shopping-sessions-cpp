@@ -1,1 +1,1 @@
-base joined ledgerjoin radix radixreserve radixplain graph pgraph reserve graphreserve pages graphpages grammar grampages r128 r1024 g128 g1024 s128 s1024 localfilter
+base clean-index clean-radix clean-graph clean-graphpages clean-slab clean-pages release-key release-keyindex release-keyradix release-range release-few release-all release-rangegraph release-rangeradix release-rangeindex release-range-pgo release-range-lto release-rangeradix-pgo clean-index-pgo

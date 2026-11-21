@@ -36,33 +36,42 @@ def main():
     binaries=[]
     area.joinpath('bin').mkdir(exist_ok=True)
     for name in candidates:
-        src=area/name
-        src.mkdir(exist_ok=True)
-        shutil.copytree(root/'cpp',src/'cpp',dirs_exist_ok=True)
-        shutil.copy2(root/'build.sh',src/'build.sh')
-        if name not in ('base','haswell','skylake'):
-            with (root/f'perf/native/{name}.patch').open('rb') as patch:
-                subprocess.run(['patch','-s','-p1'],cwd=src,stdin=patch,check=True)
-        compiler=shutil.which('g++-12') or shutil.which('g++')
-        if name in ('haswell','skylake'):
-            wrapper=src/'cxx'
-            arch='haswell' if name=='haswell' else 'skylake-avx512'
-            if name=='skylake' and 'avx512bw' not in flags: continue
-            wrapper.write_text(f'#!/bin/sh\nexec {compiler} -march={arch} "$@"\n')
-            wrapper.chmod(0o755)
-            compiler=str(wrapper)
-        if (src/'cpp/flat_parquet.hpp').exists():
-            shutil.copy2(root/'perf/native/standalone-build.sh',src/'build.sh')
-        run('sh','build.sh',cwd=src,extra={'CXX':compiler,'PYTHON':python})
-        binary=area/'bin'/name
-        shutil.copy2(src/'build/shopping',binary)
-        binaries.append(binary)
-        unit=area/'bin'/('unit-'+name)
-        localtests=src/'tests'
-        shutil.copytree(root/'tests',localtests,dirs_exist_ok=True)
-        run(compiler,'-std=c++20','-O2',str(localtests/'input.cpp'),'-o',unit)
-        run(unit)
-        run(python,root/'verify.py',binary,area/'dev','--starter',area/'starter-pyspark','--answer',area/'dev-answer')
+        try:
+            src=area/name
+            src.mkdir(exist_ok=True)
+            shutil.copytree(root/'cpp',src/'cpp',dirs_exist_ok=True)
+            shutil.copy2(root/'build.sh',src/'build.sh')
+            if name not in ('base','haswell','skylake'):
+                with (root/f'perf/native/{name}.patch').open('rb') as patch:
+                    subprocess.run(['patch','-s','-p1'],cwd=src,stdin=patch,check=True)
+            compiler=shutil.which('g++-12') or shutil.which('g++')
+            if name in ('haswell','skylake'):
+                wrapper=src/'cxx'
+                arch='haswell' if name=='haswell' else 'skylake-avx512'
+                if name=='skylake' and 'avx512bw' not in flags: continue
+                wrapper.write_text(f'#!/bin/sh\nexec {compiler} -march={arch} "$@"\n')
+                wrapper.chmod(0o755)
+                compiler=str(wrapper)
+            if (src/'cpp/flat_parquet.hpp').exists():
+                shutil.copy2(root/'perf/native/standalone-build.sh',src/'build.sh')
+            mode=name.rsplit('-',1)[-1]
+            if mode in ('pgo','lto'):
+                shutil.copy2(root/'perf/native/tuned-build.sh',src/'build.sh')
+                (src/'perf').mkdir(exist_ok=True)
+                shutil.copy2(root/'perf/native/train.py',src/'perf/train.py')
+            run('sh','build.sh',cwd=src,extra={'CXX':compiler,'PYTHON':python,'COMPILER_TRIAL':mode})
+            binary=area/'bin'/name
+            shutil.copy2(src/'build/shopping',binary)
+            unit=area/'bin'/('unit-'+name)
+            localtests=src/'tests'
+            shutil.copytree(root/'tests',localtests,dirs_exist_ok=True)
+            run(compiler,'-std=c++20','-O2',str(localtests/'input.cpp'),'-o',unit)
+            run(unit)
+            run(python,root/'verify.py',binary,area/'dev','--starter',area/'starter-pyspark','--answer',area/'dev-answer')
+            binaries.append(binary)
+        except (subprocess.CalledProcessError,OSError) as exc:
+            if name=='base': raise
+            note('Rejected '+name,repr(exc))
     if shutil.which('perf'):
         with tempfile.TemporaryDirectory(dir=area) as temp:
             try:
@@ -124,6 +133,12 @@ def main():
             note(scale+' '+b.name,f'median {statistics.median(times):.4f} s, runs {times}, peak {max(r["peak_mib"] for r in rows):.0f} MiB, user {statistics.median(r["user_s"] for r in rows):.2f} s. '+str({k:round(statistics.median(v),3) for k,v in phases.items()}))
 
         best=min((b for b in binaries if b!=binary0),key=lambda b:performance[b.name])
+        head=outcomes/(scale+'-head-to-head.jsonl')
+        run(python,root/'perf/measure.py',data,binary0,best,'--runs','7' if scale=='practice' else '5','--warmup','1','--preload','--profile','--output-parent',area,'--log',head)
+        pairs=list(map(json.loads,head.read_text().splitlines()))
+        for binary in (binary0,best):
+            times=[round(x['wall_s'],4) for x in pairs if x['round']>=0 and x['binary']==str(binary)]
+            note('Alternating '+scale+' '+binary.name,f'median {statistics.median(times):.4f} s, runs {times}.')
         # Request eviction only for this job's generated CSVs and record the
         # actual residency before the executable starts.
         for b in [binary0,best]:

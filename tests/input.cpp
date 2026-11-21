@@ -24,7 +24,8 @@ int main() {
       assert(joined == expected);
     }
   }
-  for (size_t n : {31, 32, 33, 8191, 8192, 8193, 524295}) {
+  for (size_t n : {31, 32, 33, 63, 64, 65, 127, 128, 129, 8191, 8192, 8193,
+                   524295}) {
     for (char fill : {'a', ',', '\n', '"', '\0'}) {
       std::string s = "a,b\nc,d\n\"";
       s.append(n, fill);
