@@ -1,1 +1,1 @@
-base clean-graphpages fin-slabkey fin-slabrange fin-slabfew fin-slaball fin-slabrangeonly fin-slabkey-pgo fin-slabrange-pgo fin-slabfew-pgo fin-slaball-pgo fin-slabprefetch-pgo fin-slabadvice-pgo
+base clean-graphpages fin-slabrange-pgo fin-slabadvice-pgo stripe64-pgo stripe256-pgo stripe1024-pgo striperev-pgo striperaw-pgo

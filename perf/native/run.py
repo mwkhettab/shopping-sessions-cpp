@@ -141,7 +141,7 @@ def main():
             note('Alternating '+scale+' '+binary.name,f'median {statistics.median(times):.4f} s, runs {times}.')
         # Request eviction only for this job's generated CSVs and record the
         # actual residency before the executable starts.
-        selected=[b for b in binaries if b.name in ('base','fin-slabrange-pgo','fin-slabprefetch-pgo','fin-slabadvice-pgo')]
+        selected=[b for b in binaries if b.name in ('base','fin-slabrange-pgo','fin-slabadvice-pgo')]
         if best not in selected: selected.append(best)
         observations={b:[] for b in selected}
         for iteration in range(3):
@@ -164,12 +164,15 @@ def main():
                 (outcomes/'profile.txt').write_text(proc.stderr)
                 note('Profile '+best.name,' '.join(proc.stderr.splitlines()[-12:])[-1150:])
         publish()
+    from extra_checks import scaling, race
+    scaling(root,area,practice_winner,note,run,env)
     from native_images import verify_images
     try:
         verify_images(root,area,practice_winner,run,note,env)
     except Exception as exc:
         note('Docker qualification error',repr(exc))
         raise
+    race(root,area,practice_winner,note,run,env)
 
 published=0
 def publish():
