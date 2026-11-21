@@ -71,6 +71,13 @@ jobs:
           ref: 4db76beed31640ddf4b414ed19deba5ebc660b81
           path: .acceptance/baseline
           persist-credentials: false
+      - name: Check out the runtime alternatives
+        if: steps.hardware.outputs.run == 'yes' && matrix.lane != 'portable'
+        uses: actions/checkout@v4
+        with:
+          ref: 04a48ef48c6f96a6ee0baedcd21d58639d1acde8
+          path: .acceptance/runtime
+          persist-credentials: false
       - name: Check out optional comparison sources
         if: steps.hardware.outputs.run == 'yes' && (inputs.peer_repository || vars.NATIVE_PEER_REPOSITORY) && (inputs.peer_revision || vars.NATIVE_PEER_REVISION)
         uses: actions/checkout@v4
@@ -125,6 +132,10 @@ jobs:
           set -eu
           peer="$RUNNER_TEMP/shopping-peer"
           extra=()
+          case '${{ matrix.lane }}' in
+            primary) extra+=(--runtime-source "$GITHUB_WORKSPACE/.acceptance/runtime" --runtime-builds control paired memory paired-memory) ;;
+            secondary) extra+=(--runtime-source "$GITHUB_WORKSPACE/.acceptance/runtime" --runtime-builds control paired-memory paired-memory-layout paired-memory-v4) ;;
+          esac
           if [[ -n "$PEER_REPOSITORY" || -n "$PEER_REVISION" ]]; then
             if [[ -n "$PEER_RUN_ID" || -n "$PEER_ARTIFACT" || -z "$PEER_REPOSITORY" || ! "$PEER_REVISION" =~ ^[0-9a-f]{40}$ ]]; then
               echo "Supply either a full repository revision or a comparison artifact."

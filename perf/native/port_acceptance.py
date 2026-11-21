@@ -18,6 +18,14 @@ ROOT = Path(__file__).resolve().parents[2]
 NATIVE = ROOT / "perf/native"
 BASELINE = "4db76beed31640ddf4b414ed19deba5ebc660b81"
 CASCADE = "avx2,bmi1,bmi2,abm,avx512f,avx512bw,avx512cd,avx512vl,avx512dq,avx512_vnni"
+RUNTIME_BUILDS = {
+    "control": (),
+    "paired": ("PAIRED_CLICK_SORT",),
+    "memory": ("CUSTOM_MEMORY",),
+    "paired-memory": ("PAIRED_CLICK_SORT", "CUSTOM_MEMORY"),
+    "paired-memory-layout": ("PAIRED_CLICK_SORT", "CUSTOM_MEMORY", "INTEL_LAYOUT"),
+    "paired-memory-v4": ("PAIRED_CLICK_SORT", "CUSTOM_MEMORY", "INTEL_LAYOUT", "V4_SIDECAR"),
+}
 
 
 def store(path, value):
@@ -57,9 +65,10 @@ def identity(folder):
     return r.stdout.strip() if r.returncode == 0 else None
 
 
-def build_image(tag, folder, override, area, results, env):
+def build_image(tag, folder, override, area, results, env, switches=()):
     image = "shopping-acceptance:" + tag
-    exec_logged(["docker", "build", "--platform", "linux/amd64", "-t", image, folder],
+    options = [arg for name in switches for arg in ("--build-arg", name + "=1")]
+    exec_logged(["docker", "build", "--platform", "linux/amd64", *options, "-t", image, folder],
                 results / (tag + "-build.log"), env)
     info = json.loads(capture(["docker", "image", "inspect", image]))[0]
     if (info["Os"], info["Architecture"]) != ("linux", "amd64"):
@@ -80,7 +89,8 @@ def build_image(tag, folder, override, area, results, env):
     finally:
         subprocess.run(["docker", "rm", cid], stdout=subprocess.DEVNULL, check=True)
     return exe, {"source_commit": identity(folder), "image": image, "image_id": info["Id"], "entry": entry,
-                 "executable": str(exe), "hashes": {p.name: sha(p) for p in target.iterdir() if p.is_file()}}
+                 "build_switches": list(switches), "executable": str(exe),
+                 "hashes": {p.name: sha(p) for p in target.iterdir() if p.is_file()}}
 
 
 def provided_binary(tag, source, area):
@@ -97,6 +107,18 @@ def provided_binary(tag, source, area):
         dest.chmod(0o755)
     return target, {"source_commit": None, "executable": str(target), "supplied_file": str(source),
                     "hashes": {p.name: sha(p) for p in binaries}}
+
+
+def verify_development(tag, exe, image, area, results, env, candidate_source):
+    kit = area / "starter-pyspark"
+    exec_logged([sys.executable, candidate_source / "verify.py", exe, area/"dev",
+                 "--starter", kit, "--answer", area/"dev-answer"], results/(tag + "-dev.log"), env)
+    if image:
+        log = results/(tag + "-image-dev.log")
+        exec_logged([sys.executable, kit/"scripts/run_fixtures.py", kit/"fixtures", "--", image], log, env)
+        with tempfile.TemporaryDirectory(dir=area) as out:
+            exec_logged([image, area/"dev", out], log, env)
+            exec_logged([sys.executable, kit/"scripts/compare.py", out, area/"dev-answer"], log, env)
 
 
 def in_container(image, entry, meter, cpus, memory_mib, data, out):
@@ -149,8 +171,10 @@ def paired(scale, data, bins, area, results, env, warm_count, cold_count):
                 if r >= (warm_count if mode == "warm" else cold_count):
                     continue
                 paths = list(bins.values())
-                base = (r + int(mode == "cold")) % len(paths)
+                base = (max(0, r) // 2 + int(mode == "cold")) % len(paths)
                 paths = paths[base:] + paths[:base]
+                if r >= 0 and r % 2:
+                    paths.reverse()
                 if mode == "cold":
                     os.sync()
                 f = Path(td) / f"{r}-{mode}.jsonl"
@@ -180,6 +204,14 @@ def paired(scale, data, bins, area, results, env, warm_count, cold_count):
                 deltas = [r["wall_s"] / control[r["round"]]["wall_s"] - 1 for r in selected]
                 metric["paired_change_median"] = statistics.median(deltas)
                 metric["faster_pairs"] = sum(d < 0 for d in deltas)
+            metric["versus"] = {}
+            for control_label in ("candidate", "peer", "control", "paired-memory", "paired-memory-layout"):
+                if control_label not in bins or control_label == label:
+                    continue
+                control = {r["round"]: r["wall_s"] for r in records if r["label"] == control_label and r["cache"] == mode}
+                ratios = [r["wall_s"] / control[r["round"]] for r in selected]
+                metric["versus"][control_label] = {"median_ratio": statistics.median(ratios),
+                                                  "faster_pairs": sum(ratio < 1 for ratio in ratios), "pairs": len(ratios)}
             summary[mode + "/" + label] = metric
     return summary
 
@@ -207,6 +239,8 @@ def main():
     p.add_argument("--baseline-source", type=Path, default=ROOT / ".acceptance/baseline")
     p.add_argument("--baseline-binary", type=Path)
     p.add_argument("--candidate-binary", type=Path)
+    p.add_argument("--runtime-source", type=Path)
+    p.add_argument("--runtime-builds", nargs="+", choices=RUNTIME_BUILDS, default=[])
     peer = p.add_mutually_exclusive_group()
     peer.add_argument("--peer-binary", type=Path)
     peer.add_argument("--peer-source", type=Path)
@@ -227,6 +261,8 @@ def main():
     p.add_argument("--memory-mib", type=int, default=12288)
     p.add_argument("--skip-kernel-test", action="store_true", help="for exercising the harness with existing binaries")
     args = p.parse_args()
+    if bool(args.runtime_source) != bool(args.runtime_builds) or len(set(args.runtime_builds)) != len(args.runtime_builds):
+        p.error("supply --runtime-source and distinct --runtime-builds together")
     if min(args.cpus, args.warm_20, args.warm_60, args.cold_runs, args.memory_mib) < 1:
         p.error("CPU, memory and iteration values must be positive")
     if platform.system() != "Linux" or platform.machine() not in ("x86_64", "amd64"):
@@ -286,6 +322,11 @@ def main():
             bins[tag] = exe
             state["implementations"][tag] = item
             item["tested"] = False
+        for tag in args.runtime_builds:
+            exe, item = build_image(tag, args.runtime_source.resolve(), None, area, results, env, RUNTIME_BUILDS[tag])
+            bins[tag] = exe
+            state["implementations"][tag] = item
+            item["tested"] = False
         if not args.skip_kernel_test:
             mark("kernel")
             tree = args.candidate_source.resolve()
@@ -309,27 +350,35 @@ def main():
                 images[tag] = launcher(item, exe, meter, cpu_list, args.memory_mib)
 
         mark("fixtures and development tables")
-        for tag, exe in bins.items():
-            exec_logged([sys.executable, args.candidate_source / "verify.py", exe, area/"dev",
-                         "--starter", area/"starter-pyspark", "--answer", area/"dev-answer"],
-                        results / (tag + "-dev.log"), env)
-            if tag in images:
-                # The built image also runs the exact scorer fixture and reference checks.
-                log = results / (tag + "-image-dev.log")
-                kit = area / "starter-pyspark"
-                exec_logged([sys.executable, kit/"scripts/run_fixtures.py", kit/"fixtures", "--", images[tag]], log, env)
-                with tempfile.TemporaryDirectory(dir=area) as out:
-                    exec_logged([images[tag], area/"dev", out], log, env)
-                    exec_logged([sys.executable, kit/"scripts/compare.py", out, area/"dev-answer"], log, env)
+        for tag, exe in list(bins.items()):
+            try:
+                verify_development(tag, exe, images.get(tag), area, results, env, args.candidate_source)
+            except subprocess.CalledProcessError as error:
+                if tag in ("baseline", "candidate"):
+                    raise
+                state["implementations"][tag].update(tested=False, excluded="fixture or 1M failure", error=str(error))
+                print(f"Excluding {tag} after a development comparison failed", flush=True)
+                del bins[tag]
+                continue
             state["implementations"][tag]["tested"] = True
             state["verified"]["1M/" + tag] = "36 fixtures, additional edge cases, both published 1M tables"
         mark("patterned rules")
-        rules = results / "patterned-rules.jsonl"
-        exec_logged([sys.executable, NATIVE/"port_patterns.py", bins["candidate"], bins["baseline"],
-                     area/"starter-pyspark/fixtures", "--log", rules], results/"patterned-rules.log", env)
-        audits = [json.loads(line) for line in rules.read_text().splitlines()]
-        state["verified"]["patterned rules"] = {path: sum(r["path"] == path for r in audits)
-                                                for path in ("direct", "generic")}
+        for tag in ("candidate", *args.runtime_builds):
+            if tag not in bins:
+                continue
+            rules = results/(tag + "-patterned-rules.jsonl")
+            try:
+                exec_logged([sys.executable, NATIVE/"port_patterns.py", bins[tag], bins["baseline"],
+                             area/"starter-pyspark/fixtures", "--log", rules], rules.with_suffix(".log"), env)
+            except subprocess.CalledProcessError as error:
+                if tag == "candidate":
+                    raise
+                state["implementations"][tag].update(tested=False, excluded="patterned rules failure", error=str(error))
+                del bins[tag]
+                continue
+            audits = [json.loads(line) for line in rules.read_text().splitlines()]
+            state["verified"]["patterned rules/" + tag] = {path: sum(r["path"] == path for r in audits)
+                                                               for path in ("direct", "generic")}
         for scale in ("20M", "60M"):
             if scale not in args.scales:
                 continue
