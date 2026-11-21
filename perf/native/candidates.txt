@@ -1,1 +1,1 @@
-base fin-slabkey-pgo shipresident-pgo release2rich-pgo engine-portable-pgo engine-lanes-pgo
+base fin-slabkey-pgo shipresident-pgo release2rich-pgo engine-lanes-pgo ord-slab-pgo ord-lines-pgo ord-stream-pgo ord-compact-pgo ord-pairs-pgo ord-local-flow-pgo ord-stream-packed-pgo ord-flow-packed-pgo ord-wide-fields-pgo ord-wide-packed-pgo ord-wide-flow-pgo
