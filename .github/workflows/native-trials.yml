@@ -14,10 +14,11 @@ jobs:
   compare:
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 3
       matrix:
         include:
           - {os: ubuntu-24.04, lane: primary}
+          - {os: ubuntu-24.04, lane: secondary}
           - {os: ubuntu-22.04, lane: portable}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 115
@@ -64,7 +65,7 @@ jobs:
           df -h .
       - name: Validate and measure fresh processes
         if: steps.hardware.outputs.run == 'yes'
-        run: "$RUNNER_TEMP/shopping-python/bin/python perf/native/ordinal_windows_native.py"
+        run: "$RUNNER_TEMP/shopping-python/bin/python perf/native/ordinal_final_native.py"
       - uses: actions/upload-artifact@v4
         if: always() && steps.hardware.outputs.run == 'yes'
         with:

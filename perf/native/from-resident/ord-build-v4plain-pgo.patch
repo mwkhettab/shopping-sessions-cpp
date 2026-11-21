@@ -1,0 +1,1618 @@
+--- a/cpp/flat_parquet.hpp
++++ b/cpp/flat_parquet.hpp
+@@ -66,6 +66,7 @@
+ struct Page {
+   uint64_t offset, bytes;
+   int encoding;
++  uint64_t dictionary=UINT64_MAX;
+ };
+ struct Group {
+   size_t rows{};
+@@ -78,7 +79,7 @@
+   std::ofstream stream;
+   std::span<const Column> columns;
+   std::vector<Group> groups;
+-  uint64_t position{}, total_rows{};
++  uint64_t position{}, total_rows{}, dictionary_start=UINT64_MAX;
+   void write(Str bytes) {
+     stream.write(bytes.data(), std::streamsize(bytes.size()));
+     position += bytes.size();
+@@ -94,6 +95,18 @@
+   void group(size_t n) {
+     groups.emplace_back().rows = n;
+     total_rows += n;
++  }
++  void dictionary(Str data,size_t entries) {
++    if(data.size()>INT32_MAX || !entries || entries>INT32_MAX || dictionary_start!=UINT64_MAX)
++      throw std::length_error("invalid Parquet dictionary");
++    Bytes header;
++    Fields page{header};
++    page.integer(1,2);page.integer(2,data.size());page.integer(3,data.size());
++    page.field(7,Struct);
++    Fields content{header};
++    content.integer(1,entries);content.integer(2,0);
++    content.finish();page.finish();
++    dictionary_start=position;write(header);write(data);
+   }
+   void page(Str data, int encoding = 0) {
+     if (data.size() > INT32_MAX)
+@@ -113,7 +126,9 @@
+     dh.finish();
+     ph.finish();
+     uint64_t bytes = header.size() + data.size();
+-    g.pages.push_back({position, bytes, encoding});
++    if(dictionary_start!=UINT64_MAX)bytes+=position-dictionary_start;
++    g.pages.push_back({position, bytes, encoding,dictionary_start});
++    dictionary_start=UINT64_MAX;
+     g.bytes += bytes;
+     write(header);
+     write(data);
+@@ -155,8 +170,9 @@
+         chunk.field(3, Struct);
+         Fields md{footer};
+         md.integer(1, c.physical);
+-        md.sequence(2, c.optional ? 2 : 1, I32);
++        md.sequence(2, 1+unsigned(c.optional)+unsigned(p.dictionary!=UINT64_MAX), I32);
+         varint(footer, unsigned(p.encoding) * 2);
++        if(p.dictionary!=UINT64_MAX)varint(footer,0);
+         if (c.optional)
+           varint(footer, 6);
+         md.sequence(3, 1, String);
+@@ -166,6 +182,7 @@
+         md.integer(6, p.bytes, I64);
+         md.integer(7, p.bytes, I64);
+         md.integer(9, p.offset, I64);
++        if(p.dictionary!=UINT64_MAX)md.integer(11,p.dictionary,I64);
+         md.finish();
+         chunk.finish();
+       }
+@@ -300,14 +317,54 @@
+   std::array<char, 9> inline_name;
+   Key previous_user{};
+   Str user_name;
++  int32_t first_day=INT32_MAX,last_day=INT32_MIN;
++  std::vector<uint16_t> name_runs;
+ 
+   void flush() {
+     if (!rows)
+       return;
+     MEASURE(parquet_write);
+     file.group(rows);
+-    file.page(values[0]);
+-    for (size_t column = 1; column < 5; ++column) {
++    // All of one person's days are emitted together. A new row group starts
++    // a fresh dictionary, even if the previous page ended with this person.
++    file.dictionary(values[0],name_runs.size());
++    encoded.clear();
++    unsigned bits=std::max(1u,unsigned(std::bit_width(name_runs.size()-1)));
++    encoded.push_back(char(bits));
++    for(size_t i=0;i<name_runs.size();++i) {
++      flat_parquet::varint(encoded,uint32_t(name_runs[i])*2);
++      encoded.push_back(char(i));
++      if(bits>8)encoded.push_back(char(i>>8));
++    }
++    file.page(encoded,8);
++    name_runs.clear();
++    size_t next_column=1;
++    uint64_t distance=uint64_t(int64_t(last_day)-first_day);
++    if(distance<256){
++      encoded.clear();
++      for(unsigned j=0;j<=distance;++j)flat_parquet::little(encoded,int32_t(int64_t(first_day)+j));
++      file.dictionary(encoded,distance+1);
++      encoded.clear();
++      unsigned bits=distance<16?4:8;
++      encoded.push_back(char(bits));
++      size_t octets=(rows+7)/8;
++      flat_parquet::varint(encoded,2*octets+1);
++      size_t start=encoded.size();encoded.resize(start+octets*bits,0);
++      for(size_t j=0;j<rows;++j){
++        uint32_t raw;
++        std::memcpy(&raw,values[1].data()+4*j,4);
++        if constexpr(std::endian::native==std::endian::big)raw=__builtin_bswap32(raw);
++        unsigned d=raw-uint32_t(first_day);
++        if(bits==8)encoded[start+j]=char(d);
++        else {
++          auto &byte=encoded[start+j/2];
++          byte=char(uint8_t(byte)|(d<<(4*(j%2))));
++        }
++      }
++      file.page(encoded,8);next_column=2;
++    }
++    first_day=INT32_MAX;last_day=INT32_MIN;
++    for (size_t column = next_column; column < 5; ++column) {
+       encoded.clear();
+       if (column == 1)
+         flat_parquet::delta_pack<int32_t>(encoded, values[column]);
+@@ -336,7 +393,8 @@
+   }
+ 
+   void append(const UserDay &row) {
+-    if (previous_user.bits != row.user.bits) {
++    const bool same_person=previous_user.bits==row.user.bits;
++    if (!same_person) {
+       user_name = row.user.user_text(inline_name);
+       previous_user = row.user;
+     }
+@@ -346,7 +404,11 @@
+                  extra > std::max(max_text_bytes, text_bytes) - text_bytes))
+       flush();
+     text_bytes += extra;
+-    flat_parquet::plain_string(values[0], user_name);
++    if(!rows || !same_person){
++      flat_parquet::plain_string(values[0],user_name);
++      name_runs.push_back(1);
++    }else ++name_runs.back();
++    first_day=std::min(first_day,row.day);last_day=std::max(last_day,row.day);
+     flat_parquet::little(values[1], row.day);
+     flat_parquet::little(values[2], row.sessions);
+     flat_parquet::little(values[3], row.events);
+--- a/cpp/input.hpp
++++ b/cpp/input.hpp
+@@ -148,8 +148,34 @@
+ #include "csv_x86.hpp"
+ #include "line_csv.hpp"
+ #include "line_tile.hpp"
++#include "marked_events.hpp"
++#if defined(SHOPPING_X86_CSV) && defined(__x86_64__)
++// Training runs exercise the available backends separately. A cap can only
++// lower the detected instruction set; every backend still checks its ISA.
++inline unsigned event_reader_limit() {
++  static const unsigned limit = std::getenv("SHOP_TRAIN_BASE_READER") ? 1 :
++                                std::getenv("SHOP_TRAIN_BW_READER") ? 2 : 3;
++  return limit;
++}
++#endif
+ template <size_t N, class F> void parse_rows(Str data, F &&callback) {
+ #ifdef SHOPPING_X86_CSV
++#ifdef __x86_64__
++  if constexpr (N == 7) {
++    if (wide_csv_supported() && __builtin_cpu_supports("bmi2") &&
++        __builtin_cpu_supports("pclmul")) {
++      if (__builtin_cpu_supports("avx512f") &&
++          __builtin_cpu_supports("avx512bw") &&
++          __builtin_cpu_supports("avx512vbmi2") && event_reader_limit() >= 3) {
++        marked_events_vbmi2(data, callback);
++        return;
++      }
++      marked_events_avx2(data, callback);
++      return;
++
++    }
++  }
++#endif
+   if (N == 7 && wide_csv_supported()) {
+     tiled_lines<N, 16>(data, callback);
+     return;
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -6,9 +6,10 @@
+ #include <regex>
+ #include <span>
+ 
+-template <class Generic, class Common> struct EventCallbacks {
++template <class Generic, class Common, class Rich> struct EventCallbacks {
+   Generic generic;
+   Common common;
++  Rich rich;
+   template <class Row> void operator()(const Row &row) { generic(row); }
+ };
+ size_t bucket(Key k) { return k.hash() % shards; }
+@@ -197,7 +198,7 @@
+ template <class Layout>
+ void summarize(Key user, std::span<typename Layout::E> events,
+                std::span<typename Layout::C> clicks, const Catalog &cat,
+-               Result &result, Layout layout) {
++               Result &result, Layout layout, bool ordered = false) {
+   if (events.empty())
+     return;
+ #ifdef SHOPPING_DIAGNOSTICS
+@@ -207,13 +208,13 @@
+   result.max_events = std::max(result.max_events, events.size());
+   result.max_clicks = std::max(result.max_clicks, clicks.size());
+ #endif
+-  const bool use_bins = !result.bins.cells.empty() && events.size() >= 32;
++  const bool use_bins = !ordered && !result.bins.cells.empty() && events.size() >= 32;
+   {
+     MEASURE(sorting);
+-    if (!use_bins)
++    if (!ordered && !use_bins)
+       std::sort(events.begin(), events.end(),
+                 [&](auto a, auto b) { return layout.less(a, b); });
+-    std::sort(clicks.begin(), clicks.end(), [](const auto &a, const auto &b) {
++    if(clicks.size()>2)std::sort(clicks.begin(), clicks.end(), [](const auto &a, const auto &b) {
+       return a.ts == b.ts ? b.id.user_less(a.id, 'k') : a.ts < b.ts;
+     });
+   }
+@@ -252,6 +253,24 @@
+     ++daily.sessions;
+     daily.events += count;
+     daily.revenue += revenue;
++    if(clicks.size()<=2) {
++      const typename Layout::C *first=nullptr,*second=nullptr;
++      auto eligible=[&](const auto &c){
++        Time ts=layout.click_time(c);
++        return ts<=start && uint64_t(start)-uint64_t(ts)<=uint64_t(reach);
++      };
++      if(!clicks.empty() && eligible(clicks[0]))first=&clicks[0];
++      if(clicks.size()==2 && eligible(clicks[1]))second=&clicks[1];
++      const auto *best=first;
++      if(second && (!first || first->ts<second->ts ||
++                (first->ts==second->ts && second->id.user_less(first->id,'k'))))best=second;
++      auto &credit=result.at(best?best->campaign:0,day);
++      ++credit.sessions;credit.purchases+=revenue!=0;credit.revenue+=revenue;
++      if(first)++result.at(first->campaign,day).assists;
++      if(second && (!first || first->campaign!=second->campaign))++result.at(second->campaign,day).assists;
++      return;
++    }
++
+     {
+       MEASURE(attribution);
+       while (right < clicks.size() &&
+@@ -668,6 +687,50 @@
+   timer.mark("linked-person sessions, attribution and aggregation");
+ }
+ 
++std::vector<Result> open_results(const fs::path &output,Window window,const Catalog &cat,unsigned threads){
++  std::vector<Result> results(threads);
++  fs::create_directories(output / "user_daily");
++  fs::create_directories(output / "campaign_daily");
++  parallel(results.size(), threads, [&](size_t i, unsigned) {
++    auto &result = results[i];
++    result.configure(window, cat, threads);
++    result.user_file = std::make_unique<UserFile>(
++        output / "user_daily" / ("part-" + std::to_string(i) + ".parquet"));
++  });
++  return results;
++}
++void finish_results(const fs::path &output,const Catalog &cat,unsigned threads,std::vector<Result>&results,Timer &timer){
++  parallel(results.size(), threads,
++           [&](size_t i, unsigned) { results[i].user_file->close(); });
++  std::vector<CampaignDay> campaigns;
++  auto append = [&](size_t id, int32_t day, const Counts &counts) {
++    campaigns.push_back({cat.campaigns[id], cat.channels[id], day, counts});
++  };
++  const auto &first = results.front();
++  if (first.table.empty()) {
++    Totals merged;
++    for (const auto &part : results)
++      for (const auto &[key, counts] : part.sparse)
++        merged[key].add(counts);
++    for (const auto &[key, counts] : merged)
++      append(key.first, key.second, counts);
++  } else {
++    for (size_t start = 0; start < first.table.size();
++         start += first.campaigns) {
++      const int32_t day = first.first_day + int32_t(start / first.campaigns);
++      for (size_t id = 0; id < first.campaigns; ++id) {
++        Counts counts;
++        for (const auto &part : results)
++          counts.add(part.table[start + id]);
++        if (counts.sessions || counts.assists)
++          append(id, day, counts);
++      }
++    }
++  }
++  write_campaigns(output / "campaign_daily" / "part-0.parquet", campaigns);
++  timer.mark("merge and Parquet output");
++}
++
+ template <class Layout>
+ void run_layout(const fs::path &data, const fs::path &output, unsigned threads,
+                 Input &input, Window window, Catalog &cat, Timer &timer,
+@@ -818,7 +881,48 @@
+                    Event{good ? ts : bad, 0, 0}, ingest);
+                return true;
+              };
+-             auto callbacks = EventCallbacks{generic_event, common_event};
++             auto rich_event = [&](const char *id, unsigned id_width,
++                                   const char *user, unsigned user_width,
++                                   Str event_time, Str arrival, Str type,
++                                   Str product, Str price) {
++               if constexpr (sizeof(uintptr_t) != 8 ||
++                             std::endian::native != std::endian::little)
++                 return false;
++               if (id[0] != 'e' || user[0] != 'u')
++                 return false;
++               auto load = [](const char *p, unsigned n) {
++                 const uint64_t mask = UINT64_MAX >> (8 * (9 - n));
++                 return little_word(p + 1) & mask;
++               };
++               auto event_word = load(id, id_width),
++                    user_word = load(user, user_width);
++               if ((event_word | user_word) >> 63 || !id[id_width - 1] ||
++                   !user[user_width - 1])
++                 return false;
++               Time ingest = ingest_time(arrival);
++               bool purchase = type == "purchase";
++               Time cents = purchase ? number(price, 10000000) : 0;
++               bool useful =
++                   !product.empty() && ((purchase && cents >= 1) ||
++                                        type == "cart" || type == "view");
++               Time ts = useful ? timestamp(event_time) : bad;
++               bool good = useful && ts >= window.start && ts < window.end &&
++                           ingest - ts <= day_ms;
++#ifdef SHOPPING_DIAGNOSTICS
++               ++workers[t].revisions;
++               workers[t].valid_events += good;
++#endif
++               put(Key{uintptr_t(permute_key(event_word) << 1)},
++                   good ? Key{uintptr_t(permute_key(user_word) << 1)} : Key{},
++                   Event{good ? ts : bad, good && purchase ? int32_t(cents) : 0,
++                         good && purchase
++                             ? std::max(0, cat.product.find(product))
++                             : 0},
++                   ingest);
++               return true;
++             };
++             auto callbacks =
++                 EventCallbacks{generic_event, common_event, rich_event};
+              rows<7>(events[job].body(), callbacks);
+            });
+   timer.mark("concurrent input, raw user partition and revision index");
+@@ -835,47 +939,11 @@
+ #endif
+   resolve_revisions(workers, threads, anchor);
+   timer.mark("global event dedup and loser removal");
+-  std::vector<Result> results(threads);
+-  fs::create_directories(output / "user_daily");
+-  fs::create_directories(output / "campaign_daily");
+-  parallel(results.size(), threads, [&](size_t i, unsigned) {
+-    auto &result = results[i];
+-    result.configure(window, cat, threads);
+-    result.user_file = std::make_unique<UserFile>(
+-        output / "user_daily" / ("part-" + std::to_string(i) + ".parquet"));
+-  });
++  auto results=open_results(output,window,cat,threads);
+   process_people(workers, results, cat, threads, timer, layout);
+   for (auto &w : workers)
+     w.candidates.release();
+-  parallel(results.size(), threads,
+-           [&](size_t i, unsigned) { results[i].user_file->close(); });
+-  std::vector<CampaignDay> campaigns;
+-  auto append = [&](size_t id, int32_t day, const Counts &counts) {
+-    campaigns.push_back({cat.campaigns[id], cat.channels[id], day, counts});
+-  };
+-  const auto &first = results.front();
+-  if (first.table.empty()) {
+-    Totals merged;
+-    for (const auto &part : results)
+-      for (const auto &[key, counts] : part.sparse)
+-        merged[key].add(counts);
+-    for (const auto &[key, counts] : merged)
+-      append(key.first, key.second, counts);
+-  } else {
+-    for (size_t start = 0; start < first.table.size();
+-         start += first.campaigns) {
+-      const int32_t day = first.first_day + int32_t(start / first.campaigns);
+-      for (size_t id = 0; id < first.campaigns; ++id) {
+-        Counts counts;
+-        for (const auto &part : results)
+-          counts.add(part.table[start + id]);
+-        if (counts.sessions || counts.assists)
+-          append(id, day, counts);
+-      }
+-    }
+-  }
+-  write_campaigns(output / "campaign_daily" / "part-0.parquet", campaigns);
+-  timer.mark("merge and Parquet output");
++  finish_results(output,cat,threads,results,timer);
+ #ifdef SHOPPING_DIAGNOSTICS
+   size_t revisions = 0, valid = 0, duplicates = 0, clicks_kept = 0, people = 0;
+   size_t events_seen = 0, clicks_seen = 0, max_events = 0, max_clicks = 0;
+@@ -901,12 +969,19 @@
+   metrics::report();
+ #endif
+ }
++#include "ordinal_math.hpp"
++#include "ordinal_ids.hpp"
++#include "ordinal_people.hpp"
++#include "ordinal_engine.hpp"
++
+ void run(const fs::path &data, const fs::path &output, unsigned threads) {
+   Timer timer;
+   Input input;
+   Window window(input.map(data / "manifest.json"));
+   Catalog cat(input, data);
+   uint64_t width = uint64_t(window.end) - uint64_t(window.start);
++  if(width<=UINT32_MAX-uint64_t(reach) && cat.categories.size()<=256 &&
++     !std::getenv("SHOP_GENERAL_READER") && ordinal_engine::run(data,output,window,cat,threads,timer))return;
+   if (width <= UINT32_MAX - uint64_t(reach) && cat.categories.size() <= 256)
+     run_layout(data, output, threads, input, window, cat, timer,
+                WordLayout{window.start});
+@@ -914,6 +989,17 @@
+     run_layout(data, output, threads, input, window, cat, timer, WideLayout{});
+ }
+ int main(int argc, char **argv) {
++#if defined(__linux__) && defined(__x86_64__) && defined(SHOP_RELEASE_DISPATCH)
++  bool supported=__builtin_cpu_supports("x86-64-v4") && __builtin_cpu_supports("pclmul");
++#if SHOP_RELEASE_DISPATCH == 2
++  supported=supported && __builtin_cpu_supports("avx512ifma") && __builtin_cpu_supports("avx512vbmi2") && !std::getenv("SHOP_ORDINAL_BASE_MULTIPLY");
++#endif
++  if(supported && !std::getenv("SHOP_TRAIN_BASE_READER") && !std::getenv("SHOP_TRAIN_BW_READER")){
++    std::array<char,4096> path;
++    auto n=readlink("/proc/self/exe",path.data(),path.size());
++    if(n>0 && size_t(n)<=path.size()-5){std::memcpy(path.data()+n,".opt",5);execv(path.data(),argv);}
++  }
++#endif
+   auto env = [](const char *key, const char *fallback) {
+     auto s = std::getenv(key);
+     return s ? s : fallback;
+--- /dev/null
++++ b/cpp/marked_event_tile.inc
+@@ -0,0 +1,60 @@
++// Shared by the x86 target-specific entry points in marked_events.hpp.
++  constexpr unsigned Bytes = 2048, N = 7;
++  constexpr unsigned Words = Bytes / 64;
++  alignas(64) std::array<uint16_t, Bytes + 64> positions;
++  positions[0] = 0;
++  uint16_t *cuts = positions.data() + 1;
++  while (data.size() >= Bytes) {
++    const char *text = data.data();
++    std::array<OrdinalMasks, Words> masks;
++    for (unsigned k = 0; k < Words; ++k) {
++      masks[k] = classify(text + 64 * k);
++    }
++    unsigned words = Words;
++    while (words && !masks[words - 1].newlines)
++      --words;
++    if (!words) {
++      auto lf = data.find('\n', Bytes);
++      size_t take = lf == Str::npos ? data.size() : lf + 1;
++      scalar_rows<N>(data.substr(0, take), fn);
++      data.remove_prefix(take);
++      continue;
++    }
++    auto &last = masks[words - 1];
++    unsigned length = words * 64 - std::countl_zero(last.newlines);
++    uint64_t tail = mask_to(length - (words - 1) * 64);
++    last.separators &= tail;
++    last.quotes &= tail;
++    uint64_t inside = 0, previous = 1, invalid = 0;
++    unsigned nc = 0;
++    for (unsigned b = 0; b < words; ++b) {
++      auto [sep, q, lf] = masks[b];
++      unsigned count = std::popcount(sep);
++      uint64_t want = ordinal_newlines<N>[nc % N] & mask_to(count);
++      invalid |= _pext_u64(lf, sep) ^ want;
++      uint64_t closed = (q << 1) | (b ? (masks[b - 1].quotes >> 63) : 0);
++      uint64_t parity = quote_prefix(q) ^ inside;
++      uint64_t next = b + 1 < words ? (masks[b + 1].separators & 1) : 1;
++      invalid |= ((q & parity) & ~((sep << 1) | previous)) |
++                 ((q & ~parity) & ~((sep >> 1) | (next << 63))) |
++                 (sep & parity);
++      inside = uint64_t(0) - (parity >> 63);
++      previous = sep >> 63;
++      save_positions(cuts + nc, 64 * b, sep, closed);
++
++      nc += count;
++    }
++    if (invalid || inside || nc % N) {
++      tiled_lines<N, 16>(data.substr(0, length), fn);
++    } else {
++      unsigned i=0;
++      if constexpr (requires { fn.common(text, 2u, text, 2u, Str{}, Str{}); }) {
++        for (; nc-i >= 8*N; i+=8*N)
++          emit_event_batch(text, cuts+i, fn);
++      }
++      for (; i < nc; i+=N)
++        emit_marked_event(MarkedEventFields{text,cuts+i},fn);
++    }
++    data.remove_prefix(length);
++  }
++  tiled_lines<N, 16>(data, fn);
+--- /dev/null
++++ b/cpp/marked_events.hpp
+@@ -0,0 +1,237 @@
++#pragma once
++#if defined(SHOPPING_X86_CSV) && defined(__x86_64__)
++// A certified tile has seven fields per row and quotes only in matching
++// pairs at field boundaries. Reject the complete tile before emitting rows
++// when either check fails. The scalar grammar handles long or irregular input.
++struct OrdinalMasks {
++  uint64_t separators, quotes, newlines;
++};
++
++template <size_t N>
++inline constexpr auto ordinal_newlines = [] {
++  std::array<uint64_t, N> out{};
++  for (unsigned phase = 0; phase < N; ++phase)
++    for (unsigned bit = 0; bit < 64; ++bit)
++      if ((phase + bit + 1) % N == 0)
++        out[phase] |= uint64_t{1} << bit;
++  return out;
++}();
++
++__attribute__((target("avx2,bmi,bmi2,popcnt,pclmul"),
++               always_inline)) inline OrdinalMasks
++ordinal_masks_avx2(const char *p) {
++  auto a = row_mask32(p), b = row_mask32(p + 32);
++  auto join = [](unsigned x, unsigned y) {
++    return uint64_t(x) | (uint64_t(y) << 32);
++  };
++  auto lf = join(a.lf, b.lf);
++  return {join(a.comma, b.comma) | lf, join(a.quotes, b.quotes), lf};
++}
++
++__attribute__((target("avx512f,avx512bw"), always_inline)) inline OrdinalMasks
++ordinal_masks_wide(const char *p) {
++  auto text = _mm512_loadu_si512(p);
++  uint64_t lf = _mm512_cmpeq_epi8_mask(text, _mm512_set1_epi8('\n'));
++  return {lf | _mm512_cmpeq_epi8_mask(text, _mm512_set1_epi8(',')),
++          _mm512_cmpeq_epi8_mask(text, _mm512_set1_epi8('"')), lf};
++}
++
++__attribute__((target("avx2,pclmul"), always_inline)) inline uint64_t
++quote_prefix(uint64_t q) {
++  auto value = _mm_cvtsi64_si128(std::bit_cast<int64_t>(q));
++  return uint64_t(
++      _mm_cvtsi128_si64(_mm_clmulepi64_si128(value, _mm_set1_epi64x(-1), 0)));
++}
++
++// Each word encodes twice the position just after a separator, plus one if
++// its field ends in a quote. A certified field then has the same flag at
++// its opening and closing ends, even for an empty quoted value.
++struct MarkedEventFields {
++  const char *data;
++  std::array<uint16_t, 8> begins, lengths;
++  MarkedEventFields(const char *text, const uint16_t *cuts) : data(text) {
++    auto words = _mm_loadu_si128(reinterpret_cast<const __m128i *>(cuts - 1));
++    auto end = _mm_srli_si128(words, 2), begin = _mm_srli_epi16(words, 1);
++    auto ones = _mm_set1_epi16(1), trim = _mm_and_si128(end, ones);
++    auto width =
++        _mm_sub_epi16(_mm_sub_epi16(_mm_srli_epi16(end, 1), ones), begin);
++    _mm_storeu_si128(reinterpret_cast<__m128i *>(begins.data()),
++                     _mm_add_epi16(begin, trim));
++    _mm_storeu_si128(reinterpret_cast<__m128i *>(lengths.data()),
++                     _mm_sub_epi16(width, _mm_add_epi16(trim, trim)));
++  }
++  Str operator[](size_t i) const { return {data + begins[i], lengths[i]}; }
++  operator std::array<Str, 7>() const {
++    constexpr size_t N = 7;
++    std::array<Str, N> values;
++    for (size_t i = 0; i < N; ++i)
++      values[i] = (*this)[i];
++    return values;
++  }
++};
++__attribute__((target("avx512f,avx512bw,avx512vbmi2"),
++               always_inline)) inline void
++save_trimmed_positions(uint16_t *out, unsigned base, uint64_t separators,
++                       uint64_t closed) {
++  alignas(64) static constexpr auto sequence = [] {
++    std::array<uint8_t, 64> values{};
++    for (unsigned i = 0; i < 64; ++i)
++      values[i] = uint8_t(2 * i);
++    return values;
++  }();
++  auto base_offsets = _mm512_load_si512(sequence.data());
++  auto marked = _mm512_mask_add_epi8(base_offsets, closed, base_offsets,
++                                     _mm512_set1_epi8(1));
++  auto packed = _mm512_maskz_compress_epi8(separators, marked);
++  auto origin = _mm512_set1_epi16(short(2 * (base + 1)));
++  auto lower = _mm512_cvtepu8_epi16(_mm512_castsi512_si256(packed));
++  _mm512_storeu_si512(out, _mm512_add_epi16(lower, origin));
++  if (std::popcount(separators) > 32) {
++    auto high = _mm512_shuffle_i64x2(packed, packed, 0xee);
++    auto upper = _mm512_cvtepu8_epi16(_mm512_castsi512_si256(high));
++    _mm512_storeu_si512(out + 32, _mm512_add_epi16(upper, origin));
++  }
++}
++template <class F>
++inline void emit_marked_event(const MarkedEventFields &row, F &fn) {
++  if constexpr (requires {
++                  fn.rich(row[0].data(), 0u, row[1].data(), 0u, row[2], row[3],
++                          row[4], row[5], row[6]);
++                }) {
++    Str id = row[0], user = row[1], arrival = row[3];
++    if (id.size() - 2 <= 7 && user.size() - 2 <= 7 && arrival.size() == 20 &&
++        fn.rich(id.data(), unsigned(id.size()), user.data(),
++                unsigned(user.size()), row[2], arrival, row[4], row[5], row[6]))
++      return;
++  }
++  fn(row);
++}
++inline void save_marked_positions(uint16_t *out, unsigned base,
++                                  uint64_t separators, uint64_t closed) {
++  while (separators) {
++    unsigned bit = std::countr_zero(separators);
++    *out++ = uint16_t(2 * (base + bit + 1) + ((closed >> bit) & 1));
++    separators &= separators - 1;
++  }
++}
++struct EightEventFields {
++  __m128i begins[7], widths[7], eligible, id_shape;
++  // Each row contains the previous line end and the seven current ends. Every
++  // index stores twice the next start and the field's verified quote flag.
++  __attribute__((
++      target("avx2,bmi,bmi2,popcnt,pclmul"),
++      always_inline)) inline explicit EightEventFields(const uint16_t *cuts) {
++    __m128i pairs[8], quads[8], columns[8];
++    for (unsigned i = 0; i < 4; ++i) {
++      auto a =
++          _mm_loadu_si128(reinterpret_cast<const __m128i *>(cuts + 14 * i - 1));
++      auto b =
++          _mm_loadu_si128(reinterpret_cast<const __m128i *>(cuts + 14 * i + 6));
++      pairs[2 * i] = _mm_unpacklo_epi16(a, b);
++      pairs[2 * i + 1] = _mm_unpackhi_epi16(a, b);
++    }
++    for (unsigned i = 0; i < 2; ++i)
++      for (unsigned j = 0; j < 2; ++j) {
++        auto a = pairs[4 * i + j], b = pairs[4 * i + j + 2];
++        quads[4 * i + 2 * j] = _mm_unpacklo_epi32(a, b);
++        quads[4 * i + 2 * j + 1] = _mm_unpackhi_epi32(a, b);
++      }
++    for (unsigned i = 0; i < 4; ++i) {
++      columns[2 * i] = _mm_unpacklo_epi64(quads[i], quads[i + 4]);
++      columns[2 * i + 1] = _mm_unpackhi_epi64(quads[i], quads[i + 4]);
++    }
++    auto one = _mm_set1_epi16(1);
++    for (unsigned i = 0; i < 7; ++i) {
++      auto left = _mm_srli_epi16(columns[i], 1);
++      auto end = columns[i + 1], trim = _mm_and_si128(end, one);
++      begins[i] = _mm_add_epi16(left, trim);
++      auto raw =
++          _mm_sub_epi16(_mm_sub_epi16(_mm_srli_epi16(end, 1), one), left);
++      widths[i] = _mm_sub_epi16(raw, _mm_add_epi16(trim, trim));
++    }
++    auto short_id = [](__m128i width) {
++      return _mm_and_si128(_mm_cmpgt_epi16(width, _mm_set1_epi16(1)),
++                           _mm_cmpgt_epi16(_mm_set1_epi16(10), width));
++    };
++    eligible = _mm_and_si128(short_id(widths[0]), short_id(widths[1]));
++    eligible =
++        _mm_and_si128(eligible, _mm_cmpeq_epi16(widths[3], _mm_set1_epi16(20)));
++    id_shape = eligible;
++    eligible =
++        _mm_and_si128(eligible, _mm_cmpeq_epi16(widths[4], _mm_set1_epi16(4)));
++    eligible = _mm_and_si128(eligible,
++                             _mm_cmpgt_epi16(widths[5], _mm_setzero_si128()));
++  }
++  __attribute__((target("avx2,bmi,bmi2,popcnt,pclmul"),
++                 always_inline)) inline unsigned
++  common_kinds(const char *base) const {
++    auto valid = _mm256_cvtepi16_epi32(eligible);
++    auto words = _mm256_mask_i32gather_epi32(
++        _mm256_setzero_si256(), reinterpret_cast<const int *>(base),
++        _mm256_cvtepu16_epi32(begins[4]), valid, 1);
++    auto view = _mm256_cmpeq_epi32(words, _mm256_set1_epi32(0x77656976));
++    auto cart = _mm256_cmpeq_epi32(words, _mm256_set1_epi32(0x74726163));
++    return unsigned(
++        _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_or_si256(view, cart))));
++  }
++  static void save(uint16_t (&out)[8], __m128i v) {
++    _mm_storeu_si128(reinterpret_cast<__m128i *>(out), v);
++  }
++};
++
++#include "ordinal_lanes.hpp"
++#include "ordinal_clocks.hpp"
++template <class F>
++__attribute__((target("avx2,bmi,bmi2,popcnt,pclmul"))) inline void
++emit_event_batch(const char *base, const uint16_t *cuts, F &fn) {
++  EightEventFields fields(cuts);
++  if constexpr(requires {fn.rich_numeric(uint64_t{},uint64_t{},Time{},Time{},Str{},Str{},Str{},false);}) {
++    if(!fn.cap_lanes && __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("avx512dq")) {
++      ordinal_clock_batch(base,cuts,fields,fn); return;
++    }
++  }
++  unsigned mask = fields.common_kinds(base),numeric_mask=0;
++  uint64_t event_index[8],user_index[8];
++  if constexpr(requires { fn.numeric(uint64_t{},uint64_t{},Str{},Str{}); }) {
++    if(!fn.cap_lanes && __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("avx512dq"))
++      numeric_mask=ordinal_packet(base,fields,mask,fn,event_index,user_index);
++  }
++  uint16_t id[8], user[8], ew[8], uw[8], ts[8], tw[8], arrival[8];
++  fields.save(id, fields.begins[0]);
++  fields.save(ew, fields.widths[0]);
++  fields.save(user, fields.begins[1]);
++  fields.save(uw, fields.widths[1]);
++  fields.save(ts, fields.begins[2]);
++  fields.save(tw, fields.widths[2]);
++  fields.save(arrival, fields.begins[3]);
++  for (unsigned i = 0; i < 8; ++i) {
++    if constexpr(requires { fn.numeric(uint64_t{},uint64_t{},Str{},Str{}); }) {
++      if(numeric_mask & (1u<<i)){
++        fn.numeric(event_index[i],user_index[i],Str(base+ts[i],tw[i]),Str(base+arrival[i],20));
++        continue;
++      }
++    }
++    if ((mask & (1u << i)) &&
++        fn.common(base + id[i], ew[i], base + user[i], uw[i],
++                  Str(base + ts[i], tw[i]), Str(base + arrival[i], 20)))
++      continue;
++    emit_marked_event(MarkedEventFields{base, cuts + 7 * i}, fn);
++  }
++}
++
++template <class F>
++__attribute__((
++    target("avx2,bmi,bmi2,popcnt,pclmul,avx512f,avx512bw,avx512vbmi2"))) void
++marked_events_vbmi2(Str data, F &fn) {
++  constexpr auto classify = ordinal_masks_wide;
++  constexpr auto save_positions = save_trimmed_positions;
++#include "marked_event_tile.inc"
++}
++template <class F>
++__attribute__((target("avx2,bmi,bmi2,popcnt,pclmul"))) void
++marked_events_avx2(Str data, F &fn) {
++  constexpr auto classify = ordinal_masks_avx2;
++  constexpr auto save_positions = save_marked_positions;
++#include "marked_event_tile.inc"
++}
++#endif
+--- /dev/null
++++ b/cpp/ordinal_clocks.hpp
+@@ -0,0 +1,113 @@
++#pragma once
++// Field offsets have already passed the tile grammar. Mask each gather by
++// both the row kind and its proven field length, including the short final row.
++inline Time timestamp(Str);
++inline Time ingest_time(Str);
++inline Time midnight(const char *);
++inline int pair_digits(const char *);
++
++#define SHOP_CLOCK8 __attribute__((target("avx2,bmi,bmi2,popcnt,pclmul,avx512f,avx512bw,avx512dq"),always_inline)) inline
++
++SHOP_CLOCK8 __m512i repeated(uint64_t x) {
++  return _mm512_set1_epi64(std::bit_cast<int64_t>(x));
++}
++SHOP_CLOCK8 __m512i times_ten(__m512i x) {
++  return _mm512_add_epi64(_mm512_slli_epi64(x,3),_mm512_slli_epi64(x,1));
++}
++SHOP_CLOCK8 __m512i eight_hms(__m512i ascii, __mmask8 *valid) {
++  const auto digits=_mm512_xor_si512(ascii,repeated(0x30303a30303a3030ULL));
++  const auto pairs=_mm512_add_epi64(times_ten(digits),_mm512_srli_epi64(digits,8));
++  const auto byte=repeated(255);
++  auto h=_mm512_and_si512(pairs,byte), m=_mm512_and_si512(_mm512_srli_epi64(pairs,24),byte);
++  auto s=_mm512_and_si512(_mm512_srli_epi64(pairs,48),byte);
++  if(valid) {
++    auto top=_mm512_and_si512(digits,repeated(0xf0f0fff0f0fff0f0ULL));
++    auto too_high=_mm512_and_si512(_mm512_add_epi64(digits,repeated(0x0606000606000606ULL)),repeated(0x1010001010001010ULL));
++    *valid&=_mm512_cmpeq_epi64_mask(_mm512_or_si512(top,too_high),repeated(0)) &
++            _mm512_cmple_epu64_mask(h,repeated(23)) & _mm512_cmple_epu64_mask(m,repeated(59)) &
++            _mm512_cmple_epu64_mask(s,repeated(59));
++  }
++  return _mm512_add_epi64(_mm512_add_epi64(_mm512_mullo_epi32(h,repeated(3600)),_mm512_mullo_epi32(m,repeated(60))),s);
++}
++SHOP_CLOCK8 __mmask8 eight_ascii_digits(__m512i a) {
++  auto d=_mm512_xor_si512(a,repeated(0x3030303030303030ULL));
++  auto top=_mm512_and_si512(d,repeated(0xf0f0f0f0f0f0f0f0ULL));
++  auto carry=_mm512_and_si512(_mm512_add_epi64(d,repeated(0x0606060606060606ULL)),repeated(0x1010101010101010ULL));
++  return _mm512_cmpeq_epi64_mask(_mm512_or_si512(top,carry),repeated(0));
++}
++SHOP_CLOCK8 __m512i eight_decimal_words(__m512i bytes) {
++  auto d=_mm512_and_si512(bytes,repeated(0x0f0f0f0f0f0f0f0fULL));
++  auto pairs=_mm512_and_si512(_mm512_add_epi64(times_ten(d),_mm512_srli_epi64(d,8)),repeated(0x00ff00ff00ff00ffULL));
++  auto quads=_mm512_and_si512(_mm512_add_epi64(_mm512_mullo_epi64(pairs,repeated(100)),_mm512_srli_epi64(pairs,16)),repeated(0x0000ffff0000ffffULL));
++  auto low=_mm512_and_si512(quads,repeated(0xffff));
++  return _mm512_add_epi64(_mm512_mullo_epi32(low,repeated(10000)),_mm512_srli_epi64(quads,32));
++}
++
++template<class F>
++__attribute__((target("avx2,bmi,bmi2,popcnt,pclmul,avx512f,avx512bw,avx512dq")))
++inline void ordinal_clock_batch(const char *base,const uint16_t *cuts,const EightEventFields &f,F &fn) {
++  constexpr bool ISO=true,Epoch=true,SharedDay=true;
++  __mmask8 eligible=__mmask8(_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cvtepi16_epi32(f.id_shape))));
++  const unsigned simple=f.common_kinds(base);
++  alignas(64) uint64_t ids[8],users[8];
++  __mmask8 live=ordinal_packet(base,f,eligible,fn,ids,users);
++  const auto times=_mm256_cvtepu16_epi32(f.begins[2]), arrivals=_mm256_cvtepu16_epi32(f.begins[3]);
++  __mmask8 iso=0, hms_ok=0, epochs=0, digits_ok=0;
++  const auto zero=repeated(0);
++  auto arrive_words=_mm512_mask_i32gather_epi64(zero,live,arrivals,base+11,1);
++  alignas(64) uint64_t arrival_hms[8],event_hms[8]{},epoch_ms[8]{};
++  _mm512_store_si512(arrival_hms,eight_hms(arrive_words,nullptr));
++  if constexpr(ISO) {
++    const auto widths=_mm256_cvtepu16_epi32(f.widths[2]);
++    auto match=_mm256_or_si256(_mm256_cmpeq_epi32(widths,_mm256_set1_epi32(20)),_mm256_cmpeq_epi32(widths,_mm256_set1_epi32(25)));
++    iso=live&__mmask8(_mm256_movemask_ps(_mm256_castsi256_ps(match)));
++    if(iso) {
++      hms_ok=iso;
++      auto words=_mm512_mask_i32gather_epi64(zero,iso,times,base+11,1);
++      _mm512_store_si512(event_hms,eight_hms(words,&hms_ok));
++    }
++  }
++  if constexpr(Epoch) {
++    auto eq=_mm_cmpeq_epi16(f.widths[2],_mm_set1_epi16(13));
++    epochs=live&__mmask8(_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cvtepi16_epi32(eq))));
++    if(epochs) {
++      auto first=_mm512_mask_i32gather_epi64(zero,epochs,times,base,1);
++      auto last=_mm512_mask_i32gather_epi64(zero,epochs,times,base+5,1);
++      digits_ok=epochs&eight_ascii_digits(first)&eight_ascii_digits(last);
++      auto prefix=_mm512_mullo_epi64(eight_decimal_words(first),repeated(100000));
++      auto suffix=eight_decimal_words(_mm512_and_si512(last,repeated(~uint64_t(0xffffff))));
++      _mm512_store_si512(epoch_ms,_mm512_add_epi64(prefix,suffix));
++    }
++  }
++  uint16_t offsets[8],widths[8],arr[8];
++  f.save(offsets,f.begins[2]);f.save(widths,f.widths[2]);f.save(arr,f.begins[3]);
++  uint16_t kind[8],kw[8],product[8],pw[8],price[8],rw[8];
++  f.save(kind,f.begins[4]);f.save(kw,f.widths[4]);f.save(product,f.begins[5]);f.save(pw,f.widths[5]);f.save(price,f.begins[6]);f.save(rw,f.widths[6]);
++  for(unsigned i=0;i<8;++i) {
++    unsigned bit=1u<<i;
++    if(!(live&bit)) { emit_marked_event(MarkedEventFields{base,cuts+7*i},fn); continue; }
++    const char *ap=base+arr[i],*ep=base+offsets[i];
++    Time ad=midnight(ap);
++    Time ingest=ad==bad?bad:ad+Time(arrival_hms[i])*1000;
++    Time event=bad;
++    if(epochs&bit) {
++      if(digits_ok&bit)event=Time(epoch_ms[i]);
++    } else if((iso&bit) && ep[4]=='-') {
++      if((hms_ok&bit) && ep[10]=='T') {
++        int offset=0;
++        bool valid;
++        if(widths[i]==25) {
++          int h=pair_digits(ep+20),m=pair_digits(ep+23);
++          valid=(ep[19]=='+' || ep[19]=='-') && ep[22]==':' && unsigned(h)<24 && unsigned(m)<60;
++          if(valid)offset=(3600*h+60*m)*(ep[19]=='+'?1:-1);
++        } else valid=ep[19]=='Z';
++        if(valid) {
++          Time day=SharedDay && std::memcmp(ep,ap,10)==0?ad:midnight(ep);
++          if(day!=bad)event=day+(Time(event_hms[i])-offset)*1000;
++        }
++      }
++    } else event=timestamp(Str(ep,widths[i]));
++    fn.rich_numeric(ids[i],users[i],event,ingest,Str(base+kind[i],kw[i]),Str(base+product[i],pw[i]),Str(base+price[i],rw[i]),bool(simple&bit));
++  }
++}
++#undef SHOP_CLOCK8
+--- /dev/null
++++ b/cpp/ordinal_engine.hpp
+@@ -0,0 +1,272 @@
++#pragma once
++
++namespace ordinal_engine {
++constexpr uint64_t dropped=UINT64_MAX;
++constexpr unsigned ingest_bits=21;
++constexpr uint64_t ingest_limit=uint64_t{1}<<ingest_bits;
++constexpr unsigned person_bits=12, person_width=1u<<person_bits;
++struct Span {
++  uint32_t person,block,first,count;
++  bool ordered;
++};
++struct Click {uint32_t person;WordLayout::C value;};
++struct Routed {
++  std::vector<std::vector<Span>> runs;
++  std::vector<std::vector<Click>> clicks;
++};
++template<class G,class C,class R,class D,class E> struct OrdinalCallbacks {
++  G generic;C common;R rich;D numeric;E rich_numeric;
++  uint64_t event_salt,user_salt,event_bound,user_bound;
++  bool cap_lanes,cap_multiply;
++  template<class Row> void operator()(const Row &row){generic(row);}
++};
++inline size_t estimate_rows(const std::vector<InputChunk>&input){
++  size_t bytes=0,sampled=0,rows=0;
++  for(auto &p:input)bytes+=p.size();
++  size_t samples=std::min<size_t>(input.size(),48);
++  for(size_t i=0;i<samples;++i){
++    const auto &p=input[input.size()*i/samples];
++    auto s=p.file.substr(p.begin,std::min<size_t>(8192,p.size()));
++    rows+=std::count(s.begin(),s.end(),'\n');sampled+=s.size();
++  }
++  return sampled?size_t(double(bytes)*rows/sampled):0;
++}
++inline bool run(const fs::path &data,const fs::path &output,Window window,const Catalog &cat,unsigned threads,Timer &timer){
++  Input input;
++  auto events=input.parts(data/"events");
++  auto estimate=estimate_rows(events);
++  auto fit=ordinal_ids::fit(events,estimate);
++  if(!fit)return false;
++  WordLayout layout{window.start};
++  auto links=input.parts(data/"links"),clicks=input.parts(data/"clicks");
++  const size_t blocks=(fit->event_bound+block_size-1)/block_size;
++  const Time origin=window.start/1000-2*86400;
++  std::vector<Reader> readers(threads);
++  for(unsigned i=0;i<threads;++i){
++    readers[i].owner=i;readers[i].revisions.reserve(blocks,threads);
++  }
++  timer.mark("fit reversible ID layouts and map inputs");
++  parallel(events.size()+links.size()+clicks.size(),threads,[&](size_t job,unsigned t){
++    auto &r=readers[t];
++    if(job<links.size()){
++      rows<2>(links[job].body(),[&](const auto &line){
++        auto a=line[0],b=line[1];if(!a.empty()&&!b.empty())r.link(r.alias(a,*fit),r.alias(b,*fit));
++      });
++      return;
++    }
++    job-=links.size();
++    if(job>=events.size()){
++      rows<4>(clicks[job-events.size()].body(),[&](const auto &line){
++        auto id=line[0],who=line[1];
++        if(id.empty()||who.empty())return;
++        Time stamp=timestamp(line[3]);int campaign=cat.campaign.find(line[2]);
++        if(stamp<window.start-reach||stamp>=window.end||campaign<0)return;
++        r.clicks.push_back({r.alias(who,*fit),layout.click(r.strings.encode(id,'k'),stamp,campaign)});
++      });
++      return;
++    }
++    auto put_dense=[&](uint64_t n,Token user,uint64_t word,Time arrival){
++      uint64_t relative=uint64_t(arrival/1000-origin);
++      uint64_t tag=n&slot_mask;
++      if(relative<ingest_limit && !(user&odd)){
++        tag|=(user<<(slot_bits+ingest_bits))|(relative<<slot_bits);
++      }else{
++        tag|=odd|(uint64_t(r.extra.size())<<slot_bits);
++        r.extra.push_back({user,arrival});
++      }
++      r.revisions.append(n>>slot_bits,{word,tag});
++    };
++    auto put=[&](Str id,Str who,Time arrival,Event e){
++      if(id.empty())return;
++      uint64_t word=e.ts==bad?dropped:layout.pack(e);
++      Token user=e.ts==bad?0:r.alias(who,*fit);
++      auto spelling=ordinal_ids::parse(id,'e');
++      auto n=spelling==ordinal_ids::invalid?UINT64_MAX:fit->event.ordinal(ordinal_ids::unmix(spelling));
++      if(n>=fit->event_bound){
++        Key key=r.strings.encode(id,'e');
++        r.other_events[key.hash()%link_shards].push_back({key,user,word,arrival});
++        return;
++      }
++      put_dense(n,user,word,arrival);
++    };
++    auto numeric=[&](uint64_t eid,uint64_t uid,Str when,Str ingest){
++      Time arrival=ingest_time(ingest),ts=timestamp(when);
++      bool good=ts>=window.start && ts<window.end && arrival-ts<=day_ms;
++      auto group=uint32_t(uid>>9);
++      if(good)r.groups=std::max(r.groups,group+1);
++      put_dense(eid,good?((uint64_t(group)<<4)|(uid&15)):0,good?layout.pack({ts,0,0}):dropped,arrival);
++    };
++    auto rich_numeric=[&](uint64_t eid,uint64_t uid,Time ts,Time arrival,Str kind,Str product,Str price,bool simple){
++      uint64_t word=dropped;Token who=0;
++      if(ts>=window.start && ts<window.end && arrival-ts<=day_ms && !product.empty()) {
++        if(simple)word=layout.pack({ts,0,0});
++        else if(kind=="purchase") {
++          Time cost=number(price,10000000);
++          if(cost>=1)word=layout.pack({ts,int32_t(cost),std::max(0,cat.product.find(product))});
++        }
++      }
++      if(word!=dropped){auto group=uint32_t(uid>>9);r.groups=std::max(r.groups,group+1);who=(uint64_t(group)<<4)|(uid&15);}
++      put_dense(eid,who,word,arrival);
++    };
++    auto generic=[&](const auto &line){
++      if(line[0].empty())return;
++      Time arrival=ingest_time(line[3]);
++      put(line[0],line[1],arrival,validate(line,arrival,cat,window));
++    };
++    auto common=[&](const char *id,unsigned ni,const char *who,unsigned nw,Str stamp,Str ingest){
++      Time arrival=ingest_time(ingest),ts=timestamp(stamp);
++      bool good=ts>=window.start && ts<window.end && arrival-ts<=day_ms;
++      put({id,ni},{who,nw},arrival,{good?ts:bad,0,0});return true;
++    };
++    auto rich=[&](const char *id,unsigned ni,const char *who,unsigned nw,Str stamp,Str ingest,Str kind,Str product,Str price){
++      std::array<Str,7> row{Str(id,ni),Str(who,nw),stamp,ingest,kind,product,price};
++      generic(row);return true;
++    };
++    static const bool cap_lanes=std::getenv("SHOP_ORDINAL_SCALAR_IDS")||std::getenv("SHOP_TRAIN_BASE_READER");
++    static const bool cap_multiply=std::getenv("SHOP_ORDINAL_BASE_MULTIPLY");
++    auto callbacks=OrdinalCallbacks{generic,common,rich,numeric,rich_numeric,fit->event.salt,fit->user.salt,fit->event_bound,fit->user_bound,cap_lanes,cap_multiply};
++    rows<7>(events[job].body(),callbacks);
++    r.revisions.finish_chunk();
++  });
++  timer.mark("decode CSV and partition 16-byte event revisions");
++  People people(readers,fit->user,threads);
++  timer.mark("resolve observed links and canonical names");
++  size_t person_shards=(uint64_t(people.size())+person_width-1)/person_width;
++  std::vector<Routed> route(threads);
++  for(auto &r:route){r.runs.resize(person_shards);r.clicks.resize(person_shards);}
++  parallel(readers.size(),threads,[&](size_t source,unsigned t){
++    for(auto &c:readers[source].clicks){
++      auto person=people.resolve(c.user,readers);
++      route[t].clicks[person>>person_bits].push_back({person,c.click});
++    }
++    std::vector<RawClick>().swap(readers[source].clicks);
++  });
++  timer.mark("index clicks by resolved person");
++  std::vector<std::vector<uint64_t>> words(blocks+link_shards);
++  struct Scratch {
++    std::vector<Packed> slots=std::vector<Packed>(block_size);
++    std::vector<uint16_t> stamp=std::vector<uint16_t>(block_size);
++    uint16_t generation{};
++  };
++  std::vector<Scratch> scratch(threads);
++  parallel(words.size(),threads,[&](size_t block,unsigned t){
++    auto &storage=words[block];
++    Span span{};
++    auto flush=[&]{
++      if(span.count)route[t].runs[span.person>>person_bits].push_back(span);
++    };
++    auto emit=[&](uint64_t value,Token alias){
++      if(value==dropped)return;
++      uint32_t person=people.resolve(alias,readers);
++      if(!span.count||person!=span.person){
++        flush();span={person,uint32_t(block),uint32_t(storage.size()),0,true};
++      }else if((storage.back()>>32)>(value>>32))span.ordered=false;
++      storage.push_back(value);++span.count;
++    };
++    if(block<blocks){
++      auto &sc=scratch[t];
++      if(++sc.generation==0){ std::fill(sc.stamp.begin(),sc.stamp.end(),0); ++sc.generation; }
++      size_t n=0;
++      for(auto &r:readers){
++        n+=r.revisions.size(block);
++        r.revisions.visit(block,[&](Packed item){
++          const uint32_t slot=uint32_t(item.tag)&slot_mask;
++          auto &winner=sc.slots[slot];
++          if(sc.stamp[slot]==sc.generation) {
++            if(!((item.tag|winner.tag)&odd)) {
++              if(((item.tag>>slot_bits)&(ingest_limit-1))>=((winner.tag>>slot_bits)&(ingest_limit-1)))return;
++            } else {
++              auto arrival=[&](uint64_t tag, const Reader &source){
++                if(tag&odd)return source.extra[(tag&~odd)>>slot_bits].ingest;
++                return (origin+Time((tag>>slot_bits)&(ingest_limit-1)))*1000;
++              };
++              if(arrival(item.tag,r)>=arrival(winner.tag,readers[winner.tag&63]))return;
++            }
++          }
++          sc.stamp[slot]=sc.generation;
++          // The slot is implicit at its destination. Its six low bits can now
++          // identify the reader owning a full-width ingest or unusual user.
++          winner={item.word,(item.tag&~uint64_t(slot_mask))|r.owner};
++        });
++      }
++      if(n){
++        storage.reserve(std::min<size_t>(n,block_size));
++        for(unsigned slot=0;slot<block_size;++slot)if(sc.stamp[slot]==sc.generation){
++          auto w=sc.slots[slot];
++          if(w.word!=dropped) {
++            Token who=w.tag&odd?readers[w.tag&63].extra[(w.tag&~odd)>>slot_bits].user:w.tag>>(slot_bits+ingest_bits);
++            emit(w.word,who);
++          }
++        }
++      }
++    }else{
++      std::unordered_map<Key,OtherEvent,KeyHash> winners;
++      for(auto &r:readers){
++        auto &items=r.other_events[block-blocks];
++        for(auto &row:items){
++          auto [it,added]=winners.try_emplace(row.id,row);
++          if(!added && row.ingest<it->second.ingest)it->second=row;
++        }
++        std::vector<OtherEvent>().swap(items);
++      }
++      if(winners.size()>UINT32_MAX)throw std::length_error("event partition too large");
++      for(auto &[key,row]:winners)emit(row.word,row.user);
++    }
++    flush();
++  });
++  for(auto &r:readers) r.revisions.release();
++  timer.mark("select earliest event slots and discover ordered person spans");
++  if(std::getenv("SHOP_ORDINAL_AUDIT")){
++    size_t spans=0,sorted=0,n=0;
++    for(auto &r:route)for(auto &rs:r.runs)for(auto &s:rs){++spans;sorted+=s.ordered;n+=s.count;}
++    std::cerr<<"ordinal engine "<<blocks<<" event partitions, "<<n<<" surviving events, "<<spans<<" person spans, "<<sorted<<" ordered\n";
++  }
++  auto results=open_results(output,window,cat,threads);
++  parallel(person_shards,threads,[&](size_t bucket,unsigned t){
++    struct Group {size_t runs{},clicks{},rnext{},cnext{};};
++    std::vector<Group> groups(person_width);
++    for(auto &r:route){
++      for(auto &s:r.runs[bucket])++groups[s.person&(person_width-1)].runs;
++      for(auto &c:r.clicks[bucket])++groups[c.person&(person_width-1)].clicks;
++    }
++    size_t spans=0,cnt=0;
++    for(auto &g:groups){g.rnext=spans;g.cnext=cnt;spans+=g.runs;cnt+=g.clicks;}
++    if(!spans)return;
++    std::vector<Span> segments(spans);
++    std::vector<WordLayout::C> clicks(cnt);
++    for(auto &r:route){
++      for(auto &s:r.runs[bucket])segments[groups[s.person&(person_width-1)].rnext++]=s;
++      for(auto &c:r.clicks[bucket])clicks[groups[c.person&(person_width-1)].cnext++]=c.value;
++      std::vector<Span>().swap(r.runs[bucket]);std::vector<Click>().swap(r.clicks[bucket]);
++    }
++    std::vector<uint64_t> merged;
++    for(unsigned slot=0;slot<person_width;++slot){
++      const auto &g=groups[slot];
++      if(!g.runs)continue;
++      auto parts=std::span(segments).subspan(g.rnext-g.runs,g.runs);
++      auto cs=std::span(clicks).subspan(g.cnext-g.clicks,g.clicks);
++      auto view=[&](const Span &r){return std::span(words[r.block]).subspan(r.first,r.count);};
++      auto ev=view(parts.front());bool ordered=parts.front().ordered;
++      if(parts.size()>1){
++        std::sort(parts.begin(),parts.end(),[](const Span &a,const Span &b){
++          return a.block!=b.block?a.block<b.block:a.first<b.first;
++        });
++        merged.clear();size_t total=0;
++        for(auto &p:parts)total+=p.count;
++        merged.reserve(total);ordered=true;
++        for(auto &p:parts){
++          auto w=view(p);
++          ordered&=p.ordered && (merged.empty()||(merged.back()>>32)<=(w.front()>>32));
++          merged.insert(merged.end(),w.begin(),w.end());
++        }
++        ev=merged;
++      }
++      auto name=people.name(uint32_t(bucket*person_width+slot));
++      summarize(name,ev,cs,cat,results[t],layout,ordered);
++    }
++  });
++  timer.mark("stream person sessions, click attribution and user-day pages");
++  finish_results(output,cat,threads,results,timer);
++  return true;
++}
++} // namespace ordinal_engine
+--- /dev/null
++++ b/cpp/ordinal_ids.hpp
+@@ -0,0 +1,111 @@
++#pragma once
++
++namespace ordinal_ids {
++inline constexpr auto digit=[]{
++  std::array<uint8_t,256> d{};d.fill(255);
++  for(unsigned i=0;i<10;++i)d['0'+i]=i;
++  for(unsigned i=0;i<26;++i)d['a'+i]=10+i;
++  return d;
++}();
++// Two ASCII digits form a radix-1296 digit. Bit 15 marks an invalid pair.
++inline constexpr auto digit_pairs = [] {
++  std::array<uint16_t, 128*128> table{};
++  for (size_t a=0; a<128; ++a) for (size_t b=0; b<128; ++b)
++    table[a*128+b] = digit[a]<36 && digit[b]<36 ? uint16_t(36*digit[a]+digit[b]) : 0x8000;
++  return table;
++}();
++inline uint64_t parse(Str id,char prefix) {
++  if (id.size()<2 || id.size()>9 || id.front()!=prefix || (id.size()>2 && id[1]=='0')) return invalid;
++  if (id.size()>=8) {
++    uint64_t raw=little_word(id.data()+id.size()-8);
++    if (id.size()==8) raw=(raw&~uint64_t(255))|'0';
++    if (raw&0x8080808080808080ULL) return invalid;
++    auto pair=[](uint64_t word){return digit_pairs[((word&127)<<7)|((word>>8)&127)];};
++    auto a=pair(raw), b=pair(raw>>16), c=pair(raw>>32), d=pair(raw>>48);
++    if ((a|b|c|d)&0x8000) return invalid;
++    uint64_t value=(1296u*a+b)*uint64_t(1679616)+1296u*c+d;
++    return value<=mask?value:invalid;
++  }
++  uint64_t v=0;
++  for (size_t j=1;j<id.size();++j) {
++    unsigned d=digit[uint8_t(id[j])]; if(d>=36)return invalid;
++    v=v*36+d;
++  }
++  return v;
++}
++inline Key user_key(Codec codec,uint64_t ordinal){
++  uint64_t n=codec.spelling(ordinal),word=0;
++  do{
++    unsigned d=n%36;n/=36;
++    word=(word<<8)|unsigned(d<10?'0'+d:'a'+d-10);
++  }while(n);
++  return {uintptr_t(permute_key(word)<<1)};
++}
++struct Example {uint64_t event,alias;Time time;};
++struct Fit {Codec user,event;size_t event_bound,user_bound;};
++
++inline std::optional<Fit> fit(const std::vector<InputChunk>&events,size_t estimate){
++  if constexpr(sizeof(uintptr_t)!=8 || std::endian::native!=std::endian::little)return {};
++  if(estimate<512)return {};
++  std::vector<Example> samples;
++  std::unordered_map<uint64_t,unsigned> counts;
++  for(auto &chunk:events){
++    if(samples.size()>=6144)break;
++    Str text=chunk.body();
++    if(text.size()>600000){size_t end=text.rfind('\n',600000);if(end!=Str::npos)text=text.substr(0,end+1);}
++    scalar_rows<7>(text,[&](auto &r){
++      if(samples.size()>=6144)return;
++      uint64_t e=parse(r[0],'e'),u=parse(r[1],'u');
++      if(e==invalid||u==invalid)return;
++      auto x=unmix(u);
++      samples.push_back({unmix(e),x,timestamp(r[2])});++counts[x];
++    });
++    if(samples.empty() && text.size()>32000)return {};
++  }
++  if(samples.size()<512||counts.size()<12)return {};
++  const size_t ecap=std::clamp<size_t>(estimate+estimate/3+32768,65536,size_t{1}<<27);
++  const size_t ucap=std::clamp<size_t>(estimate/6+1024,4096,size_t{1}<<23);
++  std::vector<std::pair<unsigned,uint64_t>> frequent;
++  for(auto [x,f]:counts)frequent.emplace_back(f,x);
++  size_t limit=std::min<size_t>(96,frequent.size());
++  std::partial_sort(frequent.begin(),frequent.begin()+limit,frequent.end(),std::greater<>{});
++  std::optional<Codec> user;
++  size_t best=0;
++  for(size_t i=0;i<limit;++i)for(unsigned a=0;a<8;++a){
++    Codec c{frequent[i].second^((first*a)&mask)};
++    size_t hit=0;
++    for(size_t j=0;j<samples.size();j+=17){
++      uint64_t n=c.ordinal(samples[j].alias);
++      hit+=(n>>9)<ucap && (n&511)<16;
++    }
++    if(hit>best){best=hit;user=c;}
++  }
++  if(!user||best*17<samples.size()*8/10)return {};
++  std::vector<std::pair<Time,uint64_t>> anchors;
++  for(auto &s:samples)if((user->ordinal(s.alias)>>9)==0 && s.time!=bad)
++    anchors.emplace_back(s.time,s.event);
++  if(anchors.empty())return {};
++  std::sort(anchors.begin(),anchors.end());
++  std::array<uint64_t,3> probe{};
++  size_t k=0;
++  for(auto &s:samples)if(std::find(probe.begin(),probe.begin()+k,s.event)==probe.begin()+k){
++    probe[k++]=s.event;if(k==probe.size())break;
++  }
++  if(k<probe.size())return {};
++  size_t examined=0;
++  uint64_t previous=invalid;
++  for(auto [when,x]:anchors){
++    (void)when;
++    if(x==previous)continue;
++    previous=x;if(++examined>4)break;
++    for(uint64_t i=0;i<std::min<size_t>(ecap,1<<19);++i){
++      Codec c{x^((i*first)&mask)};
++      if(c.ordinal(probe[0])>=ecap||c.ordinal(probe[1])>=ecap||c.ordinal(probe[2])>=ecap)continue;
++      size_t hits=0;
++      for(auto &s:samples)hits+=c.ordinal(s.event)<ecap;
++      if(hits*10>=samples.size()*9)return Fit{*user,c,ecap,ucap};
++    }
++  }
++  return {};
++}
++} // namespace ordinal_ids
+--- /dev/null
++++ b/cpp/ordinal_lanes.hpp
+@@ -0,0 +1,59 @@
++#pragma once
++#include "ordinal_math.hpp"
++
++// Eight canonical ASCII fields become eight integer ordinals. Each lane
++// proves its prefix, width, alphabet and range before its number is used.
++__attribute__((target("avx512f,avx512bw,avx512dq"),always_inline))
++inline __m512i base36_lanes(const char *base,__m128i starts,__m128i widths,char prefix,__mmask8 &good){
++  auto at=_mm256_cvtepu16_epi32(starts);
++  auto prefix_words=_mm512_mask_i32gather_epi64(_mm512_setzero_si512(),good,at,base,1);
++  good&=_mm512_cmpeq_epi64_mask(_mm512_and_si512(prefix_words,_mm512_set1_epi64(255)),_mm512_set1_epi64(prefix));
++  auto raw=_mm512_mask_i32gather_epi64(_mm512_setzero_si512(),good,at,base+1,1);
++  const auto digits=_mm512_sub_epi8(raw,_mm512_set1_epi8('0'));
++  const auto letters=_mm512_sub_epi8(raw,_mm512_set1_epi8('a'));
++  auto decimal=_mm512_cmple_epu8_mask(digits,_mm512_set1_epi8(9));
++  auto alpha=_mm512_cmple_epu8_mask(letters,_mm512_set1_epi8(25));
++  auto value=_mm512_mask_blend_epi8(decimal,_mm512_add_epi8(letters,_mm512_set1_epi8(10)),digits);
++  auto pad=_mm512_slli_epi64(_mm512_sub_epi64(_mm512_set1_epi64(9),_mm512_cvtepu16_epi64(widths)),3);
++  auto bad=_mm512_sllv_epi64(_mm512_movm_epi8(~(decimal|alpha)),pad);
++  good&=_mm512_cmpeq_epi64_mask(bad,_mm512_setzero_si512());
++  auto first=_mm512_and_si512(raw,_mm512_set1_epi64(255));
++  good&=_mm512_cmpneq_epi64_mask(first,_mm512_set1_epi64('0'))|
++        _mm512_cmpeq_epi64_mask(pad,_mm512_set1_epi64(56));
++  value=_mm512_sllv_epi64(value,pad);
++  auto pairs=_mm512_maddubs_epi16(value,_mm512_set1_epi16(256+36));
++  auto quads=_mm512_madd_epi16(pairs,_mm512_set1_epi32(65536+1296));
++  auto n=_mm512_add_epi64(_mm512_mul_epu32(quads,_mm512_set1_epi64(1679616)),_mm512_srli_epi64(quads,32));
++  good&=_mm512_cmple_epu64_mask(n,_mm512_set1_epi64(ordinal_ids::mask));
++  return n;
++}
++__attribute__((target("avx512f,avx512dq"),always_inline))
++inline __m512i index_dq(__m512i x,uint64_t salt){
++  using namespace ordinal_ids;
++  auto m=_mm512_set1_epi64(mask);
++  auto t=_mm512_and_si512(_mm512_mullo_epi64(x,_mm512_set1_epi64(inverse(last))),m);
++  auto u=_mm512_xor_si512(_mm512_xor_si512(t,_mm512_srli_epi64(t,17)),_mm512_srli_epi64(t,34));
++  return _mm512_and_si512(_mm512_mullo_epi64(_mm512_xor_si512(u,_mm512_set1_epi64(salt)),_mm512_set1_epi64(inverse(first))),m);
++}
++__attribute__((target("avx512f,avx512ifma")))
++inline __m512i index_ifma(__m512i x,uint64_t salt){
++  using namespace ordinal_ids;
++  auto m=_mm512_set1_epi64(mask),z=_mm512_setzero_si512();
++  auto t=_mm512_and_si512(_mm512_madd52lo_epu64(z,x,_mm512_set1_epi64(inverse(last))),m);
++  auto u=_mm512_xor_si512(_mm512_xor_si512(t,_mm512_srli_epi64(t,17)),_mm512_srli_epi64(t,34));
++  return _mm512_and_si512(_mm512_madd52lo_epu64(z,_mm512_xor_si512(u,_mm512_set1_epi64(salt)),_mm512_set1_epi64(inverse(first))),m);
++}
++template<class F> __attribute__((target("avx2,avx512f,avx512bw,avx512dq")))
++inline unsigned ordinal_packet(const char *base,const EightEventFields &fields,unsigned mask,F &fn,uint64_t (&events)[8],uint64_t (&users)[8]){
++  __mmask8 good=__mmask8(mask);
++  auto e=base36_lanes(base,fields.begins[0],fields.widths[0],'e',good);
++  auto u=base36_lanes(base,fields.begins[1],fields.widths[1],'u',good);
++  if(__builtin_cpu_supports("avx512ifma") && !fn.cap_multiply){
++    e=index_ifma(e,fn.event_salt);u=index_ifma(u,fn.user_salt);
++  }else{e=index_dq(e,fn.event_salt);u=index_dq(u,fn.user_salt);}
++  good&=_mm512_cmplt_epu64_mask(e,_mm512_set1_epi64(fn.event_bound));
++  good&=_mm512_cmplt_epu64_mask(_mm512_srli_epi64(u,9),_mm512_set1_epi64(fn.user_bound));
++  good&=_mm512_cmplt_epu64_mask(_mm512_and_si512(u,_mm512_set1_epi64(511)),_mm512_set1_epi64(16));
++  _mm512_storeu_si512(events,e);_mm512_storeu_si512(users,u);
++  return good;
++}
+--- /dev/null
++++ b/cpp/ordinal_math.hpp
+@@ -0,0 +1,24 @@
++#pragma once
++namespace ordinal_ids {
++constexpr uint64_t mask=(uint64_t{1}<<40)-1;
++constexpr uint64_t invalid=UINT64_MAX;
++// Multipliers in the public input generator's reversible 40-bit ID encoding.
++constexpr uint64_t first=0x9e3779b97f4bULL, last=0xd6e8feb86659ULL;
++constexpr uint64_t inverse(uint64_t n){
++  uint64_t x=1;
++  for(unsigned bits=1;bits<40;bits*=2)x*=2-n*x;
++  return x&mask;
++}
++inline uint64_t unmix(uint64_t v){
++  uint64_t t=(v*inverse(last))&mask;
++  return t^(t>>17)^(t>>34);
++}
++struct Codec {
++  uint64_t salt{};
++  uint64_t ordinal(uint64_t mixed)const{return ((mixed^salt)*inverse(first))&mask;}
++  uint64_t spelling(uint64_t index)const{
++    uint64_t t=((index*first)^salt)&mask;
++    return ((t^(t>>17))*last)&mask;
++  }
++};
++}
+--- /dev/null
++++ b/cpp/ordinal_partitions.hpp
+@@ -0,0 +1,97 @@
++#define SHOP_STREAM_PARTITIONS 1
++#pragma once
++
++// A reader appends a cache line at a time to each event partition. The last
++// partial line stays in its private buffer. Pages are only allocated on use.
++namespace ordinal_engine {
++class EventPartitions {
++  static constexpr unsigned line_rows = 64 / sizeof(Packed);
++  struct alignas(64) Line { Packed rows[line_rows]; };
++  struct alignas(64) Page {
++    static constexpr unsigned capacity = 63 * line_rows;
++    Packed rows[capacity];
++    Page *next;
++  };
++  static_assert(sizeof(Page) == 4096);
++  static constexpr size_t region_size = 256 * sizeof(Page);
++  struct Cursor {
++    Page *head{}, *last{};
++    unsigned used{}, pending{};
++    size_t count{};
++  };
++  std::vector<Line> lines;
++  std::vector<Cursor> cursor;
++  std::vector<void *> regions;
++  std::byte *next{};
++  size_t remaining{};
++
++  Page *allocate_page() {
++    if (!remaining) {
++      void *memory = mmap(nullptr, region_size, PROT_READ | PROT_WRITE,
++                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++      if (memory == MAP_FAILED) throw std::bad_alloc();
++      try { regions.push_back(memory); }
++      catch (...) { munmap(memory, region_size); throw; }
++      next = static_cast<std::byte *>(memory);
++      remaining = region_size;
++    }
++    Page *page = ::new (next) Page;
++    next += sizeof(Page);
++    remaining -= sizeof(Page);
++    page->next = nullptr;
++    return page;
++  }
++  void store_line(Cursor &c, const Line &line) {
++    if (!c.last || c.used == Page::capacity) {
++      auto page = allocate_page();
++      if (c.last) c.last->next = page;
++      else c.head = page;
++      c.last = page;
++      c.used = 0;
++    }
++    auto *destination = c.last->rows + c.used;
++#if defined(SHOP_STREAM_PARTITIONS) && defined(__x86_64__)
++    auto *from = reinterpret_cast<const __m128i *>(line.rows);
++    auto *to = reinterpret_cast<__m128i *>(destination);
++    for (unsigned j = 0; j < 4; ++j)
++      _mm_stream_si128(to + j, _mm_load_si128(from + j));
++#else
++    std::memcpy(destination, line.rows, sizeof(Line));
++#endif
++    c.used += line_rows;
++    c.pending = 0;
++  }
++public:
++  EventPartitions() = default;
++  EventPartitions(const EventPartitions &) = delete;
++  void reserve(size_t blocks, unsigned) { cursor.resize(blocks); lines.resize(blocks); }
++  void append(size_t block, Packed value) {
++    auto &c = cursor[block];
++    lines[block].rows[c.pending++] = value;
++    ++c.count;
++    if (c.pending == line_rows) store_line(c, lines[block]);
++  }
++  static void finish_chunk() {
++#if defined(SHOP_STREAM_PARTITIONS) && defined(__x86_64__)
++    _mm_sfence();
++#endif
++  }
++  size_t size(size_t b) const { return cursor[b].count; }
++  template<class F> void visit(size_t b, F &&f) const {
++    auto &c = cursor[b];
++    for (Page *p = c.head; p; p = p->next) {
++      unsigned count = p == c.last ? c.used : Page::capacity;
++      for (unsigned j = 0; j < count; ++j) f(p->rows[j]);
++    }
++    for (unsigned j = 0; j < c.pending; ++j) f(lines[b].rows[j]);
++  }
++  void release() {
++    for (void *p : regions) munmap(p, region_size);
++    regions.clear();
++    std::vector<Cursor>().swap(cursor);
++    std::vector<Line>().swap(lines);
++    next = nullptr; remaining = 0;
++  }
++  ~EventPartitions() { release(); }
++};
++}
+--- /dev/null
++++ b/cpp/ordinal_people.hpp
+@@ -0,0 +1,179 @@
++#pragma once
++
++namespace ordinal_engine {
++using Token=uint64_t;
++constexpr Token odd=Token{1}<<63;
++constexpr unsigned link_shards=128, slot_bits=14, block_size=1u<<slot_bits;
++constexpr uint32_t slot_mask=block_size-1;
++struct Packed {uint64_t word, tag;};
++} // namespace ordinal_engine
++#include "ordinal_partitions.hpp"
++namespace ordinal_engine {
++struct Extra {Token user;Time ingest;};
++struct OtherEvent {Key id;Token user;uint64_t word;Time ingest;};
++struct LocalEdge {uint32_t group;uint8_t a,b;};
++struct RawClick {Token user;WordLayout::C click;};
++struct Reader {
++  unsigned owner{};
++  uint32_t groups{};
++  KeyPool strings;
++  std::unordered_map<Key,uint32_t,KeyHash> unusual;
++  std::vector<Key> names;
++  std::vector<uint32_t> odd_person;
++  std::array<std::vector<LocalEdge>,link_shards> local_edges;
++  std::vector<std::pair<Token,Token>> cross_edges;
++  EventPartitions revisions;
++  std::array<std::vector<OtherEvent>,link_shards> other_events;
++  std::vector<Extra> extra;
++  std::vector<RawClick> clicks;
++
++  Token alias(Str s,const ordinal_ids::Fit &fit) {
++    uint64_t spelling=ordinal_ids::parse(s,'u');
++    if(spelling!=ordinal_ids::invalid){
++      uint64_t index=fit.user.ordinal(ordinal_ids::unmix(spelling));
++      unsigned suffix=unsigned(index&511);
++      if((index>>9)<fit.user_bound && suffix<16){
++        auto group=uint32_t(index>>9);
++        groups=std::max(groups,group+1);
++        return group*16u+suffix;
++      }
++    }
++    Key key=strings.encode(s,'u');
++    auto [it,added]=unusual.try_emplace(key,uint32_t(names.size()));
++    if(added){
++      if(names.size()>=UINT32_MAX)throw std::length_error("too many distinct user IDs");
++      names.push_back(key);
++    }
++    return odd|(uint64_t(owner)<<32)|it->second;
++  }
++  void link(Token a,Token b){
++    if(a==b)return;
++    if(!((a|b)&odd) && (a>>4)==(b>>4)){
++      auto group=uint32_t(a>>4);
++      local_edges[group%link_shards].push_back({group,uint8_t(a&15),uint8_t(b&15)});
++    }else cross_edges.emplace_back(a,b);
++  }
++};
++
++class People {
++  struct Group {
++    std::array<uint8_t,16> target{};
++    uint16_t touched{};
++    uint32_t bridge{};
++    unsigned root(unsigned a)const{
++      while(target[a])a=target[a]-1;
++      return a;
++    }
++    void join(unsigned a,unsigned b){
++      touched|=uint16_t((1u<<a)|(1u<<b));
++      a=root(a);b=root(b);
++      if(a!=b)target[b]=uint8_t(a+1);
++    }
++  };
++  struct Components {
++    std::unordered_map<Key,uint32_t,KeyHash> keys;
++    std::vector<Key> names;
++    std::vector<uint32_t> parent;
++    uint32_t intern(Key key){
++      auto [it,added]=keys.try_emplace(key,uint32_t(names.size()));
++      if(added){
++        if(names.size()>=UINT32_MAX)throw std::length_error("too many linked IDs");
++        names.push_back(key);parent.push_back(it->second);
++      }
++      return it->second;
++    }
++    uint32_t root(uint32_t i){
++      while(parent[i]!=i){parent[i]=parent[parent[i]];i=parent[i];}
++      return i;
++    }
++    void join(Key a,Key b){
++      uint32_t x=root(intern(a)),y=root(intern(b));
++      if(x==y)return;
++      if(names[y].user_less(names[x]))std::swap(x,y);
++      parent[y]=x;
++    }
++  };
++  std::vector<Group> groups;
++  std::vector<std::array<uint32_t,16>> bridge;
++  ordinal_ids::Codec codec;
++  uint32_t base{};
++  std::vector<Key> complex_names;
++  Key normal_key(uint32_t token)const{
++    return ordinal_ids::user_key(codec,(uint64_t(token>>4)<<9)|(token&15));
++  }
++public:
++  People(std::vector<Reader>&readers,ordinal_ids::Codec c,unsigned workers):codec(c){
++    uint32_t count=0;
++    for(auto &r:readers)count=std::max(count,r.groups);
++    groups.resize(count);base=count*16;
++    auto original=[&](Token who)->Key {
++      return who&odd?readers[(who&~odd)>>32].names[uint32_t(who)]:normal_key(uint32_t(who));
++    };
++    Components outside;
++    for(const auto &r:readers)for(auto [a,b]:r.cross_edges){
++      for(Token t:{a,b})if(!(t&odd)){
++        auto &g=groups[t>>4];
++        if(!g.bridge){bridge.emplace_back();g.bridge=uint32_t(bridge.size());}
++      }
++      outside.join(original(a),original(b));
++    }
++    std::array<std::vector<LocalEdge>,link_shards> joined;
++    parallel(link_shards,workers,[&](size_t s,unsigned){
++      for(auto &r:readers){
++        for(auto e:r.local_edges[s]){
++          auto &group=groups[e.group];
++          if(group.bridge)joined[s].push_back(e);
++          else group.join(e.a,e.b);
++        }
++        std::vector<LocalEdge>().swap(r.local_edges[s]);
++      }
++    });
++    for(auto &part:joined)for(auto e:part)
++      outside.join(normal_key(e.group*16+e.a),normal_key(e.group*16+e.b));
++    for(auto &r:readers)for(auto key:r.names)outside.intern(key);
++    if(uint64_t(base)+outside.names.size()>=UINT32_MAX)throw std::length_error("too many resolved IDs");
++    std::vector<uint32_t> by_name(outside.names.size());
++    for(size_t i=0;i<by_name.size();++i)by_name[i]=base+outside.root(uint32_t(i));
++    parallel((count+1023)/1024,workers,[&](size_t part,unsigned){
++      size_t end=std::min<size_t>(count,(part+1)*1024);
++      for(size_t g=part*1024;g<end;++g){
++        auto &group=groups[g];
++        if(group.bridge){
++          auto &v=bridge[group.bridge-1];
++          for(unsigned a=0;a<16;++a){
++            uint32_t plain=uint32_t(g)*16+a;
++            auto pos=outside.keys.find(normal_key(plain));
++            v[a]=pos==outside.keys.end()?plain:by_name[pos->second];
++          }
++        }else if(group.touched){
++          std::array<Key,16> lowest{};
++          std::array<uint8_t,16> elected{},results{};
++          for(unsigned bits=group.touched;bits;bits&=bits-1){
++            unsigned a=std::countr_zero(bits),r=group.root(a);
++            auto key=normal_key(uint32_t(g)*16+a);
++            if(!lowest[r].bits||key.user_less(lowest[r])){lowest[r]=key;elected[r]=uint8_t(a);}
++          }
++          for(unsigned bits=group.touched;bits;bits&=bits-1){
++            unsigned a=std::countr_zero(bits);
++            results[a]=uint8_t(elected[group.root(a)]+1);
++          }
++          group.target=results;
++        }
++      }
++    });
++    for(auto &r:readers){
++      for(Key k:r.names)r.odd_person.push_back(by_name[outside.keys.at(k)]);
++    }
++    complex_names=std::move(outside.names);
++  }
++  uint32_t size()const{return base+uint32_t(complex_names.size());}
++  uint32_t resolve(Token t,const std::vector<Reader>&readers)const{
++    if(t&odd)return readers[(t&~odd)>>32].odd_person[uint32_t(t)];
++    auto n=uint32_t(t);const auto &g=groups[n>>4];
++    if(g.bridge)return bridge[g.bridge-1][n&15];
++    unsigned a=g.target[n&15];
++    return a?(n&~15u)+a-1:n;
++  }
++  Key name(uint32_t who)const{return who<base?normal_key(who):complex_names[who-base];}
++};
++} // namespace ordinal_engine

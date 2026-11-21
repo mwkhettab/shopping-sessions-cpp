@@ -1,1 +1,1 @@
-base fin-slabkey-pgo shipresident-pgo release2rich-pgo engine-lanes-pgo ord-stream-packed-pgo ord-wide-packed-pgo ord-row-packet-pgo ord-row-clocks-pgo ord-months-pgo ord-row-months-pgo ord-all-input-pgo ord-all-months-pgo ord-all-rows-pgo
+base fin-slabkey-pgo shipresident-pgo release2rich-pgo engine-lanes-pgo ord-wide-packed-pgo ord-direct-clocks-pgo ord-direct-prefetch-pgo ord-claims-wide-pgo ord-claims-click-pgo ord-click-keys-pgo ord-paired-clocks-pgo ord-paired-only-pgo ord-build-v4-pgo ord-build-v4plain-pgo ord-build-modern-pgo
