@@ -23,6 +23,15 @@ for root in map(Path,sys.argv[1:]):
             row=json.loads(line)
             if row['round']>=0:records.setdefault(Path(row['binary']).name,[]).append(row['wall_s'])
         emit('Five paired holdout medians '+profile.parent.name, ', '.join(f'{n} {statistics.median(v):.4f} s' for n,v in records.items()))
+    for profile in root.rglob('holdout.jsonl'):
+        groups={}
+        for line in profile.read_text().splitlines():
+            row=json.loads(line)
+            if row['round'] >= 0:
+                groups.setdefault(Path(row['binary']).name,[]).append(row)
+        emit('All held-out entries '+profile.parent.name, ' / '.join(
+            f"{name} {statistics.median(r['wall_s'] for r in rows):.4f} s at {max(r['peak_mib'] for r in rows):.0f} MiB"
+            for name,rows in groups.items()))
     for report in root.rglob('cpu-samples.txt'):
         rows=[line.strip()[:135] for line in report.read_text(errors='replace').splitlines() if re.match(r'\s*[0-9.]+%',line)]
         if rows:emit('Top CPU symbols '+report.parent.name,' / '.join(rows[:9]))
