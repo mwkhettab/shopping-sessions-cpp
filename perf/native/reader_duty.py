@@ -15,13 +15,12 @@ def add_timing(source):
     ~DutyClock(){if(enabled){worker.nanos[kind]+=time()-initial;++worker.jobs[kind];}}
   };
 ''',1)
-    before='''      [&](size_t job, unsigned t) {
-        if (job < links.size())'''
-    after='''      [&](size_t job, unsigned t) {
-        DutyClock input_work(duty[t],job<links.size()?0:job<links.size()+events.size()?1:2,trace_jobs);
-        if (job < links.size())'''
-    assert before in source
-    source=source.replace(before,after,1)
+    import re
+    pattern=r'(\[&\]\(size_t job, unsigned t\) \{\n)([ ]+)(if \(job < links.size\(\)\))'
+    def duty(match):
+        return match[1]+match[2]+'DutyClock input_work(duty[t],job<links.size()?0:job<links.size()+events.size()?1:2,trace_jobs);\n'+match[2]+match[3]
+    source,count=re.subn(pattern,duty,source,count=1)
+    assert count==1
     anchor='  timer.mark("concurrent input, raw user partition and revision index");'
     assert anchor in source
     return source.replace(anchor,anchor+'''

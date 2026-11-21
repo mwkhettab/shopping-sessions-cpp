@@ -54,6 +54,7 @@ def main():
                     with path.open('rb') as patch:
                         subprocess.run(['patch','-s','-p1'],cwd=src,stdin=patch,check=True)
             if name=='base': run('sha256sum','--check',root/'perf/native/official-099.sha256',cwd=src)
+            if name=='shipresident-pgo':run('sha256sum','--check',root/'perf/native/resident-control.sha256',cwd=src)
             if name=='shipcolumns-pgo':
                 run('sha256sum','--check',root/'perf/native/production-columns.sha256',cwd=src)
             compiler=shutil.which('g++-12') or shutil.which('g++')
@@ -142,6 +143,18 @@ def main():
                     run(compiler,'-std=c++20','-O2','-fsanitize=undefined','-fno-sanitize-recover=all',*opts,'-I',src/'cpp',root/'perf/native'/suite,'-o',unit)
                     run(unit)
             if (src/'cpp/exact_revision_slots.hpp').is_file():run(python,root/'perf/native/packed_id_oracle.py',binary)
+            for header,suite in [('joint_clock.hpp','joint_clock_test.cpp'),('flat_alias_groups.hpp','flat_alias_test.cpp')]:
+                if (src/'cpp'/header).is_file():
+                    run(compiler,'-std=c++20','-O2','-fsanitize=undefined','-fno-sanitize-recover=all','-I',src/'cpp',root/'perf/native'/suite,'-o',unit)
+                    run(unit)
+            if name.startswith(('reskind','resqproof','resordinal')):
+                suite='rich_event_test.cpp' if name.startswith('reskind') else 'compact_prefix_test.cpp'
+                run(compiler,'-std=c++20','-O2','-fsanitize=undefined','-fno-sanitize-recover=all','-I',src/'cpp',root/'perf/native'/suite,'-o',unit)
+                run(unit)
+            if name=='resordinal-pgo' and 'avx2' in flags and 'bmi2' in flags and 'pclmulqdq' in flags:
+                run(compiler,'-std=c++20','-O2','-fsanitize=undefined','-fno-sanitize-recover=all','-I',src/'cpp',root/'perf/native/ordinal16_test.cpp','-o',unit)
+                run(unit)
+            if name=='resdest-pgo' or name.startswith('flatgroup'):run(python,root/'perf/native/dest_oracle.py',binary)
             binaries.append(binary)
         except (subprocess.CalledProcessError,OSError) as exc:
             if name in ('base',release_control): raise
@@ -197,7 +210,7 @@ def main():
                     layout=re.search(r'SHOP_REVISION_LAYOUT (\d+) (\d+)',mixed.stderr)
                     if not layout:raise ValueError('missing storage calibration counters')
                     note('Revision storage '+b.name+' '+scale,f'{layout[1]} row revisions, {layout[2]} column revisions.')
-                elif (area/b.name/'cpp/timeline_reuse.hpp').is_file():
+                elif (area/b.name/'cpp/timeline_reuse.hpp').is_file() and 'SHOP_TIMELINE_REUSE' in (area/b.name/'cpp/main.cpp').read_text():
                     reuse=subprocess.run([b,data,d],check=True,env=env|{'SHOP_RECYCLE_TRACE':'1'},capture_output=True,text=True)
                     amounts=re.search(r'SHOP_TIMELINE_REUSE (\d+) (\d+)',reuse.stderr)
                     if not amounts:raise ValueError('missing timeline capacity totals')
@@ -315,7 +328,7 @@ def main():
     locgen=area/'generate-skewed-alias'
     run('g++-12','-std=c++20','-O2',root/'perf/native/long_location_input.cpp','-o',locgen)
     verify_long_locations(area,locgen,list(dict.fromkeys([area/'bin'/release_control,area/'bin'/practice_winner])),note)
-    for name in dict.fromkeys([practice_winner, *[b for b in candidates if (b.startswith("pipe") or b in ("destslab-pgo","destpages-pgo"))]]):
+    for name in dict.fromkeys([practice_winner, *[b for b in candidates if (b.startswith("pipe") or b in ("destslab-pgo","destpages-pgo","resdest-pgo","flatgroup-pgo"))]]):
         if (area / "bin" / name).is_file():
             race(root,area,name,note,run,env)
 

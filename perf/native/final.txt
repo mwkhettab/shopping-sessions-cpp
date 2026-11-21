@@ -1,1 +1,1 @@
-base fin-slabkey-pgo shipcolumns-pgo colfusetags-pgo revforcec-pgo varcoltags-pgo fixedskip-pgo fixed32-pgo plane12-pgo planecols-pgo sparseword-pgo rawonecols-pgo wordtag-pgo wordsparse-pgo @best
+base fin-slabkey-pgo shipcolumns-pgo shipresident-pgo varcoltags-pgo clockpair-pgo resplane-pgo resraw-pgo resordinal-pgo reskind-pgo flatgroup-pgo resdest-pgo @best
