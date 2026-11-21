@@ -9,6 +9,10 @@ permissions:
   contents: read
 jobs:
   compare:
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [first, second, third]
     runs-on: ubuntu-24.04
     timeout-minutes: 95
     env:
@@ -18,26 +22,35 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: Identify a compatible native Intel runner
+        id: cpu
+        run: python3 perf/native/intel-wide-runner.py
       - name: Check out the corrected Clang control
+        if: steps.cpu.outputs.wide == 'true'
         uses: actions/checkout@v4
         with:
           ref: 29ee0cc5c26291c511cad44aec18c6531f050f79
           path: .acceptance/candidate
           persist-credentials: false
       - name: Check out the independent implementation
+        if: steps.cpu.outputs.wide == 'true'
         uses: actions/checkout@v4
         with:
           ref: 4db76beed31640ddf4b414ed19deba5ebc660b81
           path: .acceptance/baseline
           persist-credentials: false
       - uses: actions/setup-python@v5
+        if: steps.cpu.outputs.wide == 'true'
         with:
           python-version: '3.12'
       - name: Prepare pinned inputs and published tables
+        if: steps.cpu.outputs.wide == 'true'
         run: bash perf/native/prepare-port-runner.sh
       - name: Build and check the four storage variants
+        if: steps.cpu.outputs.wide == 'true'
         run: bash perf/native/partition_trials/build.sh .acceptance/candidate "$RUNNER_TEMP/shopping-trials/partition-binaries"
       - name: Compare whole tables and time rotated releases
+        if: steps.cpu.outputs.wide == 'true'
         run: |
           area="$RUNNER_TEMP/shopping-trials"
           options=()
@@ -46,16 +59,24 @@ jobs:
           done
           "$RUNNER_TEMP/shopping-python/bin/python" perf/native/port_acceptance.py \
             --candidate-source "$GITHUB_WORKSPACE/.acceptance/candidate" "${options[@]}" \
-            --release-generated-practice --warm-20 7 --warm-60 5 --cold-runs 1
+            --release-generated-practice --warm-20 9 --warm-60 5 --cold-runs 1
+          python3 - "$area/results/port-acceptance/status.json" <<'PYTHON'
+          import json, sys
+          state = json.load(open(sys.argv[1]))
+          assert state["verified"]["kernel"] == "wide SIMD"
+          for variant in ("direct-events", "cached-lines", "click-index", "click-partitions"):
+              for size in ("1M", "20M", "60M"):
+                  assert f"{size}/{variant}" in state["verified"], (size, variant)
+          PYTHON
       - name: Publish stage and process measurements
-        if: always()
+        if: always() && steps.cpu.outputs.wide == 'true'
         run: |
           area="$RUNNER_TEMP/shopping-trials/results"
           if test -f "$area/port-acceptance/status.json"; then python3 perf/native/publish_profile.py "$area"; fi
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: always() && steps.cpu.outputs.wide == 'true'
         with:
-          name: partition-and-index-comparisons
+          name: partition-and-index-comparisons-${{ matrix.lane }}
           path: |
             ${{ runner.temp }}/shopping-trials/results/
             ${{ runner.temp }}/shopping-trials/partition-binaries/*.log
