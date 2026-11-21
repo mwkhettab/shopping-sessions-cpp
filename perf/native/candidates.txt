@@ -1,1 +1,1 @@
-base clean-graphpages fin-slabrange-pgo fin-slabadvice-pgo stripe64-pgo stripe256-pgo stripe1024-pgo striperev-pgo striperaw-pgo
+base fin-slabkey-pgo shapebare-pgo shape1024-pgo shape4096-pgo shape16384-pgo localblocks8-pgo localblocks64-pgo

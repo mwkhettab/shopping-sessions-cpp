@@ -20,7 +20,10 @@ def verify_images(root,area,best,run,note,env):
     if pgo:
         (src/'perf').mkdir(exist_ok=True)
         shutil.copy2(root/'perf/native/train.py',src/'perf/train.py')
-    run('docker','build','--platform','linux/amd64','-t',tags[0],root)
+    control=area/'base'
+    for f in ('build.sh','Dockerfile','.dockerignore'):
+        shutil.copy2(root/'perf/native'/('image-standard-'+f.lstrip('.')),control/f)
+    run('docker','build','--platform','linux/amd64','-t',tags[0],control)
     run('docker','build','--platform','linux/amd64','-t',tags[1],src)
     fingerprint=subprocess.check_output(['docker','run','--rm','--platform','linux/amd64','--entrypoint','sha256sum',tags[1],'/app/shopping'],text=True).split()[0]
     note('Image binary '+best,f'sha256 {fingerprint}')

@@ -31,6 +31,7 @@ def main():
     model=next(x.split(':',1)[1].strip() for x in cpu if x.startswith('model name'))
     flags=next(x.split(':',1)[1].split() for x in cpu if x.startswith('flags'))
     note('Hardware',f'{model}, {env["NCPU"]} workers, affinity {sorted(os.sched_getaffinity(0))}, AVX-512BW {"avx512bw" in flags}.')
+    note("Control","Official 1.13-second commit 8430241e49a4147b9b42dffce4cf21a4088eb5ff, byte-checked sources.")
     candidates=(root/'perf/native/candidates.txt').read_text().split()
     if 'avx512bw' not in flags: candidates=[n for n in candidates if not n.startswith('v512')]
     binaries=[]
@@ -41,9 +42,11 @@ def main():
             src.mkdir(exist_ok=True)
             shutil.copytree(root/'cpp',src/'cpp',dirs_exist_ok=True)
             shutil.copy2(root/'build.sh',src/'build.sh')
-            if name not in ('base','haswell','skylake'):
-                with (root/f'perf/native/{name}.patch').open('rb') as patch:
+            if name not in ('haswell','skylake'):
+                revision='clean-graphpages' if name=='base' else name
+                with (root/f'perf/native/{revision}.patch').open('rb') as patch:
                     subprocess.run(['patch','-s','-p1'],cwd=src,stdin=patch,check=True)
+            if name=='base': run('sha256sum','--check',root/'perf/native/official-113.sha256',cwd=src)
             compiler=shutil.which('g++-12') or shutil.which('g++')
             if name in ('haswell','skylake'):
                 wrapper=src/'cxx'
@@ -141,7 +144,7 @@ def main():
             note('Alternating '+scale+' '+binary.name,f'median {statistics.median(times):.4f} s, runs {times}.')
         # Request eviction only for this job's generated CSVs and record the
         # actual residency before the executable starts.
-        selected=[b for b in binaries if b.name in ('base','fin-slabrange-pgo','fin-slabadvice-pgo')]
+        selected=[b for b in binaries if b.name in ('base','fin-slabkey-pgo')]
         if best not in selected: selected.append(best)
         observations={b:[] for b in selected}
         for iteration in range(3):
