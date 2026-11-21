@@ -1,0 +1,101 @@
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -468,6 +468,7 @@
+       }
+       return x.group;
+     };
++    auto fill_spans = [&]<bool Ranked>() {
+     // First count each alias, then scatter into disjoint contiguous spans.
+     // A linked person may own spans in several of these raw-user shards.
+     auto &store = storage[b];
+@@ -479,14 +480,26 @@
+             u.bits = UINTPTR_MAX;
+             continue;
+           }
+-          u.bits = intern(Key{u.bits});
+-          ++groups[u.bits].event_end;
++          size_t group = intern(Key{u.bits});
++          if constexpr (Ranked) {
++            auto ordinal = ++groups[group].event_end;
++            u.bits = static_cast<uintptr_t>((uint64_t(group) << 32) | uint64_t(ordinal));
++          } else {
++            u.bits = group;
++            ++groups[group].event_end;
++          }
+           ++event_count;
+         }
+       for (auto part : w.clicks[b].spans())
+         for (auto &[u, c] : part) {
+-          u.bits = intern(Key{u.bits});
+-          ++groups[u.bits].click_end;
++          size_t group = intern(Key{u.bits});
++          if constexpr (Ranked) {
++            auto ordinal = ++groups[group].click_end;
++            u.bits = static_cast<uintptr_t>((uint64_t(group) << 32) | uint64_t(ordinal));
++          } else {
++            u.bits = group;
++            ++groups[group].click_end;
++          }
+         }
+       click_count += w.clicks[b].size();
+     }
+@@ -511,8 +524,13 @@
+     size_t event_offset = 0, click_offset = 0;
+     for (auto &g : groups) {
+       auto events_in_group = g.event_end, clicks_in_group = g.click_end;
+-      g.event_end = event_offset;
+-      g.click_end = click_offset;
++      if constexpr (Ranked) {
++        g.event_end = event_offset + events_in_group;
++        g.click_end = click_offset + clicks_in_group;
++      } else {
++        g.event_end = event_offset;
++        g.click_end = click_offset;
++      }
+       event_offset += events_in_group;
+       click_offset += clicks_in_group;
+     }
+@@ -520,10 +538,24 @@
+       for (auto part : w.events[b].spans())
+         for (auto &[u, e] : part)
+           if (u.bits != UINTPTR_MAX)
+-            store.events[groups[u.bits].event_end++] = e;
++            {
++            if constexpr (Ranked) {
++              auto group = uint32_t(uint64_t(u.bits) >> 32);
++              store.events[groups[group].event_end - uint32_t(u.bits)] = e;
++            } else {
++              store.events[groups[u.bits].event_end++] = e;
++            }
++          }
+       for (auto part : w.clicks[b].spans())
+         for (auto &[u, c] : part)
+-          store.clicks[groups[u.bits].click_end++] = c;
++          {
++            if constexpr (Ranked) {
++              auto group = uint32_t(uint64_t(u.bits) >> 32);
++              store.clicks[groups[group].click_end - uint32_t(u.bits)] = c;
++            } else {
++              store.clicks[groups[u.bits].click_end++] = c;
++            }
++          }
+       w.events[b].release();
+       w.clicks[b].release();
+     }
+@@ -541,6 +573,16 @@
+       event_offset = g.event_end;
+       click_offset = g.click_end;
+     }
++    };
++    if constexpr (sizeof(uintptr_t) >= sizeof(uint64_t)) {
++      // Each packed alias and ordinal comes from these rows, before any
++      // link-only aliases are inserted. All-ones remains the discarded-row tag.
++      if (n < UINT32_MAX) {
++        fill_spans.template operator()<true>();
++        return;
++      }
++    }
++    fill_spans.template operator()<false>();
+   });
+   for (auto &w : workers) {
+     w.events.release();

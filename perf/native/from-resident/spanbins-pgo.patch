@@ -1,0 +1,312 @@
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -163,7 +163,12 @@
+   size_t count{}, slot{};
+ };
+ #include "session_bins.hpp"
++constexpr unsigned mask_threshold=0;
++constexpr bool use_event_pieces=true, use_click_pieces=false;
++#define SHOP_MASK_VECTOR 0
++#include "session_click_masks.hpp"
+ struct Result {
++  SessionClickMasks mask;
+   SessionBins bins;
+ #ifdef SHOPPING_DIAGNOSTICS
+   size_t people{}, events_seen{}, clicks_seen{}, max_events{}, max_clicks{};
+@@ -180,6 +185,7 @@
+     bins.configure(w);
+     size_t count = cat.campaigns.size();
+     activity.configure(count);
++    if constexpr(mask_threshold!=0)mask.campaign.configure(count);
+     spend.configure(cat.categories.size());
+     first_day = utc_day(w.start);
+     campaigns = count;
+@@ -197,25 +203,47 @@
+ template <class Layout>
+ void summarize(Key user, std::span<typename Layout::E> events,
+                std::span<typename Layout::C> clicks, const Catalog &cat,
+-               Result &result, Layout layout) {
++               Result &result, Layout layout,
++               typename ScanWorker<Layout>::Vertex *event_pieces=nullptr,
++               typename ScanWorker<Layout>::Vertex *click_pieces=nullptr,
++               size_t total_events=0, size_t total_clicks=0,
++               std::vector<typename Layout::C> *merged_clicks=nullptr) {
++  if(!event_pieces)total_events=events.size();
++  if(!click_pieces)total_clicks=clicks.size();
++  auto visit_clicks=[&](auto accept){
++    if(!click_pieces){accept(clicks);return;}
++    auto *v=click_pieces;
++    do{accept(v->clicks);v=v->next;}while(v!=click_pieces);
++  };
++  auto order_clicks=[&] {
++    if(click_pieces){
++      merged_clicks->clear();
++      merged_clicks->reserve(total_clicks);
++      visit_clicks([&](auto view){merged_clicks->insert(merged_clicks->end(),view.begin(),view.end());});
++      clicks=*merged_clicks;click_pieces=nullptr;
++    }
++    std::sort(clicks.begin(),clicks.end(),[](const auto &a,const auto &b){
++      return a.ts==b.ts?b.id.user_less(a.id,'k'):a.ts<b.ts;
++    });
++  };
++  unsigned saved=0;
++  bool collecting=mask_threshold && total_clicks>=mask_threshold;
+   if (events.empty())
+     return;
+ #ifdef SHOPPING_DIAGNOSTICS
+   ++result.people;
+-  result.events_seen += events.size();
+-  result.clicks_seen += clicks.size();
+-  result.max_events = std::max(result.max_events, events.size());
+-  result.max_clicks = std::max(result.max_clicks, clicks.size());
++  result.events_seen += total_events;
++  result.clicks_seen += total_clicks;
++  result.max_events = std::max(result.max_events, total_events);
++  result.max_clicks = std::max(result.max_clicks, total_clicks);
+ #endif
+-  const bool use_bins = !result.bins.cells.empty() && events.size() >= 32;
++  const bool use_bins = !result.bins.cells.empty() && total_events >= 32;
+   {
+     MEASURE(sorting);
+     if (!use_bins)
+       std::sort(events.begin(), events.end(),
+                 [&](auto a, auto b) { return layout.less(a, b); });
+-    std::sort(clicks.begin(), clicks.end(), [](const auto &a, const auto &b) {
+-      return a.ts == b.ts ? b.id.user_less(a.id, 'k') : a.ts < b.ts;
+-    });
++    if(!collecting)order_clicks();
+   }
+   size_t left = 0, right = 0;
+   UserDay daily{user, 0, 0, 0, 0, {}};
+@@ -247,11 +275,7 @@
+       result.purchased.push_back(category);
+     value += price;
+   };
+-  auto end_session = [&](Time start, int64_t count, int64_t revenue) {
+-    auto day = daily.day;
+-    ++daily.sessions;
+-    daily.events += count;
+-    daily.revenue += revenue;
++  auto attribute_sorted=[&](Time start,int32_t day,int64_t revenue) {
+     {
+       MEASURE(attribution);
+       while (right < clicks.size() &&
+@@ -282,9 +306,33 @@
+     for (int campaign : result.active)
+       ++result.at(campaign, day).assists;
+   };
++  auto end_session=[&](Time start,int64_t count,int64_t revenue) {
++    ++daily.sessions;
++    daily.events+=count;
++    daily.revenue+=revenue;
++    if(collecting) {
++      if(saved<64) {
++        result.mask.sessions[saved++]={start,revenue,daily.day};
++        return;
++      }
++      // The 65th session returns this person to the sorted sweep. The
++      // first 64 user-day totals have already been applied.
++      collecting=false;
++      order_clicks();
++      for(unsigned i=0;i<saved;++i){
++        const auto &s=result.mask.sessions[i];
++        attribute_sorted(s.start,s.day,s.revenue);
++      }
++    }
++    attribute_sorted(start,daily.day,revenue);
++  };
+   if (use_bins) {
+     MEASURE(session);
+-    result.bins.scan(events, begin_session, spend, end_session, layout);
++    if(event_pieces) {
++      auto *v=event_pieces;
++      do{result.bins.add(v->events,layout);v=v->next;}while(v!=event_pieces);
++    } else result.bins.add(events,layout);
++    result.bins.emit(begin_session,spend,end_session);
+   } else {
+     size_t i = 0;
+     while (i < events.size()) {
+@@ -308,6 +356,8 @@
+     }
+   }
+   finish_day();
++  if(collecting)
++    result.mask.attribute(saved,layout,visit_clicks,[&](int k,int32_t d)->Counts&{return result.at(k,d);});
+   for (int campaign : result.active)
+     result.activity[campaign].count = 0;
+   result.active.clear();
+@@ -639,9 +689,11 @@
+       } while (v != &head);
+       if (!event_count)
+         continue;
+-      if (event_count > ev.size() || click_count > cl.size()) {
+-        bool merge_e = event_count > ev.size(),
+-             merge_c = click_count > cl.size();
++      bool split_events=use_event_pieces && event_count>ev.size() &&
++                        !results[t].bins.cells.empty() && event_count>=32;
++      bool split_clicks=use_click_pieces && click_count>cl.size() && click_count>=mask_threshold;
++      bool merge_e=event_count>ev.size() && !split_events, merge_c=click_count>cl.size() && !split_clicks;
++      if(merge_e || merge_c) {
+         events_buffer.clear();
+         click_buffer.clear();
+         if (merge_e)
+@@ -662,7 +714,8 @@
+         if (merge_c)
+           cl = click_buffer;
+       }
+-      summarize(head.name, ev, cl, cat, results[t], layout);
++      summarize(head.name,ev,cl,cat,results[t],layout,split_events?&head:nullptr,
++                split_clicks?&head:nullptr,event_count,click_count,&click_buffer);
+     }
+   });
+   timer.mark("linked-person sessions, attribution and aggregation");
+--- a/cpp/session_bins.hpp
++++ b/cpp/session_bins.hpp
+@@ -28,9 +28,8 @@
+     }
+   }
+ 
+-  template <class T, class Begin, class Spend, class End, class Layout>
+-  void scan(std::span<T> events, Begin begin, Spend spend, End end,
+-            Layout layout) {
++  template<class T,class Layout>
++  void add(std::span<T> events,Layout layout) {
+     for (auto word : events) {
+       const auto e = layout.unpack(word);
+       size_t index = (uint64_t(e.ts) - uint64_t(origin)) / session_gap;
+@@ -50,6 +49,9 @@
+         cell.purchases = purchases.size();
+       }
+     }
++  }
++  template<class Begin,class Spend,class End>
++  void emit(Begin begin,Spend spend,End end) {
+     Time start{}, last{};
+     int64_t count = 0, revenue = 0;
+     for (size_t word = 0; word < occupied.size(); ++word) {
+--- /dev/null
++++ b/cpp/session_click_masks.hpp
+@@ -0,0 +1,123 @@
++#pragma once
++
++struct SessionCredit {
++  Time start;
++  int64_t revenue;
++  int32_t day;
++};
++
++struct SessionClickMasks {
++  std::array<SessionCredit,64> sessions;
++  ScratchArray<uint64_t> campaign;
++  std::vector<int> touched;
++
++  static uint64_t prefix(unsigned n) {
++    return n ? UINT64_MAX >> (64-n) : 0;
++  }
++
++#ifdef SHOPPING_X86_CSV
++  template<unsigned Blocks, class Layout, class Click, class Offer>
++  __attribute__((target("avx2"),noinline))
++  static void packed_ranges(std::span<Click> rows, const uint32_t *relative,
++                            Time origin, Time last, uint64_t active,
++                            Layout layout, Offer &offer) {
++    __m256i starts[Blocks];
++    for(unsigned i=0;i<Blocks;++i)
++      starts[i]=_mm256_loadu_si256(reinterpret_cast<const __m256i *>(relative+8*i));
++    const auto sign=_mm256_set1_epi32(INT32_MIN);
++    const auto limit=_mm256_set1_epi32(int32_t(INT32_MIN+reach+1));
++    for(const auto &click:rows) {
++      Time t=layout.click_time(click);
++      if(t<origin || t>last)continue;
++      auto value=_mm256_set1_epi32(std::bit_cast<int32_t>(uint32_t(t-origin)));
++      uint64_t mask=0;
++      for(unsigned j=0;j<Blocks;++j) {
++        auto gap=_mm256_xor_si256(_mm256_sub_epi32(starts[j],value),sign);
++        unsigned bits=unsigned(_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(limit,gap))));
++        mask|=uint64_t(bits)<<(8*j);
++      }
++      if(uint64_t covered=mask&active)offer(click,covered);
++    }
++  }
++#endif
++  template<class Layout, class Visit, class At>
++  void attribute(unsigned n, Layout layout, Visit visit, At at) {
++    using Click=typename Layout::C;
++    std::array<Time,64> starts,oldest;
++    std::array<uint64_t,64> day_masks;
++    std::array<const Click *,64> winners;
++    std::fill_n(winners.begin(),n,nullptr);
++    for(unsigned i=0;i<n;) {
++      unsigned first=i;
++      do {
++        starts[i]=sessions[i].start;
++        oldest[i]=starts[i]-reach;
++        ++i;
++      } while(i<n && sessions[i].day==sessions[first].day);
++      std::fill(day_masks.begin()+first,day_masks.begin()+i,prefix(i)&~prefix(first));
++    }
++    auto newer=[](const Click *next,const Click *old){
++      return !old || next->ts>old->ts || (next->ts==old->ts && next->id.user_less(old->id,'k'));
++    };
++    auto offer=[&](const Click &click,uint64_t bits) {
++      unsigned first=unsigned(std::countr_zero(bits));
++      if(newer(&click,winners[first]))winners[first]=&click;
++      auto &mask=campaign[click.campaign];
++      if(!mask)touched.push_back(click.campaign);
++      mask|=bits;
++    };
++    bool packed=false;
++#if defined(SHOPPING_X86_CSV) && SHOP_MASK_VECTOR
++    if (__builtin_cpu_supports("avx2") && n>1 &&
++        uint64_t(starts[n-1])-uint64_t(oldest[0])<=UINT32_MAX-uint64_t(reach)-1) {
++      std::array<uint32_t,64> relative{};
++      for(unsigned i=0;i<n;++i)relative[i]=uint32_t(starts[i]-oldest[0]);
++      const auto valid=prefix(n);
++      auto process=[&]<unsigned Blocks>() {
++        visit([&](std::span<Click> rows){
++          packed_ranges<Blocks>(rows,relative.data(),oldest[0],starts[n-1],valid,layout,offer);
++        });
++      };
++      if(n<=8)process.template operator()<1>();
++      else if(n<=16)process.template operator()<2>();
++      else if(n<=32)process.template operator()<4>();
++      else process.template operator()<8>();
++      packed=true;
++    }
++#endif
++    if(!packed)visit([&](std::span<Click> rows) {
++      for(const Click &click:rows) {
++        auto time=layout.click_time(click);
++        if(time<oldest[0] || time>starts[n-1])continue;
++        unsigned first=0,last=1;
++        if(n!=1) {
++          first=unsigned(std::lower_bound(starts.begin(),starts.begin()+n,time)-starts.begin());
++          last=unsigned(std::upper_bound(oldest.begin()+first,oldest.begin()+n,time)-oldest.begin());
++          if(first==last)continue;
++        }
++        offer(click,prefix(last)&~prefix(first));
++      }
++    });
++    const Click *winner=nullptr;
++    for(unsigned i=0;i<n;++i) {
++      if(winners[i] && newer(winners[i],winner))winner=winners[i];
++      int index=winner && layout.click_time(*winner)>=oldest[i]?winner->campaign:0;
++      const auto &session=sessions[i];
++      auto &counts=at(index,session.day);
++      ++counts.sessions;
++      counts.purchases+=session.revenue!=0;
++      counts.revenue+=session.revenue;
++    }
++    for(int id:touched) {
++      auto &stored=campaign[id];
++      uint64_t bits=stored;
++      stored=0;
++      while(bits) {
++        auto i=std::countr_zero(bits);
++        at(id,sessions[i].day).assists+=std::popcount(bits&day_masks[i]);
++        bits&=~day_masks[i];
++      }
++    }
++    touched.clear();
++  }
++};

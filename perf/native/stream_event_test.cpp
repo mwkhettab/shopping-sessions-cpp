@@ -13,6 +13,18 @@ struct StreamAudit {
   std::vector<Fields> scalar;
   size_t next{},marked{};
   bool accept{};
+#ifdef CHECK_STREAM_BATCH
+  size_t common_rows{};
+  bool common(const char *id,unsigned il,const char *user,unsigned ul,Str ts,Str ingest) {
+    if(next>=scalar.size())std::abort();
+    const auto &row=scalar[next];
+    if(Str(id,il)!=row[0] || Str(user,ul)!=row[1] || ts!=row[2] || ingest!=row[3] ||
+       row[5].empty() || (row[4]!="view" && row[4]!="cart"))std::abort();
+    ++common_rows;
+    next+=accept;
+    return accept;
+  }
+#endif
   void compare(const Fields &r) {
     if(next>=scalar.size() || r!=scalar[next]) std::abort();
   }
@@ -56,6 +68,15 @@ int main() {
   size_t marked=0, cases=0;
   auto run = [&](Str s){ ++cases; marked += verify_stream(s); };
   run(population);
+#ifdef CHECK_STREAM_BATCH
+  {
+    StreamAudit audit;
+    scalar_rows<7>(population,[&](const Fields &r){audit.scalar.push_back(r);});
+    audit.accept=true;
+    stream_events_avx2(population,audit);
+    if(audit.next!=audit.scalar.size() || !audit.common_rows)std::abort();
+  }
+#endif
   std::mt19937 rng(501791);
   for (unsigned width : {63,64,128,256,512,1024,2048,4096}) {
     for(int displacement=-4; displacement<=4; ++displacement) {

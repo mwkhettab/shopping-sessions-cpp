@@ -66,7 +66,7 @@ jobs:
           df -h .
       - name: Validate and measure fresh processes
         if: steps.hardware.outputs.run == 'yes'
-        run: "$RUNNER_TEMP/shopping-python/bin/python perf/native/reader_portfolio.py"
+        run: "$RUNNER_TEMP/shopping-python/bin/python perf/native/batch_and_scatter.py"
       - uses: actions/upload-artifact@v4
         if: always() && steps.hardware.outputs.run == 'yes'
         with:
