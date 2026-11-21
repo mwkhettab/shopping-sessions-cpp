@@ -23,7 +23,7 @@ def report(title,message):
 def main():
     bin=area/'bin';bin.mkdir(exist_ok=True)
     model=next(line.split(':')[1].strip() for line in Path('/proc/cpuinfo').read_text().splitlines() if line.startswith('model name'))
-    report('Native processor',model+', pinned CPUs '+str(sorted(os.sched_getaffinity(0))))
+    report('Native processor',model+', available CPUs '+str(sorted(os.sched_getaffinity(0))))
     manifest=json.loads((native/'ordinal-files.json').read_text())
     candidates=[n for n in manifest if n.startswith('engine-')]
     participants=['base',control,recent,*candidates]
@@ -81,6 +81,8 @@ def main():
     gen=area/'skew-generator';run('g++-12','-O2','-std=c++20',native/'long_location_input.cpp','-o',gen);skew(area,gen,[bin/winner],note)
     race(root,area,winner,note,run,env)
     select('Final correctness',('Eight worker RSS ','ThreadSanitizer ','Skewed revision locations '))
+    for name in ('practice','final','holdout'):
+        note('Per-dataset medians '+name,json.dumps(times[name],sort_keys=True))
 if __name__=='__main__':
     try:main()
     except BaseException as e:report('Failure',repr(e));raise
