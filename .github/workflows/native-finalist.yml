@@ -50,6 +50,12 @@ jobs:
           ref: 5230d4835e1b2f9f6b48d1dc53319a3e2b658077
           path: .acceptance/corrected-gcc
           persist-credentials: false
+      - name: Check out the qualified Clang release
+        uses: actions/checkout@v4
+        with:
+          ref: 29ee0cc5c26291c511cad44aec18c6531f050f79
+          path: .acceptance/qualified-clang
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -62,6 +68,8 @@ jobs:
           docker buildx build --platform linux/amd64 --output "type=local,dest=$old" .acceptance/previous
           gcc="$RUNNER_TEMP/shopping-trials/corrected-gcc"
           docker buildx build --platform linux/amd64 --output "type=local,dest=$gcc" .acceptance/corrected-gcc
+          clang="$RUNNER_TEMP/shopping-trials/qualified-clang"
+          docker buildx build --platform linux/amd64 --output "type=local,dest=$clang" .acceptance/qualified-clang
           python="$RUNNER_TEMP/shopping-python/bin/python"
           if "$python" .acceptance/candidate/tests/pipeline/long_link.py "$old/app/shopping" >"$old/long-link.log" 2>&1; then
             echo '::notice title=Previous release identity check::This build produced the expected 43 user-day rows.'
@@ -78,9 +86,16 @@ jobs:
           "$RUNNER_TEMP/shopping-python/bin/python" perf/native/port_acceptance.py \
             --candidate-source "$GITHUB_WORKSPACE/.acceptance/candidate" \
             --comparison-binary "corrected-gcc=$RUNNER_TEMP/shopping-trials/corrected-gcc/app/shopping" \
+            --comparison-binary "qualified-clang=$RUNNER_TEMP/shopping-trials/qualified-clang/app/shopping" \
             --previous-release "$RUNNER_TEMP/shopping-trials/previous/app/shopping" \
             --release-generated-practice --release-generated-final \
-            --warm-20 3 --warm-60 3 --cold-runs 1 --container-lifetime-pairs 5 --input-policy-rounds 5
+            --warm-20 9 --warm-60 5 --cold-runs 1 --container-lifetime-pairs 5 --input-policy-rounds 5
+          python3 - "$RUNNER_TEMP/shopping-trials/results/port-acceptance/status.json" <<'PY'
+          import json, sys
+          state = json.load(open(sys.argv[1]))
+          for size in ("1M", "20M", "60M"):
+              assert f"{size}/qualified-clang" in state["verified"], size
+          PY
       - name: Publish native measurements and qualification
         if: always()
         run: |

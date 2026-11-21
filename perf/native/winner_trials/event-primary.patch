@@ -501,7 +501,7 @@ diff --git a/tests/pipeline/event_primary.py b/tests/pipeline/event_primary.py
 new file mode 100644
 --- /dev/null
 +++ b/tests/pipeline/event_primary.py
-@@ -0,0 +1,187 @@
+@@ -0,0 +1,192 @@
 +"""Exercise dedup-before-validation across compact event bucket boundaries."""
 +import argparse
 +from collections import defaultdict
@@ -558,6 +558,9 @@ new file mode 100644
 +            ids[i] = "e" + spelling(i, 0x1D0896B42F)
 +        return ids[i]
 +
++    def cohort(i):
++        return 0 if i < 1000 else 1 + (i - 1000)//128
++
 +    revisions = [[] for _ in range(16)]
 +    # Values in this independent oracle are (ingest, person, revenue or None).
 +    # None means a physically valid row whose winning copy fails validation.
@@ -574,7 +577,7 @@ new file mode 100644
 +    with (data / "events/anchors.csv").open("w") as f:
 +        print(HEADERS["events"], file=f)
 +        for i in range(ANCHORS):
-+            group = 0 if i < 1000 else 1 + (i - 1000)//128
++            group = cohort(i)
 +            print(",".join((eid(i), user(group), when, timestamp(START+30),
 +                           "view", "p1", "")), file=f)
 +            remember(eid(i), START+30, user(group), 0)
@@ -594,7 +597,7 @@ new file mode 100644
 +    raw_users = [" \x00raw ", "u00", "élève", "long-" + "Z"*320]
 +    for j, i in enumerate(special):
 +        key = eid(i)
-+        owner = raw_users[j % 4] if j % 2 else user(j + 300)
++        owner = raw_users[j % 4] if j % 2 else user(300 if i == 0 else cohort(i))
 +        for rank in range(8):
 +            part = (7*rank + j)%len(revisions)
 +            # Some rank-zero records are invalid, including empty users,
@@ -612,6 +615,8 @@ new file mode 100644
 +                price, value = "0", None
 +            elif j % 8 == 7:
 +                product, value = "", None
++            if rank == 0 and i in (16383, 32767):
++                name, t, kind, product, price, value = raw_users[2], when, "purchase", "p1", "41", 41
 +            # For ordinal zero both the input ordinal and the packed ingest
 +            # bits are zero; the winning event still needs a live generation.
 +            sec = START-DAY+rank if i == 0 else START+rank
