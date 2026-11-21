@@ -83,7 +83,7 @@ def main():
             shutil.copytree(root/'tests',localtests,dirs_exist_ok=True)
             run(compiler,'-std=c++20','-O2',str(localtests/'input.cpp'),'-o',unit)
             run(unit)
-            if name.startswith(('index','boundsreader','fused','shipreader','mask','cert','hotfuse','colfuse','adaptfuse','quotecmov','cut','hotanchors')):
+            if name.startswith(('index','boundsreader','fused','shipreader','mask','var','ord','cert','hotfuse','colfuse','adaptfuse','quotecmov','cut','hotanchors')):
                 run(compiler,'-std=c++20','-O2','-fsanitize=undefined','-fno-sanitize-recover=all',
                     '-I',src/'cpp',root/'perf/native/mutated_rows.cpp','-o',unit)
                 run(unit)
@@ -92,13 +92,16 @@ def main():
             run(python,root/'perf/native/interval_oracle.py',binary)
             run(python,root/'perf/native/page_oracle.py',binary)
             run(python,root/'perf/native/prefix_oracle.py',binary)
-            if name.startswith(('click','claim','filter','clock')) or name=='shipreader-pgo':
+            if name.startswith(('click','claim','filter','clock','maskrev','varrev','ctrlrev','maskhotrev')) or name=='shipreader-pgo':
                 run(python,root/'perf/native/ordered_ids_oracle.py',binary)
             if name.startswith('clock') and 'avx2' in flags and (src/'cpp/row_clocks.hpp').is_file():
                 run(compiler,'-std=c++20','-O2','-fsanitize=undefined','-fno-sanitize-recover=all','-I',src/'cpp',root/'perf/native/clock_lanes.cpp','-o',unit)
                 run(unit)
             if (src/'cpp/quote_certificate.hpp').is_file() and 'avx2' in flags and 'pclmulqdq' in flags:
                 run(compiler,'-std=c++20','-O2','-fsanitize=undefined','-fno-sanitize-recover=all','-I',src/'cpp',root/'perf/native/quote_grammar.cpp','-o',unit)
+                run(unit)
+            if (src/'cpp/ordinal_csv.hpp').is_file() and 'avx2' in flags and 'bmi2' in flags and 'pclmulqdq' in flags:
+                run(compiler,'-std=c++20','-O2','-fsanitize=undefined','-fno-sanitize-recover=all','-I',src/'cpp',root/'perf/native/ordinal_test.cpp','-o',unit)
                 run(unit)
             binaries.append(binary)
         except (subprocess.CalledProcessError,OSError) as exc:
@@ -246,6 +249,9 @@ def main():
         if json.loads(filepath.read_text())['digests']!=baseline_digests:
             raise ValueError('different row, time or key digests: '+filepath.name)
     note('Cumulative input digests','The released reader and selected challenger matched all control digests.')
+    from phase_pmu import collect as phase_counters
+    for label in dict.fromkeys(['shipreader-pgo',practice_winner]):
+        if (area/'bin'/label).is_file():phase_counters(root,area,label,note,run,env)
     from extra_checks import scaling, race
     scaling(root,area,practice_winner,note,run,env)
     for name in dict.fromkeys([practice_winner, *[b for b in candidates if b.startswith("pipe")]]):

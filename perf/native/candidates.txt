@@ -1,1 +1,1 @@
-base fin-slabkey-pgo shipreader-pgo fusedbounds-pgo hotfuse-pgo colfuse-pgo adaptfuse-pgo plainfuse-pgo clockscalar8-pgo clockfour-pgo clock16-pgo clickwire-pgo clickwiretie-pgo clickrad1024-pgo clickmsd128-pgo claimone-pgo filterfour-pgo claimwrite32-pgo cert16-pgo maskcert1024-pgo maskcertfuse-pgo
+base fin-slabkey-pgo shipreader-pgo maskemit-pgo ctrlrev-pgo maskrev-pgo maskrev32-pgo maskrev80-pgo maskhot-pgo maskhotrev-pgo maskcol-pgo varprefix-pgo varsplit-pgo varrev-pgo ordscalar-pgo ordlookup-pgo ordwide-pgo certprefix-pgo certprefixq-pgo certvar-pgo

@@ -1,0 +1,440 @@
+--- a/cpp/input.hpp
++++ b/cpp/input.hpp
+@@ -147,8 +147,15 @@
+ #endif
+ #include "csv_x86.hpp"
+ #include "line_csv.hpp"
++#include "line_tile.hpp"
++#include "ordinal_csv.hpp"
+ template <size_t N, class F> void parse_rows(Str data, F &&callback) {
+ #ifdef SHOPPING_X86_CSV
++  if constexpr(N==7)if(wide_csv_supported() && __builtin_cpu_supports("bmi2") && __builtin_cpu_supports("pclmul") && __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("avx512vbmi2")){ ordinal_wide_rows<N,false>(data,callback);return; }
++  if (N == 7 && wide_csv_supported()) {
++    tiled_lines<N, 16>(data, callback);
++    return;
++  }
+   if (wide_csv_supported()) { line_csv_rows<N>(data,callback); return; }
+   if (wide_csv_supported()) {
+     wide_csv_rows<N>(data, callback);
+--- /dev/null
++++ b/cpp/line_tile.hpp
+@@ -0,0 +1,125 @@
++#pragma once
++// Find line endings in small groups; both the delimiter count and all
++// surrounding quotes are checked before a field reaches the event validator.
++#ifdef SHOPPING_X86_CSV
++inline uint64_t mask_to(unsigned n) {
++  return n >= 64 ? ~uint64_t{} : (uint64_t{1} << n) - 1;
++}
++template <size_t N, class F>
++__attribute__((target("avx2,bmi,popcnt"), always_inline)) inline void
++split_known_line(const char *p, size_t len, const char *end, F &fn) {
++  if (len >= 128 || end - p < 128) {
++    scalar_rows<N>(Str(p, len), fn);
++    return;
++  }
++  uint64_t lo, hi = 0, ql, qh = 0;
++  auto get = [&](unsigned at, uint64_t &commas,
++                 uint64_t &quotes) __attribute__((target("avx2,bmi,popcnt"),
++                                                  always_inline)) {
++    auto a = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(p + at));
++    auto b = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(p + at + 32));
++    auto comma = _mm256_set1_epi8(','), quote = _mm256_set1_epi8('"');
++    uint64_t c0 = unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, comma)));
++    uint64_t q0 = unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, quote)));
++    uint64_t c1 = unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, comma)));
++    uint64_t q1 = unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, quote)));
++    auto mask = mask_to(unsigned(len) - at);
++    commas = (c0 | (c1 << 32)) & mask;
++    quotes = (q0 | (q1 << 32)) & mask;
++  };
++  get(0, lo, ql);
++  if (len > 64)
++    get(64, hi, qh);
++  if (size_t(std::popcount(lo) + std::popcount(hi)) != N - 1)
++    return;
++  std::array<Str, N> fields;
++  unsigned start = 0, wrapped = 0;
++  for (unsigned i = 0; i < N; ++i) {
++    unsigned cut = unsigned(len);
++    if (i + 1 < N) {
++      if (lo) {
++        cut = std::countr_zero(lo);
++        lo &= lo - 1;
++      } else {
++        cut = 64 + std::countr_zero(hi);
++        hi &= hi - 1;
++      }
++    }
++    unsigned width = cut - start;
++    bool quotes = width >= 2 && ((p[start] == '"') & (p[cut - 1] == '"'));
++    wrapped += 2 * quotes;
++    fields[i] = {p + start + quotes, width - 2 * quotes};
++    start = cut + 1;
++  }
++  if (wrapped == unsigned(std::popcount(ql) + std::popcount(qh)))
++    fn(fields);
++}
++
++template <size_t N, unsigned Batch, class F>
++__attribute__((target("avx2,bmi,popcnt"))) void tiled_lines(Str data, F &fn) {
++  size_t from = 0, scan = 0;
++  std::array<size_t, Batch> ends;
++  unsigned n = 0;
++  auto flush = [&]() __attribute__((target("avx2,bmi,popcnt"), always_inline)) {
++    for (unsigned i = 0; i < n; ++i) {
++      auto to = ends[i];
++      split_known_line<N>(data.data() + from, to - from,
++                          data.data() + data.size(), fn);
++      from = to + 1;
++    }
++    n = 0;
++  };
++  auto lf = _mm256_set1_epi8('\n');
++  for (; scan + 32 <= data.size(); scan += 32) {
++    auto v = _mm256_loadu_si256(
++        reinterpret_cast<const __m256i *>(data.data() + scan));
++    auto mask = unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, lf)));
++    while (mask) {
++      ends[n++] = scan + std::countr_zero(mask);
++      mask &= mask - 1;
++      if (n == Batch)
++        flush();
++    }
++  }
++  if (n)
++    flush();
++  if (from < data.size())
++    line_csv_rows<N>(data.substr(from), fn);
++}
++#include "quote_certificate.hpp"
++template <size_t N, unsigned Batch, class F>
++__attribute__((target("avx2,bmi,popcnt,pclmul"))) void certified_lines(Str data, F &fn) {
++  size_t from = 0, scan = 0;
++  std::array<size_t, Batch> ends;
++  unsigned n = 0;
++  auto flush = [&]() __attribute__((target("avx2,bmi,popcnt,pclmul"), always_inline)) {
++    auto decode=[&](unsigned first,unsigned stop,bool okay) __attribute__((target("avx2,bmi,popcnt,pclmul"),always_inline)){
++      for(unsigned k=first;k<stop;++k){
++        auto last=ends[k];auto len=last-from;
++        if(okay && len<128)split_certified<N>(data.data()+from,unsigned(len),data.data()+data.size(),fn);
++        else split_known_line<N>(data.data()+from,len,data.data()+data.size(),fn);
++        from=last+1;
++      }
++    };
++    bool okay=certify_quotes(data.data()+from,ends[n-1]+1-from);
++    decode(0,n,okay);
++    n = 0;
++  };
++  auto lf = _mm256_set1_epi8('\n');
++  for (; scan + 32 <= data.size(); scan += 32) {
++    auto v = _mm256_loadu_si256(
++        reinterpret_cast<const __m256i *>(data.data() + scan));
++    auto mask = unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, lf)));
++    while (mask) {
++      ends[n++] = scan + std::countr_zero(mask);
++      mask &= mask - 1;
++      if (n == Batch)
++        flush();
++    }
++  }
++  if (n)
++    flush();
++  if (from < data.size())
++    line_csv_rows<N>(data.substr(from), fn);
++}
++#endif
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -233,7 +233,7 @@
+       auto &v = result.spend[k];
+       if (v > best || (v == best && cat.categories[k] < *daily.category)) {
+         best = v;
+-        daily.category = cat.categories[k];
++        daily.category = &cat.categories[k];
+       }
+       v = 0;
+     }
+@@ -769,8 +769,13 @@
+   resolve_revisions(workers, threads, anchor);
+   timer.mark("global event dedup and loser removal");
+   std::vector<Result> results(threads);
+-  for (auto &result : results)
++  size_t rows_hint =
++      std::min<size_t>(event_count / 8, (size_t(512) << 20) / sizeof(UserDay)) /
++      threads;
++  for (auto &result : results) {
++    result.users.reserve(rows_hint);
+     result.configure(window, cat, threads);
++  }
+   process_people(workers, results, cat, threads, timer, layout);
+   fs::create_directories(output / "user_daily");
+   fs::create_directories(output / "campaign_daily");
+@@ -779,13 +784,35 @@
+                     ("part-" + std::to_string(i) + ".parquet"),
+                 results[i].users);
+   });
+-  Totals merged;
+-  for (auto &r : results)
+-    r.merge_into(merged);
+   std::vector<CampaignDay> campaigns;
+-  for (auto &[key, c] : merged)
+-    campaigns.push_back(
+-        {cat.campaigns[key.first], cat.channels[key.first], key.second, c});
++  auto append = [&](size_t id, int32_t day, const Counts &c) {
++    campaigns.push_back({cat.campaigns[id], cat.channels[id], day, c});
++  };
++  const auto &first = results.front();
++  if (!first.table.empty()) {
++    for (size_t start = 0; start < first.table.size();
++         start += first.campaigns) {
++      int32_t day = first.first_day + int32_t(start / first.campaigns);
++      for (size_t id = 0; id < first.campaigns; ++id) {
++        Counts c{};
++        for (const auto &r : results) {
++          const auto &part = r.table[start + id];
++          c.sessions += part.sessions;
++          c.purchases += part.purchases;
++          c.revenue += part.revenue;
++          c.assists += part.assists;
++        }
++        if (c.sessions || c.assists)
++          append(id, day, c);
++      }
++    }
++  } else {
++    Totals merged;
++    for (auto &r : results)
++      r.merge_into(merged);
++    for (auto &[key, c] : merged)
++      append(key.first, key.second, c);
++  }
+   write_campaigns(output / "campaign_daily" / "part-0.parquet", campaigns);
+   timer.mark("merge and Parquet output");
+ #ifdef SHOPPING_DIAGNOSTICS
+--- /dev/null
++++ b/cpp/ordinal_csv.hpp
+@@ -0,0 +1,95 @@
++#pragma once
++#ifdef SHOPPING_X86_CSV
++// Within a 256-byte tile even its very last delimiter fits in one byte.
++// Extract newline bits in separator order. In a well-formed event stream
++// every seventh separator must be LF, regardless of field widths or quotes.
++struct OrdinalMasks { uint64_t separators, quotes, newlines; };
++
++template<size_t N> inline constexpr auto ordinal_newlines=[] {
++  std::array<uint64_t,N> out{};
++  for(unsigned phase=0;phase<N;++phase)
++    for(unsigned bit=0;bit<64;++bit)
++      if((phase+bit+1)%N==0)out[phase]|=uint64_t{1}<<bit;
++  return out;
++}();
++
++struct OrdinalFields {
++  const char *base;
++  const uint8_t *end;
++  Str operator[](size_t i) const {
++    unsigned first=uint8_t(end[std::ptrdiff_t(i)-1]+1),cut=end[i];
++    unsigned trim=base[first]=='"';
++    return {base+first+trim,cut-first-2*trim};
++  }
++  template<size_t N> operator std::array<Str,N>() const {
++    std::array<Str,N> row;
++    for(unsigned i=0;i<N;++i)row[i]=(*this)[i];
++    return row;
++  }
++};
++
++__attribute__((target("avx2,bmi,bmi2,popcnt,pclmul"),always_inline))
++inline OrdinalMasks ordinal_masks_avx2(const char *p){
++  auto a=row_mask32(p),b=row_mask32(p+32);
++  auto join=[](unsigned x,unsigned y){return uint64_t(x)|(uint64_t(y)<<32);};
++  auto lf=join(a.lf,b.lf);
++  return {join(a.comma,b.comma)|lf,join(a.quotes,b.quotes),lf};
++}
++
++__attribute__((target("avx512f,avx512bw"),always_inline))
++inline OrdinalMasks ordinal_masks_wide(const char *p){
++  auto text=_mm512_loadu_si512(p);
++  uint64_t lf=_mm512_cmpeq_epi8_mask(text,_mm512_set1_epi8('\n'));
++  return {lf|_mm512_cmpeq_epi8_mask(text,_mm512_set1_epi8(',')),
++          _mm512_cmpeq_epi8_mask(text,_mm512_set1_epi8('"')),lf};
++}
++
++inline constexpr auto byte_positions=[] {
++  std::array<uint64_t,256> table{};
++  for(unsigned mask=0;mask<256;++mask){
++    unsigned n=0;
++    for(unsigned i=0;i<8;++i)if(mask&(1u<<i))table[mask]|=uint64_t(i)<<(8*n++);
++  }
++  return table;
++}();
++
++template<bool lookup>
++__attribute__((target("avx2,bmi,bmi2,popcnt,pclmul"),always_inline))
++inline void ordinal_positions(uint8_t *out,unsigned base,uint64_t sep){
++  if constexpr(lookup){
++    for(unsigned i=0;i<64;i+=8){
++      uint8_t marks=uint8_t(sep);sep>>=8;
++      uint64_t positions=byte_positions[marks]+uint64_t(base+i)*0x0101010101010101ULL;
++      std::memcpy(out,&positions,8);out+=std::popcount(marks);
++    }
++  }else{
++    while(sep){*out++=uint8_t(base+std::countr_zero(sep));sep&=sep-1;}
++  }
++}
++
++__attribute__((target("avx512f,avx512bw,avx512vbmi2"),always_inline))
++inline void ordinal_positions_wide(uint8_t *out,unsigned base,uint64_t sep){
++  alignas(64) static constexpr auto seq=[] {
++    std::array<uint8_t,64> out{};
++    for(unsigned i=0;i<64;++i)out[i]=uint8_t(i);
++    return out;
++  }();
++  auto offsets=_mm512_add_epi8(_mm512_load_si512(seq.data()),_mm512_set1_epi8(char(base)));
++  _mm512_storeu_si512(out,_mm512_maskz_compress_epi8(sep,offsets));
++}
++
++#define ORDINAL_USE_WIDE 0
++#define ORDINAL_READER ordinal_rows
++#define ORDINAL_TARGET "avx2,bmi,bmi2,popcnt,pclmul"
++#include "ordinal_loop.inc"
++#undef ORDINAL_TARGET
++#undef ORDINAL_READER
++#undef ORDINAL_USE_WIDE
++#define ORDINAL_USE_WIDE 1
++#define ORDINAL_READER ordinal_wide_rows
++#define ORDINAL_TARGET "avx2,bmi,bmi2,popcnt,pclmul,avx512f,avx512bw,avx512vbmi2"
++#include "ordinal_loop.inc"
++#undef ORDINAL_TARGET
++#undef ORDINAL_READER
++#undef ORDINAL_USE_WIDE
++#endif
+--- /dev/null
++++ b/cpp/ordinal_loop.inc
+@@ -0,0 +1,53 @@
++// Instantiate the same grammar and emission loop with each runtime-checked ISA.
++template<size_t N,bool Lookup,class F>
++__attribute__((target(ORDINAL_TARGET))) void ORDINAL_READER(Str data,F &fn){
++  alignas(64) std::array<uint8_t,1+256+64> positions;
++  positions[0]=255;
++  auto *cuts=positions.data()+1;
++  while(data.size()>=256){
++    const char *p=data.data();
++    OrdinalMasks m[4];
++    for(unsigned b=0;b<4;++b){
++#if ORDINAL_USE_WIDE
++      m[b]=ordinal_masks_wide(p+b*64);
++#else
++      m[b]=ordinal_masks_avx2(p+b*64);
++#endif
++    }
++    unsigned blocks=4;
++    while(blocks && !m[blocks-1].newlines)--blocks;
++    if(!blocks){
++      auto lf=data.find('\n',256),n=lf==Str::npos?data.size():lf+1;
++      scalar_rows<N>(data.substr(0,n),fn);data.remove_prefix(n);continue;
++    }
++    unsigned length=64u*blocks-std::countl_zero(m[blocks-1].newlines);
++    uint64_t tail=mask_to(length-(blocks-1)*64);
++    m[blocks-1].separators&=tail;m[blocks-1].quotes&=tail;
++    uint64_t inside=0,prev=1,invalid=0;
++    unsigned nc=0;
++    for(unsigned b=0;b<blocks;++b){
++      auto [sep,q,lf]=m[b];
++      auto count=unsigned(std::popcount(sep));
++      uint64_t want=ordinal_newlines<N>[nc%N]&mask_to(count);
++      invalid|=_pext_u64(lf,sep)^want;
++      uint64_t parity=quote_prefix(q)^inside;
++      uint64_t next=b+1<blocks?(m[b+1].separators&1):1;
++      invalid|=((q&parity)&~((sep<<1)|prev))|((q&~parity)&~((sep>>1)|(next<<63)))|(sep&parity);
++      inside=uint64_t(0)-(parity>>63);prev=sep>>63;
++#if ORDINAL_USE_WIDE
++      ordinal_positions_wide(cuts+nc,b*64,sep);
++#else
++      ordinal_positions<Lookup>(cuts+nc,b*64,sep);
++#endif
++      nc+=count;
++    }
++    if(invalid || inside || nc%N){
++      tiled_lines<N,16>(data.substr(0,length),fn);
++    }else{
++      for(unsigned i=0;i<nc;i+=N){OrdinalFields row{p,cuts+i};fn(row);}
++    }
++    data.remove_prefix(length);
++  }
++  tiled_lines<N,16>(data,fn);
++}
++
+--- a/cpp/output.hpp
++++ b/cpp/output.hpp
+@@ -3,7 +3,7 @@
+   Key user;
+   int32_t day;
+   int64_t sessions, events, revenue;
+-  std::optional<Str> category;
++  const Str *category{};
+ };
+ struct Counts {
+   int64_t sessions{}, purchases{}, revenue{}, assists{};
+--- /dev/null
++++ b/cpp/quote_certificate.hpp
+@@ -0,0 +1,58 @@
++#pragma once
++#ifdef SHOPPING_X86_CSV
++__attribute__((target("avx2,pclmul"),always_inline)) inline uint64_t quote_prefix(uint64_t q){
++  auto value=_mm_cvtsi64_si128(std::bit_cast<int64_t>(q));
++  return uint64_t(_mm_cvtsi128_si64(_mm_clmulepi64_si128(value,_mm_set1_epi64x(-1),0)));
++}
++inline bool csv_separator(char c){return c==',' || c=='\n';}
++__attribute__((target("avx2,pclmul"),always_inline)) inline bool
++certify_quotes(const char *start,size_t n){
++  uint64_t inside=0,previous=1,invalid=0;
++  for(size_t i=0;i<n;i+=64){
++    const char *p=start+i;unsigned used=unsigned(std::min<size_t>(64,n-i));
++    alignas(32) char tail[64]{};
++    if(used<64){std::memcpy(tail,p,used);p=tail;}
++    auto a=_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
++    auto b=_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p+32));
++    auto join=[](__m256i x,__m256i y) __attribute__((target("avx2"),always_inline)) {
++      return uint64_t(unsigned(_mm256_movemask_epi8(x)))|(uint64_t(unsigned(_mm256_movemask_epi8(y)))<<32);
++    };
++    auto quote=_mm256_set1_epi8('"'),comma=_mm256_set1_epi8(','),lf=_mm256_set1_epi8('\n');
++    uint64_t q=join(_mm256_cmpeq_epi8(a,quote),_mm256_cmpeq_epi8(b,quote));
++    uint64_t sep=join(_mm256_or_si256(_mm256_cmpeq_epi8(a,comma),_mm256_cmpeq_epi8(a,lf)),
++                      _mm256_or_si256(_mm256_cmpeq_epi8(b,comma),_mm256_cmpeq_epi8(b,lf)));
++    uint64_t parity=quote_prefix(q)^inside;
++    auto opening=q&parity,closing=q&~parity;
++    uint64_t next=(i+64<n)?uint64_t(csv_separator(start[i+64])):uint64_t(1);
++    invalid|=(opening&~((sep<<1)|previous)) | (closing&~((sep>>1)|(next<<63))) | (sep&parity);
++    inside=uint64_t(0)-(parity>>63);previous=sep>>63;
++  }
++  return !(invalid|inside);
++}
++template<size_t N,class F>
++__attribute__((target("avx2,bmi,popcnt"),always_inline)) inline void
++split_certified(const char *p,unsigned len,const char *end,F &fn) {
++  if(len>=128 || end-p<128){split_known_line<N>(p,len,end,fn);return;}
++  auto marks=[&](unsigned at) __attribute__((target("avx2,bmi,popcnt"),always_inline)) {
++    auto comma=_mm256_set1_epi8(',');
++    auto a=_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p+at));
++    auto b=_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p+at+32));
++    return (uint64_t(unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a,comma))))|
++            (uint64_t(unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b,comma))))<<32))&mask_to(len-at);
++  };
++  uint64_t lo=marks(0),hi=len>64?marks(64):0;
++  if(std::popcount(lo)+std::popcount(hi)!=N-1)return;
++  std::array<Str,N> row;
++  unsigned from=0;
++  for(unsigned i=0;i<N;++i){
++    unsigned cut=len;
++    if(i+1<N){
++      if(lo){cut=std::countr_zero(lo);lo&=lo-1;}
++      else{cut=64+std::countr_zero(hi);hi&=hi-1;}
++    }
++    unsigned q=p[from]=='"';
++    row[i]=Str(p+from+q,cut-from-2*q);from=cut+1;
++  }
++  fn(row);
++}
++#endif

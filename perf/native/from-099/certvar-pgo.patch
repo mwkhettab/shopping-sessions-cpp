@@ -1,0 +1,489 @@
+--- /dev/null
++++ b/cpp/certified_masks.hpp
+@@ -0,0 +1,78 @@
++#pragma once
++#ifdef SHOPPING_X86_CSV
++#include "certified_prefix.hpp"
++template<unsigned Bytes> struct CertifiedCsvTile {
++  static_assert(Bytes%64==0 && Bytes<65536);
++  std::array<uint64_t,Bytes/64+3> commas;
++  std::array<uint16_t,Bytes> ends;
++  unsigned lines=0;
++  __attribute__((target("avx2,bmi,popcnt,pclmul"),always_inline)) inline bool scan(Str tile){
++    lines=0;uint64_t inside=0,previous=1,invalid=0;size_t block=0;
++    for(size_t i=0;i<tile.size();i+=64,++block){
++      const char *p=tile.data()+i;
++      alignas(32) char tail[64]{};
++      if(tile.size()-i<64){std::memcpy(tail,p,tile.size()-i);p=tail;}
++      auto a=row_mask32(p),b=row_mask32(p+32);
++      auto join=[](unsigned x,unsigned y){return uint64_t(x)|(uint64_t(y)<<32);};
++      uint64_t lf=join(a.lf,b.lf),q=join(a.quotes,b.quotes);
++      commas[block]=join(a.comma,b.comma);
++      uint64_t sep=commas[block]|lf;
++      uint64_t parity=quote_prefix(q)^inside;
++      uint64_t next=i+64<tile.size()?csv_separator(tile[i+64]):1;
++      invalid|=((q&parity)&~((sep<<1)|previous))|((q&~parity)&~((sep>>1)|(next<<63)))|(sep&parity);
++      inside=uint64_t(0)-(parity>>63);previous=sep>>63;
++      while(lf){ends[lines++]=uint16_t(i+std::countr_zero(lf));lf&=lf-1;}
++    }
++    commas[block]=commas[block+1]=0;
++    return !(invalid|inside);
++  }
++  uint64_t shifted(unsigned block,unsigned off)const{
++    return off?(commas[block]>>off)|(commas[block+1]<<(64-off)):commas[block];
++  }
++};
++template<size_t N,unsigned Size,class F>
++__attribute__((target("avx2,bmi,popcnt,pclmul"))) void
++certified_masks(Str data,F &fn){
++  CertifiedCsvTile<Size> tile;
++  while(data.size()>=128) {
++    auto requested=std::min<size_t>(Size,data.size());
++    auto last=data.substr(0,requested).rfind('\n');
++    if(last==Str::npos){
++      last=data.find('\n',requested);
++      auto bytes=last==Str::npos?data.size():last+1;
++      scalar_rows<N>(data.substr(0,bytes),fn);data.remove_prefix(bytes);continue;
++    }
++    Str piece=data.substr(0,last+1);
++    bool okay=tile.scan(piece);
++    unsigned from=0;
++    for(unsigned i=0;i<tile.lines;++i){
++      const unsigned to=tile.ends[i],len=to-from;const char *p=piece.data()+from;
++      if(!okay || len>=128){split_known_line<N>(p,len,data.data()+data.size(),fn);from=to+1;continue;}
++      unsigned block=from/64,shift=from%64;
++      uint64_t lo=tile.shifted(block,shift)&mask_to(len),hi=len>64?(tile.shifted(block+1,shift)&mask_to(len-64)):0;
++      from=to+1;
++      if(std::popcount(lo)+std::popcount(hi)!=N-1)continue;
++      if constexpr(requires {fn.common(p,8u,p,8u,Str{},Str{});}){
++        // Prefix predictions read a bounded lookahead within the current input chunk.
++        if(data.data()+data.size()-p>=128){
++          uint64_t ql=0;
++          if(prefix_certified_event(p,len,lo,hi,ql,fn))continue;
++        }
++      }
++      std::array<Str,N> fields;unsigned start=0;
++      for(unsigned k=0;k<N;++k){
++        unsigned cut=len;
++        if(k+1<N){
++          if(lo){cut=std::countr_zero(lo);lo&=lo-1;}
++          else{cut=64+std::countr_zero(hi);hi&=hi-1;}
++        }
++        unsigned q=p[start]=='"';
++        fields[k]=Str(p+start+q,cut-start-2*q);start=cut+1;
++      }
++      fn(fields);
++    }
++    data.remove_prefix(piece.size());
++  }
++  line_csv_rows<N>(data,fn);
++}
++#endif
+--- /dev/null
++++ b/cpp/certified_prefix.hpp
+@@ -0,0 +1,42 @@
++#pragma once
++struct CsvPrefix {
++  uint64_t commas{}, quotes{}, range{};
++  uint8_t start_id{}, id_width{}, start_user{}, user_width{}, start_time{}, time_width{}, count{};
++};
++constexpr auto csv_prefixes() {
++  std::array<std::array<std::array<CsvPrefix,21>,7>,4> table{};
++  for(unsigned ew:{8u,9u})for(unsigned uw:{8u,9u})
++  for(unsigned q0=0;q0<2;++q0) for(unsigned q1=0;q1<2;++q1)
++    for(unsigned q2=0;q2<2;++q2) for(unsigned w:{13u,20u,25u}){
++      const unsigned c0=ew+2*q0,c1=c0+1+uw+2*q1,c2=c1+1+w+2*q2;
++      auto bit=[](unsigned i){return uint64_t{1}<<i;};
++      uint64_t quotes=(q0?(bit(0)|bit(c0-1)):0) |
++                       (q1?(bit(c0+1)|bit(c1-1)):0) |
++                       (q2?(bit(c1+1)|bit(c2-1)):0);
++      table[c0-8][c1-17][c2-31]={bit(c0)|bit(c1)|bit(c2),quotes,bit(c2+1)-1,
++        uint8_t(q0),uint8_t(ew),uint8_t(c0+1+q1),uint8_t(uw),uint8_t(c1+1+q2),uint8_t(w),uint8_t(2*(q0+q1+q2))};
++    }
++  return table;
++}
++inline constexpr auto csv_prefix_table=csv_prefixes();
++template<class F>
++__attribute__((target("avx2,bmi,popcnt,pclmul"),always_inline)) inline bool
++prefix_certified_event(const char *p,unsigned len,uint64_t lo,uint64_t hi,uint64_t ql,F &fn) {
++  auto a=lo&(uint64_t{15}<<8), b=lo&(uint64_t{127}<<17), c=lo&(((uint64_t{1}<<21)-1)<<31);
++  if(!a||!b||!c)return false;
++  unsigned c0=std::countr_zero(a),c1=std::countr_zero(b),c2=std::countr_zero(c);
++  const CsvPrefix &prefix=csv_prefix_table[c0-8][c1-17][c2-31];
++  if(!prefix.range || (lo&prefix.range)!=prefix.commas)return false;
++  unsigned id_start=prefix.start_id;
++  if(unsigned(p[0]=='"')!=id_start || unsigned(p[c0+1]=='"')!=prefix.start_user-(c0+1) ||
++     unsigned(p[c1+1]=='"')!=prefix.start_time-(c1+1))return false;
++  unsigned s3=c2+1,q3=p[s3]=='"',c3=s3+20+2*q3,s4=c3+1,q4=p[s4]=='"',c4=s4+4+2*q4;
++  unsigned c5=hi?127u-std::countl_zero(hi):63u-std::countl_zero(lo);
++  if(c4>=c5 || p[c3]!=',' || p[c4]!=',')return false;
++  const char *kind=p+s4+q4;
++  if((std::memcmp(kind,"view",4)!=0 && std::memcmp(kind,"cart",4)!=0) ||
++     c5-(c4+1)<=2u*(p[c4+1]=='"'))return false;
++  const char *id=p+id_start,*user=p+prefix.start_user;
++  Str ts(p+prefix.start_time,prefix.time_width),ingest(p+s3+q3,20);
++  return fn.common(id,prefix.id_width,user,prefix.user_width,ts,ingest);
++}
+--- a/cpp/input.hpp
++++ b/cpp/input.hpp
+@@ -147,8 +147,17 @@
+ #endif
+ #include "csv_x86.hpp"
+ #include "line_csv.hpp"
++#include "line_tile.hpp"
++#include "certified_masks.hpp"
+ template <size_t N, class F> void parse_rows(Str data, F &&callback) {
+ #ifdef SHOPPING_X86_CSV
++  if constexpr(N==7)if(wide_csv_supported() && __builtin_cpu_supports("pclmul")){
++    certified_masks<N,1024>(data,callback);return;
++  }
++  if (N == 7 && wide_csv_supported()) {
++    tiled_lines<N, 16>(data, callback);
++    return;
++  }
+   if (wide_csv_supported()) { line_csv_rows<N>(data,callback); return; }
+   if (wide_csv_supported()) {
+     wide_csv_rows<N>(data, callback);
+--- /dev/null
++++ b/cpp/line_tile.hpp
+@@ -0,0 +1,125 @@
++#pragma once
++// Find line endings in small groups; both the delimiter count and all
++// surrounding quotes are checked before a field reaches the event validator.
++#ifdef SHOPPING_X86_CSV
++inline uint64_t mask_to(unsigned n) {
++  return n >= 64 ? ~uint64_t{} : (uint64_t{1} << n) - 1;
++}
++template <size_t N, class F>
++__attribute__((target("avx2,bmi,popcnt"), always_inline)) inline void
++split_known_line(const char *p, size_t len, const char *end, F &fn) {
++  if (len >= 128 || end - p < 128) {
++    scalar_rows<N>(Str(p, len), fn);
++    return;
++  }
++  uint64_t lo, hi = 0, ql, qh = 0;
++  auto get = [&](unsigned at, uint64_t &commas,
++                 uint64_t &quotes) __attribute__((target("avx2,bmi,popcnt"),
++                                                  always_inline)) {
++    auto a = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(p + at));
++    auto b = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(p + at + 32));
++    auto comma = _mm256_set1_epi8(','), quote = _mm256_set1_epi8('"');
++    uint64_t c0 = unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, comma)));
++    uint64_t q0 = unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, quote)));
++    uint64_t c1 = unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, comma)));
++    uint64_t q1 = unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, quote)));
++    auto mask = mask_to(unsigned(len) - at);
++    commas = (c0 | (c1 << 32)) & mask;
++    quotes = (q0 | (q1 << 32)) & mask;
++  };
++  get(0, lo, ql);
++  if (len > 64)
++    get(64, hi, qh);
++  if (size_t(std::popcount(lo) + std::popcount(hi)) != N - 1)
++    return;
++  std::array<Str, N> fields;
++  unsigned start = 0, wrapped = 0;
++  for (unsigned i = 0; i < N; ++i) {
++    unsigned cut = unsigned(len);
++    if (i + 1 < N) {
++      if (lo) {
++        cut = std::countr_zero(lo);
++        lo &= lo - 1;
++      } else {
++        cut = 64 + std::countr_zero(hi);
++        hi &= hi - 1;
++      }
++    }
++    unsigned width = cut - start;
++    bool quotes = width >= 2 && ((p[start] == '"') & (p[cut - 1] == '"'));
++    wrapped += 2 * quotes;
++    fields[i] = {p + start + quotes, width - 2 * quotes};
++    start = cut + 1;
++  }
++  if (wrapped == unsigned(std::popcount(ql) + std::popcount(qh)))
++    fn(fields);
++}
++
++template <size_t N, unsigned Batch, class F>
++__attribute__((target("avx2,bmi,popcnt"))) void tiled_lines(Str data, F &fn) {
++  size_t from = 0, scan = 0;
++  std::array<size_t, Batch> ends;
++  unsigned n = 0;
++  auto flush = [&]() __attribute__((target("avx2,bmi,popcnt"), always_inline)) {
++    for (unsigned i = 0; i < n; ++i) {
++      auto to = ends[i];
++      split_known_line<N>(data.data() + from, to - from,
++                          data.data() + data.size(), fn);
++      from = to + 1;
++    }
++    n = 0;
++  };
++  auto lf = _mm256_set1_epi8('\n');
++  for (; scan + 32 <= data.size(); scan += 32) {
++    auto v = _mm256_loadu_si256(
++        reinterpret_cast<const __m256i *>(data.data() + scan));
++    auto mask = unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, lf)));
++    while (mask) {
++      ends[n++] = scan + std::countr_zero(mask);
++      mask &= mask - 1;
++      if (n == Batch)
++        flush();
++    }
++  }
++  if (n)
++    flush();
++  if (from < data.size())
++    line_csv_rows<N>(data.substr(from), fn);
++}
++#include "quote_certificate.hpp"
++template <size_t N, unsigned Batch, class F>
++__attribute__((target("avx2,bmi,popcnt,pclmul"))) void certified_lines(Str data, F &fn) {
++  size_t from = 0, scan = 0;
++  std::array<size_t, Batch> ends;
++  unsigned n = 0;
++  auto flush = [&]() __attribute__((target("avx2,bmi,popcnt,pclmul"), always_inline)) {
++    auto decode=[&](unsigned first,unsigned stop,bool okay) __attribute__((target("avx2,bmi,popcnt,pclmul"),always_inline)){
++      for(unsigned k=first;k<stop;++k){
++        auto last=ends[k];auto len=last-from;
++        if(okay && len<128)split_certified<N>(data.data()+from,unsigned(len),data.data()+data.size(),fn);
++        else split_known_line<N>(data.data()+from,len,data.data()+data.size(),fn);
++        from=last+1;
++      }
++    };
++    bool okay=certify_quotes(data.data()+from,ends[n-1]+1-from);
++    decode(0,n,okay);
++    n = 0;
++  };
++  auto lf = _mm256_set1_epi8('\n');
++  for (; scan + 32 <= data.size(); scan += 32) {
++    auto v = _mm256_loadu_si256(
++        reinterpret_cast<const __m256i *>(data.data() + scan));
++    auto mask = unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, lf)));
++    while (mask) {
++      ends[n++] = scan + std::countr_zero(mask);
++      mask &= mask - 1;
++      if (n == Batch)
++        flush();
++    }
++  }
++  if (n)
++    flush();
++  if (from < data.size())
++    line_csv_rows<N>(data.substr(from), fn);
++}
++#endif
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -6,6 +6,11 @@
+ #include <regex>
+ #include <span>
+ 
++template<class Generic,class Common> struct EventCallbacks {
++  Generic generic;
++  Common common;
++  template<class Row> void operator()(const Row &row){generic(row);}
++};
+ size_t bucket(Key k) { return k.hash() % shards; }
+ #include "event_layout.hpp"
+ struct RevisionIndex {
+@@ -233,7 +238,7 @@
+       auto &v = result.spend[k];
+       if (v > best || (v == best && cat.categories[k] < *daily.category)) {
+         best = v;
+-        daily.category = cat.categories[k];
++        daily.category = &cat.categories[k];
+       }
+       v = 0;
+     }
+@@ -715,18 +720,7 @@
+           });
+           return;
+         }
+-        rows<7>(events[job].body(), [&](auto &r) {
+-          if (r[0].empty())
+-            return;
+-          Time ingest = ingest_time(r[3]);
+-          // Invalid revisions still take part in earliest-ingest selection.
+-          Key id = workers[t].pool.encode(r[0], 'e');
+-          Event e = validate(r, ingest, cat, window);
+-#ifdef SHOPPING_DIAGNOSTICS
+-          ++workers[t].revisions;
+-          workers[t].valid_events += e.ts != bad;
+-#endif
+-          Key user = e.ts == bad ? Key{} : workers[t].pool.encode(r[1], 'u');
++        auto put=[&](Key id, Key user, Event e, Time ingest) {
+           auto &w = workers[t];
+           uint64_t location = 0;
+           if (user.bits) {
+@@ -752,7 +746,41 @@
+             w.extended.push_back({seconds, location});
+           }
+           w.candidates[bucket(id)].push_back(ref);
+-        });
++        };
++        auto generic_event=[&](auto const &r) __attribute__((noinline)) {
++          if(r[0].empty())return;
++          auto &w=workers[t];
++          Time ingest=ingest_time(r[3]);
++          Key id=w.pool.encode(r[0],'e');
++          Event e=validate(r,ingest,cat,window);
++#ifdef SHOPPING_DIAGNOSTICS
++          ++w.revisions;
++          w.valid_events+=e.ts!=bad;
++#endif
++          Key user=e.ts==bad?Key{}:w.pool.encode(r[1],'u');
++          put(id,user,e,ingest);
++        };
++        auto common_event=[&](const char *id,unsigned id_width,const char *user,unsigned user_width,Str event_time,Str arrival) {
++          if constexpr(sizeof(uintptr_t)!=8 || std::endian::native!=std::endian::little)return false;
++          if(id[0]!='e' || user[0]!='u')return false;
++          auto load=[](const char *p,unsigned n){
++            const uint64_t mask=UINT64_MAX>>(8*(9-n));
++            return little_word(p+1)&mask;
++          };
++          auto event_word=load(id,id_width),user_word=load(user,user_width);
++          if((event_word|user_word)>>63 || !id[id_width-1] || !user[user_width-1])return false;
++          Time ingest=ingest_time(arrival),ts=timestamp(event_time);
++          bool good=ts>=window.start && ts<window.end && ingest-ts<=day_ms;
++#ifdef SHOPPING_DIAGNOSTICS
++          ++workers[t].revisions;
++          workers[t].valid_events+=good;
++#endif
++          put(Key{uintptr_t(permute_key(event_word)<<1)},good?Key{uintptr_t(permute_key(user_word)<<1)}:Key{},
++              Event{good?ts:bad,0,0},ingest);
++          return true;
++        };
++        auto callbacks=EventCallbacks{generic_event,common_event};
++        rows<7>(events[job].body(),callbacks);
+       });
+   timer.mark("concurrent input, raw user partition and revision index");
+ #ifdef SHOPPING_DIAGNOSTICS
+@@ -769,8 +797,13 @@
+   resolve_revisions(workers, threads, anchor);
+   timer.mark("global event dedup and loser removal");
+   std::vector<Result> results(threads);
+-  for (auto &result : results)
++  size_t rows_hint =
++      std::min<size_t>(event_count / 8, (size_t(512) << 20) / sizeof(UserDay)) /
++      threads;
++  for (auto &result : results) {
++    result.users.reserve(rows_hint);
+     result.configure(window, cat, threads);
++  }
+   process_people(workers, results, cat, threads, timer, layout);
+   fs::create_directories(output / "user_daily");
+   fs::create_directories(output / "campaign_daily");
+@@ -779,13 +812,35 @@
+                     ("part-" + std::to_string(i) + ".parquet"),
+                 results[i].users);
+   });
+-  Totals merged;
+-  for (auto &r : results)
+-    r.merge_into(merged);
+   std::vector<CampaignDay> campaigns;
+-  for (auto &[key, c] : merged)
+-    campaigns.push_back(
+-        {cat.campaigns[key.first], cat.channels[key.first], key.second, c});
++  auto append = [&](size_t id, int32_t day, const Counts &c) {
++    campaigns.push_back({cat.campaigns[id], cat.channels[id], day, c});
++  };
++  const auto &first = results.front();
++  if (!first.table.empty()) {
++    for (size_t start = 0; start < first.table.size();
++         start += first.campaigns) {
++      int32_t day = first.first_day + int32_t(start / first.campaigns);
++      for (size_t id = 0; id < first.campaigns; ++id) {
++        Counts c{};
++        for (const auto &r : results) {
++          const auto &part = r.table[start + id];
++          c.sessions += part.sessions;
++          c.purchases += part.purchases;
++          c.revenue += part.revenue;
++          c.assists += part.assists;
++        }
++        if (c.sessions || c.assists)
++          append(id, day, c);
++      }
++    }
++  } else {
++    Totals merged;
++    for (auto &r : results)
++      r.merge_into(merged);
++    for (auto &[key, c] : merged)
++      append(key.first, key.second, c);
++  }
+   write_campaigns(output / "campaign_daily" / "part-0.parquet", campaigns);
+   timer.mark("merge and Parquet output");
+ #ifdef SHOPPING_DIAGNOSTICS
+--- a/cpp/output.hpp
++++ b/cpp/output.hpp
+@@ -3,7 +3,7 @@
+   Key user;
+   int32_t day;
+   int64_t sessions, events, revenue;
+-  std::optional<Str> category;
++  const Str *category{};
+ };
+ struct Counts {
+   int64_t sessions{}, purchases{}, revenue{}, assists{};
+--- /dev/null
++++ b/cpp/quote_certificate.hpp
+@@ -0,0 +1,58 @@
++#pragma once
++#ifdef SHOPPING_X86_CSV
++__attribute__((target("avx2,pclmul"),always_inline)) inline uint64_t quote_prefix(uint64_t q){
++  auto value=_mm_cvtsi64_si128(std::bit_cast<int64_t>(q));
++  return uint64_t(_mm_cvtsi128_si64(_mm_clmulepi64_si128(value,_mm_set1_epi64x(-1),0)));
++}
++inline bool csv_separator(char c){return c==',' || c=='\n';}
++__attribute__((target("avx2,pclmul"),always_inline)) inline bool
++certify_quotes(const char *start,size_t n){
++  uint64_t inside=0,previous=1,invalid=0;
++  for(size_t i=0;i<n;i+=64){
++    const char *p=start+i;unsigned used=unsigned(std::min<size_t>(64,n-i));
++    alignas(32) char tail[64]{};
++    if(used<64){std::memcpy(tail,p,used);p=tail;}
++    auto a=_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
++    auto b=_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p+32));
++    auto join=[](__m256i x,__m256i y) __attribute__((target("avx2"),always_inline)) {
++      return uint64_t(unsigned(_mm256_movemask_epi8(x)))|(uint64_t(unsigned(_mm256_movemask_epi8(y)))<<32);
++    };
++    auto quote=_mm256_set1_epi8('"'),comma=_mm256_set1_epi8(','),lf=_mm256_set1_epi8('\n');
++    uint64_t q=join(_mm256_cmpeq_epi8(a,quote),_mm256_cmpeq_epi8(b,quote));
++    uint64_t sep=join(_mm256_or_si256(_mm256_cmpeq_epi8(a,comma),_mm256_cmpeq_epi8(a,lf)),
++                      _mm256_or_si256(_mm256_cmpeq_epi8(b,comma),_mm256_cmpeq_epi8(b,lf)));
++    uint64_t parity=quote_prefix(q)^inside;
++    auto opening=q&parity,closing=q&~parity;
++    uint64_t next=(i+64<n)?uint64_t(csv_separator(start[i+64])):uint64_t(1);
++    invalid|=(opening&~((sep<<1)|previous)) | (closing&~((sep>>1)|(next<<63))) | (sep&parity);
++    inside=uint64_t(0)-(parity>>63);previous=sep>>63;
++  }
++  return !(invalid|inside);
++}
++template<size_t N,class F>
++__attribute__((target("avx2,bmi,popcnt"),always_inline)) inline void
++split_certified(const char *p,unsigned len,const char *end,F &fn) {
++  if(len>=128 || end-p<128){split_known_line<N>(p,len,end,fn);return;}
++  auto marks=[&](unsigned at) __attribute__((target("avx2,bmi,popcnt"),always_inline)) {
++    auto comma=_mm256_set1_epi8(',');
++    auto a=_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p+at));
++    auto b=_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p+at+32));
++    return (uint64_t(unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a,comma))))|
++            (uint64_t(unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b,comma))))<<32))&mask_to(len-at);
++  };
++  uint64_t lo=marks(0),hi=len>64?marks(64):0;
++  if(std::popcount(lo)+std::popcount(hi)!=N-1)return;
++  std::array<Str,N> row;
++  unsigned from=0;
++  for(unsigned i=0;i<N;++i){
++    unsigned cut=len;
++    if(i+1<N){
++      if(lo){cut=std::countr_zero(lo);lo&=lo-1;}
++      else{cut=64+std::countr_zero(hi);hi&=hi-1;}
++    }
++    unsigned q=p[from]=='"';
++    row[i]=Str(p+from+q,cut-from-2*q);from=cut+1;
++  }
++  fn(row);
++}
++#endif

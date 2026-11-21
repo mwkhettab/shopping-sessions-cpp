@@ -9,7 +9,7 @@ from pathlib import Path
 import pyarrow.parquet as pq
 from random_rules import clock, parsed, oracle, day, gap, reach, user_cols, camp_cols, event_cols, click_cols
 
-def make(data):
+def make(data, widths=False):
     start=parsed('2032-02-28T00:00:00Z')
     stop=start+5*day
     (data/'manifest.json').write_text(json.dumps({'window_start':clock(start),'window_end':clock(stop)}))
@@ -20,12 +20,14 @@ def make(data):
         return ','.join('"'+s+'"' if (mask>>i)&1 else s for i,s in enumerate(row))
     ev=[];cl=[];ln=[]
     suffixes=['12345678','abcdefgh','  0<>@ %','abcdef\x00A','ABCDEFβ','1234567\x7f','1234567\x00','extra space','ré']
+    if widths:
+        suffixes=['1234567','abcdefg','    xy ','ABCD\x00EF','ABCDEβ','abcdef\x7f','abcdef\x00',*suffixes]
     for mask in range(128):
         for form in range(3):
             for variant in range(7):
                 n=(mask*3+form)*7+variant
                 owner='u'+suffixes[n%len(suffixes)]
-                key='e'+format(n,'08x')
+                key='e'+format(n,'07x' if widths and (mask+form+variant)%2 else '08x')
                 ms=start+(n%79)*gap+1000*(n%3)
                 stamp=(str(ms+int(variant==4)),clock(ms),clock(ms,330))[form]
                 # Every combination gets valid and invalid earliest revisions.
@@ -56,13 +58,17 @@ def make(data):
     return oracle(data,start,stop,prod,camps)
 
 def main(binaries):
+    for widths in (False,True):
+        verify(binaries,widths)
+    print('Both ID-width populations, 128 quote masks, three clock forms, invalid revisions, cross-user duplicates and malformed lines matched independent scalar results',flush=True)
+
+def verify(binaries,widths):
     with tempfile.TemporaryDirectory() as tmp:
-        data=Path(tmp);refs=make(data)
+        data=Path(tmp);refs=make(data,widths)
         for i,binary in enumerate(binaries):
             out=data/('result'+str(i))
             subprocess.run([binary,data,out],check=True,env=os.environ|{'NCPU':'8'})
             for name,cols,ref in zip(('user_daily','campaign_daily'),(user_cols,camp_cols),refs):
                 got=[tuple(row[c] for c in cols) for path in (out/name).glob('*.parquet') for row in pq.read_table(path,columns=cols).to_pylist()]
                 if sorted(got)!=ref:raise AssertionError((binary,name,len(got),len(ref)))
-    print('128 quote masks, three clock forms, invalid revisions, cross-user duplicates and malformed lines matched independent scalar results',flush=True)
 if __name__=='__main__':main(sys.argv[1:])
