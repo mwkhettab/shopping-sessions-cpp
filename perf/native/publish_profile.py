@@ -10,6 +10,16 @@ def emit(title, message):
     print(f'::notice file=BENCHMARKS.md,line=1,title={title}::{text}',flush=True)
 
 for root in map(Path,sys.argv[1:]):
+    # GitHub displays ten annotations per step. Lead with full release images
+    # from each runner and aggregate their other conclusions separately.
+    for report in sorted(root.rglob('all-notes.json')):
+        notes=json.loads(report.read_text())
+        images=[x for x in notes if x.startswith(('Image selection','Image binary','Image optimized binary','Docker fixture binary','Docker practice','Docker final','Docker holdout'))]
+        if images:emit('Release images '+report.parent.name,' || '.join(images)[:4000])
+    for report in sorted(root.rglob('all-notes.json')):
+        notes=json.loads(report.read_text())
+        keep=[re.sub(r' {2,}',' ',x) for x in notes if x.startswith(('Release pairs','Population structure','ThreadSanitizer','20M process PMU','Sampled branch-misses','Sampled cache-misses'))]
+        if keep:emit('Paired comparisons and profiles '+report.parent.name,' || '.join(keep)[:4000])
     for source in root.rglob('source-lines*.txt'):
         folder=source.parent
         records=[]
@@ -35,10 +45,3 @@ for root in map(Path,sys.argv[1:]):
     for report in root.rglob('cpu-samples.txt'):
         rows=[line.strip()[:135] for line in report.read_text(errors='replace').splitlines() if re.match(r'\s*[0-9.]+%',line)]
         if rows:emit('Top CPU symbols '+report.parent.name,' / '.join(rows[:9]))
-    for report in root.rglob('all-notes.json'):
-        notes=json.loads(report.read_text())
-        for title,fields in [('Images',('Image selection','Image binary','Image optimized binary','Docker fixture binary','Docker practice','Docker final','Docker holdout')),
-                             ('Release pairs',('Release pairs',)),('Population and race checks',('Population structure','ThreadSanitizer')),
-                             ('Hardware counters',('20M process PMU',)),('Misses',('Sampled branch-misses','Sampled cache-misses'))]:
-            selected=[re.sub(r' {2,}',' ',x) for x in notes if x.startswith(fields)]
-            if selected:emit(title,' || '.join(selected)[:4000])
