@@ -1,1 +1,1 @@
-base fin-slabkey-pgo shipresident-pgo resordinal-pgo ordmarklane-pgo ordrichlane-pgo ordmodtags-pgo ordtagwords-pgo ordctrlavx2-pgo ordmodavx2-pgo rawalias64-pgo rawindex16-pgo seciso-pgo secfullord-pgo @best
+base shipresident-pgo cleanorddual-pgo cleanordwide-pgo resordinal-pgo bwmasks-pgo bwmarks-pgo bwnibbles-pgo bwgather-pgo bwsplit-pgo trainauto-pgo trainlimited-pgo trainboth-pgo trainpartial-pgo @best

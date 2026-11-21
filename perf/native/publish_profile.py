@@ -18,6 +18,12 @@ for root in map(Path,sys.argv[1:]):
         if images:emit('Release images '+report.parent.name,' || '.join(images)[:4000])
     for report in sorted(root.rglob('all-notes.json')):
         notes=json.loads(report.read_text())
+        calibration=[x for x in notes if x.startswith('Cross-profile ')]
+        if calibration:emit('Compiler training by CPU capability '+report.parent.name,' || '.join(calibration)[:4100])
+        balance=[x for x in notes if x.startswith('Per-worker tail ')]
+        if balance:emit('Per-worker CPU and stage drain '+report.parent.name,' || '.join(balance)[:4100])
+        minimum=[x for x in notes if x.startswith('Minimum Intel ISA ')]
+        if minimum:emit('AVX-512F and BW reader audit '+report.parent.name,' || '.join(minimum)[:3000])
         keep=[re.sub(r' {2,}',' ',x) for x in notes if x.startswith(('Release pairs','Population structure','ThreadSanitizer','20M process PMU','Sampled branch-misses','Sampled cache-misses','Input probe'))]
         if keep:emit('Paired comparisons and profiles '+report.parent.name,' || '.join(keep)[:4000])
         phase=[x for x in notes if x.startswith(('Reader CPU by input','Process boundaries','Revision storage','Phase PMU','Phase clock diagnostic'))]

@@ -175,6 +175,15 @@ def main():
                 run(unit)
             if name in ('rawcopy16-pgo','rawindex16-pgo','rawalias64-pgo'):
                 run(python,root/'perf/native/dest_oracle.py',binary)
+            if name.startswith('bw') and isa_ok and 'avx512bw' in flags and 'avx512f' in flags:
+                for check in (('bw_positions_test.cpp','bw_ordinal_dialect.cpp') if name=='bwnibbles-pgo' else ('bw_ordinal_dialect.cpp',)):
+                    run(compiler,'-std=c++20','-O2','-fsanitize=undefined','-fno-sanitize-recover=all','-I',src/'cpp',root/'perf/native'/check,'-o',unit)
+                    run(unit)
+                from compatible_readers import summarize as check_isa
+                note('Minimum Intel ISA '+name,check_isa(binary))
+            if name.startswith('cleanord') and isa_ok:
+                run(compiler,'-std=c++20','-O2','-fsanitize=undefined','-fno-sanitize-recover=all','-I',src/'cpp',root/'perf/native/ordinal16_test.cpp','-o',unit)
+                run(unit)
             binaries.append(binary)
         except (subprocess.CalledProcessError,OSError) as exc:
             if name in ('base',release_control): raise
@@ -309,6 +318,8 @@ def main():
                 proc=subprocess.run([src/'build/shopping-profile',data,temp],env=env|{'PROFILE':'1'},capture_output=True,text=True,check=True)
                 (outcomes/'profile.txt').write_text(proc.stderr)
                 note('Profile '+best.name,' '.join(proc.stderr.splitlines()[-12:])[-1150:])
+        from cross_training_checks import compare as check_training
+        check_training(root,area,scale,[b.name for b in binaries],run,note)
         if scale in ('final', 'holdout'):
             from native_images import verify_images
             if scale=='final':
@@ -354,6 +365,9 @@ def main():
     for name in dict.fromkeys([practice_winner, *[b for b in candidates if (b.startswith("pipe") or b in ("destslab-pgo","destpages-pgo","resdest-pgo","flatgroup-pgo","trimunmap-pgo","bands32sparse-pgo","rawindex16-pgo"))]]):
         if (area / "bin" / name).is_file():
             race(root,area,name,note,run,env)
+
+    from worker_tail import execute as per_worker
+    per_worker(root,area/'shipresident-pgo',[(k,area/k,area/(k+'-oracle')) for k in ('practice','holdout')],'g++-12',env,True,run,note,outcomes)
 
     from release_input_costs import collect as isolated_release_input
     isolated_release_input(root,area,note,run,env)
