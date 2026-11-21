@@ -70,6 +70,12 @@ int main(int argc,char** argv) {
     assert(!::operator new(max,std::nothrow));
     bool threw=false;try {auto* impossible=::operator new(max);::operator delete(impossible);} catch(const std::bad_alloc&){threw=true;}
     assert(threw);
+    struct HandlerFailure {};
+    const auto prior=std::set_new_handler([]{throw HandlerFailure{};});
+    bool called=false;
+    try {auto* impossible=::operator new(max);::operator delete(impossible);} catch(const HandlerFailure&){called=true;}
+    assert(called && !::operator new(max,std::nothrow));
+    std::set_new_handler(prior);
     auto* unprotected=anon(8*HP);
     for(unsigned i=0;i<8;++i) unprotected[i*HP]=42;
     for(std::size_t t=0;t<NT;++t) writers[t]=std::thread([t]{release_heap_part(t,NT);});

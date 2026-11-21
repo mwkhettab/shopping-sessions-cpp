@@ -5,6 +5,7 @@
 using namespace pipeline;
 int main(int argc,char** argv) {
     if(argc!=4) return 2;
+    if (std::getenv("SESSION_OUTPUT_REGION")) sys::alloc_enable();
     const std::string shape=argv[1],mode=argv[2];const bool nonempty=shape=="filled";
     G g;g.nt=4;g.nd=3;g.nc=3;g.day0=20000;g.row_cap=32000;g.ukey=111;g.check=true;g.ucap=100;
     std::array<u16,100> users{};g.utab=users.data();

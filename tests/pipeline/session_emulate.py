@@ -3,6 +3,7 @@ import argparse
 import os
 from pathlib import Path
 import re
+import platform
 import subprocess
 import tempfile
 
@@ -38,12 +39,13 @@ def main():
         (path / 'events_fast.hpp').write_text(header)
         source = (HERE / 'session_runs.cpp').read_text().replace('../../cpp/pipeline/', '')
         (path / 'run.cpp').write_text(source)
-        flags = ['-O1', '-g', '-fsanitize=address,undefined', '-fno-omit-frame-pointer'] if opts.sanitize else ['-O2']
+        sanitizer = 'undefined' if platform.system() == 'Darwin' else 'address,undefined'
+        flags = ['-O1', '-g', '-fsanitize='+sanitizer, '-fno-sanitize-recover=all', '-fno-omit-frame-pointer'] if opts.sanitize else ['-O2']
         subprocess.run([os.getenv('CXX', 'c++'), '-std=c++20', *flags, '-Wno-psabi', '-Wno-pass-failed',
                         '-DSESSION_TEST_FAST', '-I', str(path), '-I', str(PIPE), '-I', str(HERE), '-I', str(simde),
                         str(path/'run.cpp'), '-o', str(path/'run')], check=True)
         for pattern in range(5):
-            subprocess.run([str(path/'run'), str(pattern)], check=True)
+            subprocess.run([str(path/'run'), str(pattern)], check=True, timeout=45)
 
 
 if __name__ == '__main__':
