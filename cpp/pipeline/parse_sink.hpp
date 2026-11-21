@@ -81,11 +81,25 @@ template<class G,class T> struct Ctx {
     [[gnu::noinline]] void ev_flush() {
         const auto n=std::exchange(eb.n,0); if(!n) return;
         t.n_ev_rows+=n;
-        const EvP p{g.ing_base,g.ws,g.wlen,g.ukey,g.ekey,g.ucap,g.ecap,tb.prod.data(),t.ev.lines_ptr()};
-        const auto [regular,special,bad]=u64(TS_BAD)-u64(p.ing_base)>=ING_MAX*1000 ? ev_vec<false>(eb,out,n,p) : ev_vec<true>(eb,out,n,p);
-        if(bad) sys::fallback("ingest_ts bad or out of range");
-        t.ev.push_many(regular,n,out.ob.data(),out.lp.data(),out.rec.data());
-        for(auto m=special;m;m&=m-1) ev_one(eb.row(std::countr_zero(m)));
+        constexpr bool packed=requires{t.ev.sink_bucket();};
+        EvP p{g.ing_base,g.ws,g.wlen,g.ukey,g.ekey,g.ucap,g.ecap,tb.prod.data(),t.ev.lines_ptr()};
+        if constexpr(packed) {p.ucap=std::min(p.ucap,R12_USER_LIMIT);p.sinkb=t.ev.sink_bucket();}
+        const auto masks=u64(TS_BAD)-u64(p.ing_base)>=ING_MAX*1000
+            ? ev_vec<false,packed>(eb,out,n,p) : ev_vec<true,packed>(eb,out,n,p);
+        if(masks.bad_ingest) sys::fallback("ingest_ts bad or out of range");
+        if constexpr(packed) {
+            const auto sink=std::uintptr_t(p.lines)+p.sinkb*R12_STAGE;
+            for(auto m=masks.purchases&masks.regular;m;m&=m-1) {
+                const auto i=std::countr_zero(m);
+                const auto cat=p.ptab[std::min<std::size_t>(u32(eb.pp[i]),PBOUND)];
+                const auto [q,x]=out.rec[i];
+                t.ev.defer(out.ob[i],std::rotl(x,32)|(u64(cat)<<4),q&R12_MASK);
+                out.ob[i]=p.sinkb;out.lp[i]=sink;
+            }
+            t.ev.push_encoded(n,out.ob.data(),out.lp.data(),out.rec.data());
+            t.ev.flush_escapes();
+        } else t.ev.push_many(masks.regular,n,out.ob.data(),out.lp.data(),out.rec.data());
+        for(auto m=masks.special;m;m&=m-1) ev_one(eb.row(std::countr_zero(m)));
     }
     [[gnu::noinline]] void ck_one(const ClRow& r) {
         const auto rel=u64(r.ts)-u64(g.cbase);

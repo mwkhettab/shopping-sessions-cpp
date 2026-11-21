@@ -2,6 +2,7 @@
 #include "k_free.hpp"
 #include "links.hpp"
 #include "parse_links.hpp"
+#include "input_release.hpp"
 #include <charconv>
 #include <fstream>
 #include <numeric>
@@ -87,20 +88,26 @@ template<class G> void stage1(G& g,std::size_t tid){
 #endif
     auto& t=g.t(tid);
     if(PARTS_READY.load(std::memory_order_relaxed)){t.ev.set_arena(g.ev_arena);t.us.set_arena(g.us_arena);}
-    else{t.ev=Part(g.ev_arena,g.nb);t.us=Part(g.us_arena,g.nub);}
+    else{t.ev=std::remove_cvref_t<decltype(t.ev)>(g.ev_arena,g.nb);t.us=Part(g.us_arena,g.nub);}
     if(!CORE_READY.load(std::memory_order_relaxed))t.core=core::Core(g.nc,g.nd,g.row_cap,g.ws_mod,g.day0);
     auto eb=std::make_unique<EvBatch>();auto cb=std::make_unique<CkBatch>();auto out=std::make_unique<Out>();const auto& tb=tabs(g);
     const bool use_rd=d.rd && FDS.size()==g.files.size();auto* rb=use_rd?sys::anon(d.rd+8192)+4096:nullptr;
-    const auto& [q,nckl]=work_queue(g);bool us_open=true;links::Scratch sc;
+    const auto& [q,nckl]=work_queue(g);
+    static InputRelease pages(q.size(),env_size("XL_RELK",SHOP_INPUT_RELEASE_GROUP),env_size("XL_FRLAG",32));
+    const bool grouped=RELEASE && pages.grouped();
+    auto done=[&](std::size_t i) {
+        pages.finish(g.files,q,i,[&](auto a,auto b){sys::release(g.region+a,b-a);});
+    };
+    bool us_open=true;links::Scratch sc;
     for(;;){if(d.st2q&&!us_open)while(links::job(g,t,sc)){}
         const auto i=g.qnext.fetch_add(1,std::memory_order_relaxed);
         if(us_open&&i>=nckl){us_open=false;t.us.finish();if(g.ccap)ckix::flush(out->pd,g.csr);links::us_finished(g,out->pd.end,d.st2q);if(d.st2q)while(links::job(g,t,sc)){};}
         if(i>=q.size())break;const auto& c=q[i];const auto& f=g.files[c.file];
-        if(use_rd&&FDS[c.file]>=0){chunk_rd(g,t,*eb,*cb,*out,tb,tid,f,c,FDS[c.file],rb,d.rd);continue;}
+        if(use_rd&&FDS[c.file]>=0){chunk_rd(g,t,*eb,*cb,*out,tb,tid,f,c,FDS[c.file],rb,d.rd);if(grouped)done(i);continue;}
         std::string_view data(reinterpret_cast<const char*>(g.region+f.off),f.len);
-        const auto s=c.a==f.hdr?c.a:next_line_start(data,c.a-1),e=c.b>=f.len?f.len:next_line_start(data,c.b-1);if(s>=e)continue;
+        const auto s=c.a==f.hdr?c.a:next_line_start(data,c.a-1),e=c.b>=f.len?f.len:next_line_start(data,c.b-1);if(s>=e){if(grouped)done(i);continue;}
         parse_buf(g,t,*eb,*cb,*out,tb,tid,f,data.substr(s,e-s),s);
-        if(RELEASE)sys::release(g.region+f.off+s,e-s);
+        if(grouped) done(i);else if(RELEASE) sys::release(g.region+f.off+s,e-s);
     }
     t.ev.finish();if(d.st2q)for(;;){if(links::job(g,t,sc))continue;if(links::done(g))break;sys::spin_loop();}
     if(rb)::madvise(rb-4096,d.rd+8192,MADV_DONTNEED);

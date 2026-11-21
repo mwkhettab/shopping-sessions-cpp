@@ -10,6 +10,9 @@
 #include <string_view>
 #include <tuple>
 #include <vector>
+#if SHOP_R12_SCATTER
+#include "events_packet12.hpp"
+#endif
 
 namespace pipeline::events {
 inline constexpr auto relaxed = std::memory_order_relaxed;
@@ -142,6 +145,9 @@ inline void slab_settle(core::Core& c) {
 }
 inline void scatter_chunk(const Rec* p,std::size_t n,Rec* slots,u64 gen,const i8* nextc) {
     auto put=[&](const Rec& r){
+#if SHOP_R12_SCATTER
+        scatter_record(r,slots,gen);
+#else
         auto& s=slots[r.w1&(BSIZE-1)];
         if (u16(s.w1)!=u16(r.w1+gen) || ((r.w1>>16)&ING_MAX)<((s.w1>>16)&ING_MAX)) {
 #if defined(__x86_64__)
@@ -151,6 +157,7 @@ inline void scatter_chunk(const Rec* p,std::size_t n,Rec* slots,u64 gen,const i8
             s={r.w0,r.w1+gen};
 #endif
         }
+#endif
     };
     constexpr std::size_t link_off=4032;
     __builtin_prefetch(reinterpret_cast<const void*>(reinterpret_cast<std::uintptr_t>(nextc)+link_off));
@@ -277,13 +284,19 @@ template<class G> void stage3a_old(const G& g,std::size_t tid) {
         const auto ta=clock::now();
         std::memset(slots,255,BSIZE*sizeof(Rec));
         bool any=false;
-        for (std::size_t th=0;th<g.nt;++th) g.t(th).ev.for_each(b,[&](auto records){
-            any=true;
-            for (auto r:records) {
+        for (std::size_t th=0;th<g.nt;++th) {
+            auto put=[&](Rec r) {
+                any=true;
                 auto& s=slots[r.w1&(BSIZE-1)];
                 if (((r.w1>>16)&ING_MAX)<((s.w1>>16)&ING_MAX)) s=r;
-            }
-        });
+            };
+            const auto& part=g.t(th).ev;
+#if SHOP_R12_SCATTER
+            if constexpr(requires{part.for_each_rec(b,put);}) part.for_each_rec(b,put);
+            else
+#endif
+                part.for_each(b,[&](auto records){for(auto r:records) put(r);});
+        }
         auto& info=g.edges[b];
         info.n=0;
         if (!any) continue;

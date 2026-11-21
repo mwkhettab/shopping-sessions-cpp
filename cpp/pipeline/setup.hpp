@@ -32,6 +32,9 @@ template<class OnMap> Chain map_inputs(const std::vector<Input>& all,bool parall
         chain.bytes[std::size_t(f.kind)]+=f.len;chain.files.push_back({f.kind,off,f.len,SIZE_MAX});if(parallel)parse::set_fd(i,fd);else parse::keep_fd(fd);
         mapped(f.kind,file_view(chain,chain.files.back()));off+=padded(f.len);
     }
+    const auto advice=parse::env_size("XL_IOADV",SHOP_INPUT_ADVICE);
+    if(advice==1 || advice==2)
+        ::madvise(chain.region,off,advice==2?MADV_SEQUENTIAL:MADV_RANDOM);
     sys::lap("s.mmap");return chain;
 }
 inline void make_queue(Chain& c,std::size_t nt){auto size=std::clamp<std::size_t>((c.bytes[0]+c.bytes[1]+c.bytes[2])/(nt*16),64u<<10,2u<<20);
@@ -87,12 +90,12 @@ inline std::unique_ptr<G> setup_par(std::string_view dir,std::size_t nt,bool che
     auto click_sample=[&]{if(cbytes.done.load(std::memory_order_acquire) && !ctaken.exchange(true,std::memory_order_acq_rel)){keyrec::Sample s;s.add_click_lines(cbytes.get(),4000);crows.set(std::move(s.clicks));}};
     auto sample_piece=[&](auto j){keyrec::Sample sample;sample.add_event_lines(piece(sbytes.get(),j,ks),5000);spieces[j].set(std::move(sample));};
     const auto upart=sys::SETUP_PARTS.load(std::memory_order_relaxed);const auto q_ord=2+kp,q_merge=3+kp,q_part=4+kp,q_core=q_part+(upart?1:0),nq=q_core+nt;
-    std::vector<Slot<std::pair<parse::Part,parse::Part>>> parts(upart?nt:0);
+    std::vector<Slot<std::pair<parse::EventPart,parse::Part>>> parts(upart?nt:0);
     auto task=[&](std::size_t i){if(i==1)camps.set(campaigns(data));else if(i==0)ptxt.set(map_file(data/"products.csv"));
         else if(i<q_ord)pparts[i-2].set(products_part(piece(body(ptxt.get()),i-2,kp)));
         else if(i==q_ord){if(parse::pin_mode())(void)parse::cpu_order();}
         else if(i>=q_core){const auto nc=camps.get().nc;cores[i-q_core].set(core::Core(nc,nd,rowcap.get(),ws_mod,day0));}
-        else if(i==q_part){auto [nb,nub]=nbs.get();for(auto& p:parts)p.set(std::pair{parse::Part::new_unbound(nb),parse::Part::new_unbound(nub)});}
+        else if(i==q_part){auto [nb,nub]=nbs.get();for(auto& p:parts)p.set(std::pair{parse::EventPart::new_unbound(nb),parse::Part::new_unbound(nub)});}
         else if(i==q_merge){std::vector<std::optional<ProdPart>> pv;pv.reserve(kp);for(auto& s:pparts)pv.push_back(s.take());auto prod=products_merge(pv);auto& camp=camps.get().camp;
             parse::init_tabs_shared(prod.prod.data(),prod.prod.size(),camp.data(),camp.size());lookups.set(std::move(prod));}};
     auto help=[&]{click_sample();if(sbytes.done.load(std::memory_order_acquire)){for(;;){auto j=snext.fetch_add(1,std::memory_order_relaxed);if(j>=ks)break;sample_piece(j);}}

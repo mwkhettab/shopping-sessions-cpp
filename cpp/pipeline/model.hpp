@@ -1,13 +1,14 @@
 #pragma once
 #include "links_uf.hpp"
-#include "parse_part.hpp"
+#include "parse_event12.hpp"
 #include <memory>
 #include <tuple>
 #include <unordered_map>
 
 namespace pipeline {
 struct TState {
-    parse::Part ev,us;
+    parse::EventPart ev;
+    parse::Part us;
     std::vector<std::pair<u64,u32>> raws;
     std::vector<u8> rawbuf;
     std::vector<u64> odd_users;

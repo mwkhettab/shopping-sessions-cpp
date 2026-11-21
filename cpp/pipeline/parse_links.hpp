@@ -102,7 +102,7 @@ template<class C> PIPELINE_ROUTING_X64 LkMasks lk_packet(C& c,LkBatch& lb,std::s
         auto w0=_mm512_or_si512(splat8(u64{1}<<63),_mm512_or_si512(_mm512_slli_epi64(_mm512_and_si512(ua,splat8(UBSIZE-1)),43),_mm512_or_si512(_mm512_slli_epi64(aa,4),ab)));
         auto bucket=_mm512_srli_epi64(ua,UB),zero=_mm512_setzero_si512();
         _mm512_store_si512(c.out.rec.data()+j,_mm512_permutex2var_epi64(w0,even,zero));_mm512_store_si512(c.out.rec.data()+j+4,_mm512_permutex2var_epi64(w0,odd,zero));
-        _mm512_store_si512(c.out.ob.data()+j,bucket);_mm512_store_si512(c.out.lp.data()+j,_mm512_add_epi64(line,_mm512_slli_epi64(bucket,6)));
+        _mm512_store_si512(c.out.ob.data()+j,bucket);_mm512_store_si512(c.out.lp.data()+j,_mm512_add_epi64(line,mulu32_8(bucket,splat8(PART_STAGE_BYTES))));
         mask.regular|=u64(ok)<<j;mask.gen|=u64(ne&~ok)<<j;mask.decoded|=u64(ma&mb)<<j;
     }
     return mask;
@@ -132,7 +132,7 @@ template<class C> inline LkMasks lk_scalar(C& c,LkBatch& lb,std::size_t n) {
         if(!a || !b || a->first!=b->first) {m.gen|=u64{1}<<i;continue;}
         const u64 u=a->first,ub=u>>UB;
         c.out.rec[i]={(u64{1}<<63)|((u&(UBSIZE-1))<<43)|(u64(a->second)<<4)|b->second,0};
-        c.out.ob[i]=ub;c.out.lp[i]=std::uintptr_t(c.t.us.lines_ptr())+(ub<<6);m.regular|=u64{1}<<i;
+        c.out.ob[i]=ub;c.out.lp[i]=std::uintptr_t(c.t.us.lines_ptr())+ub*PART_STAGE_BYTES;m.regular|=u64{1}<<i;
     }
     return m;
 }

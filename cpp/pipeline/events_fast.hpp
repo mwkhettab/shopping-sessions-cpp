@@ -385,13 +385,21 @@ struct Walk {
 template<class T> inline std::size_t pass_a(Fast& fx,T& worker,u64 gen) {
     const auto inv=_mm512_set1_epi64(INVALID_TS),m16=_mm512_set1_epi64(65535),m15=_mm512_set1_epi64(15);
     const auto oddi=_mm512_setr_epi64(1,3,5,7,9,11,13,15),pmask=_mm512_set1_epi64(u64{0xffffff}<<9);
+#if SHOP_R12_SCATTER
+    const auto tags=_mm512_set1_epi64(gen);
+#else
     auto tags=_mm512_add_epi64(_mm512_setr_epi64(0,1,2,3,4,5,6,7),_mm512_set1_epi64(gen));
+#endif
     std::size_t k=0;
     auto step=[&](std::size_t blk) PIPELINE_EV_ATTR {
         const auto r0=get512(fx.slots+8*blk),r1=get512(fx.slots+8*blk+4);
         const auto w0=_mm512_permutex2var_epi64(r0,even64(),r1),w1=_mm512_permutex2var_epi64(r0,oddi,r1);
+#if SHOP_R12_SCATTER
+        const auto occ=_mm512_testn_epi64_mask(_mm512_xor_si512(w1,tags),m16);
+#else
         const auto occ=_mm512_testn_epi64_mask(_mm512_sub_epi64(w1,tags),m16);
         tags=_mm512_add_epi64(tags,_mm512_set1_epi64(8));
+#endif
         const auto ts=_mm512_srli_epi64(w0,33);
         const auto valid=_mm512_mask_cmpneq_epu64_mask(occ,ts,inv);
         const u8 odd=valid&_mm512_movepi64_mask(w1);
@@ -514,6 +522,15 @@ template<class G> void stage3a(const G& g,std::size_t tid,Pool* pool,const Share
         auto scatter=[&](const Rec* p,std::size_t n,const i8* next){any=true;scatter_chunk(p,n,fx.slots,gen,next);};
         for(std::size_t th=0;th<g.nt;++th) {
             const auto& part=g.t(th).ev;
+#if SHOP_R12_SCATTER
+            auto esc=[&](Rec record){any=true;scatter_record(record,fx.slots,gen);};
+            if constexpr(requires{part.for_each_esc(b,esc);}) {
+                part.for_each_chunk(b,[&](const u8* p,std::size_t n,const i8* next) PIPELINE_EV_ATTR {
+                    any=true;scatter_chunk12(p,n,fx.slots,gen,next);
+                });
+                part.for_each_esc(b,esc);
+            } else
+#endif
             if constexpr (requires{part.for_each_chunk(b,scatter);}) part.for_each_chunk(b,scatter);
             else part.for_each(b,[&](std::span<const Rec> records){
                 const i8* next=nullptr;

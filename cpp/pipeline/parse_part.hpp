@@ -31,14 +31,14 @@ inline bool popw() {
     return value;
 }
 
-struct alignas(64) Line { std::array<Rec, 4> rows; };
+struct alignas(64) Line { std::array<Rec, PART_STAGE_BYTES/sizeof(Rec)> rows; };
 
 class Part {
     struct alignas(64) Page {
         Rec rows[LINK_OFF / sizeof(Rec)];
         Page* next;
     };
-    static_assert(sizeof(Line) == 64 && sizeof(Page) == CHUNK);
+    static_assert(sizeof(Line) == PART_STAGE_BYTES && LINK_OFF%PART_STAGE_BYTES==0 && sizeof(Page)==CHUNK);
     static_assert(offsetof(Page, next) == LINK_OFF);
     std::vector<Line> lines_;
     std::vector<u8> fill_;
@@ -56,7 +56,7 @@ class Part {
     explicit Part(std::size_t nb)
         : lines_(nb), fill_(nb + 64), cur_(nb, LINK_OFF),
           nch_(nb), n_(nb), head_(nb), populate_(popw()),
-          pend_(72 * sizeof(Line) / sizeof(u64)) {}
+          pend_(72) {}
 
     [[gnu::noinline]] std::uintptr_t new_chunk(std::size_t bucket, std::uintptr_t old) {
         if (block_ == block_end_) {
@@ -99,10 +99,13 @@ class Part {
     }
     template<bool Stream> __attribute__((target("avx512f"),always_inline))
     static inline void line_x86(std::uintptr_t address,const Line& line) {
-        auto value = _mm512_load_si512(&line);
-        auto *out = reinterpret_cast<__m512i*>(address);
-        if constexpr (Stream) _mm512_stream_si512(out,value);
-        else _mm512_store_si512(out,value);
+        auto* out=reinterpret_cast<__m512i*>(address);
+        const auto* in=reinterpret_cast<const __m512i*>(&line);
+        for(std::size_t i=0;i<PART_STAGE_BYTES/64;++i) {
+            const auto value=_mm512_load_si512(in+i);
+            if constexpr(Stream) _mm512_stream_si512(out+i,value);
+            else _mm512_store_si512(out+i,value);
+        }
     }
     template<bool Stream> __attribute__((target("avx512f")))
     void flush_one_x86(std::size_t b) {line_x86<Stream>(take_line(b),lines_[b]);}
@@ -161,7 +164,7 @@ public:
     inline void push(std::size_t bucket, u64 w0, u64 w1) {
         const auto offset = fill_[bucket];
         lines_[bucket].rows[offset / sizeof(Rec)] = {w0, w1};
-        if (offset == 48) {
+        if (offset + sizeof(Rec) == PART_STAGE_BYTES) {
             if (NT) flush_line<true>(bucket);
             else flush_line<false>(bucket);
         } else {
@@ -192,7 +195,7 @@ public:
             const auto b = std::size_t(buckets[i]);
             if constexpr(Indexed) note_ordinal(b,records[i][0]);
             unsigned offset = fill_[b];
-            if (offset == 64) {
+            if (offset == PART_STAGE_BYTES) {
                 flush_full(pending);
                 pending = 0;
                 offset = 0;
@@ -203,7 +206,7 @@ public:
             const auto next = unsigned(offset + sizeof(Rec));
             fill_[b] = u8(next);
             pend_[pending] = b;
-            pending += next >> 6;
+            pending += next == PART_STAGE_BYTES;
         };
         if (mask == (n >= 64 ? UINT64_MAX : (u64{1} << n) - 1)) {
             for (std::size_t i = 0; i < n; ++i) row(i);

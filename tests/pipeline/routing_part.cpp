@@ -33,7 +33,7 @@ int main() {
             for (unsigned j=0;j<n;++j) {
                 const auto b = rng()%buckets;
                 offsets[j] = b;
-                pointers[j] = reinterpret_cast<std::uintptr_t>(part.lines_ptr()+64*b);
+                pointers[j] = reinterpret_cast<std::uintptr_t>(part.lines_ptr()+parse::PART_STAGE_BYTES*b);
                 records[j] = {rng(),rng()};
                 if ((mask >> j) & 1) expected[b].push_back(records[j]);
             }

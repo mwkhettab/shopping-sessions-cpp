@@ -1,5 +1,6 @@
 #pragma once
 #include "ckix.hpp"
+#include "parse_event12.hpp"
 
 namespace pipeline::parse {
 struct alignas(64) Out {
@@ -12,6 +13,7 @@ struct EvP {
     u64 wlen, ukey, ekey, ucap, ecap;
     const u8* ptab;
     const u8* lines;
+    u64 sinkb{};
 };
 struct CkP {
     i64 cbase;
@@ -20,11 +22,11 @@ struct CkP {
     std::optional<std::pair<u64,u64>> crange;
     const u8* lines;
 };
-struct EvMasks { u64 regular, special; bool bad_ingest; };
+struct EvMasks { u64 regular, special; bool bad_ingest; u64 purchases{}; };
 struct CkMasks { u64 regular, special; };
 
-template<bool CheckBad> inline EvMasks ev_scalar(const EvBatch& eb, Out& out, std::size_t n,const EvP& p) {
-    u64 regular=0;
+template<bool CheckBad,bool Packed=false> inline EvMasks ev_scalar(const EvBatch& eb, Out& out, std::size_t n,const EvP& p) {
+    u64 regular=0,purchases=0;
     bool bad=false;
     for(std::size_t i=0;i<n;++i) {
         const u64 ing=u64(eb.ing[i])-u64(p.ing_base),rel=u64(eb.ts[i])-u64(p.ws);
@@ -36,16 +38,26 @@ template<bool CheckBad> inline EvMasks ev_scalar(const EvBatch& eb, Out& out, st
         const bool normal=eb.uid[i]<=keyrec::MASK && user<p.ucap && alias<NALIAS;
         const u64 event=keyrec::unscramble(eb.eid[i],p.ekey);
         const bool evok=eb.eid[i]<=keyrec::MASK && event<p.ecap;
-        if(evok && (!valid || normal)) regular |= u64{1}<<i;
+        const bool keep=evok && (!valid || normal);
+        if(keep) regular |= u64{1}<<i;
         u64 word0=valid ? (rel<<33)|(price<<9)|alias : UINT64_MAX;
-        if(valid && price) word0 |= u64(p.ptab[std::min<std::size_t>(u32(eb.pp[i]),PBOUND)])<<4;
+        if(valid && price) {
+            if constexpr(Packed) purchases|=u64{1}<<i;
+            else word0|=u64(p.ptab[std::min<std::size_t>(u32(eb.pp[i]),PBOUND)])<<4;
+        }
         // This multiply is exact on the supported ingest interval.
         const u64 ing_s=(u64(u32(ing))*274877907ull)>>38;
-        out.rec[i]={word0,(event&(BSIZE-1))|(ing_s<<16)|((valid?user:0)<<37)};
-        out.ob[i]=event>>BB;
-        out.lp[i]=u64(std::uintptr_t(p.lines))+(out.ob[i]<<6);
+        const auto word1=(event&(BSIZE-1))|(ing_s<<16)|((valid?user:0)<<37);
+        if constexpr(Packed) {
+            out.rec[i]={word1|((valid?alias:0)<<59),std::rotl(word0,32)};
+            out.ob[i]=keep?event>>BB:p.sinkb;
+        } else {
+            out.rec[i]={word0,word1};
+            out.ob[i]=event>>BB;
+        }
+        out.lp[i]=u64(std::uintptr_t(p.lines))+out.ob[i]*(Packed?R12_STAGE:PART_STAGE_BYTES);
     }
-    return {regular,~regular&active_mask(n),bad};
+    return {regular,~regular&active_mask(n),bad,purchases};
 }
 template<bool Ranged,bool ModeA> inline CkMasks ck_scalar(const CkBatch& cb, Out& out, std::size_t n,const CkP& p) {
     u64 regular=0,keep=0;
@@ -60,13 +72,13 @@ template<bool Ranged,bool ModeA> inline CkMasks ck_scalar(const CkBatch& cb, Out
             regular |= u64{1}<<i;
         out.rec[i]={id|((user&(UBSIZE-1))<<43),(rel<<32)|(camp<<4)|alias};
         out.ob[i]=user>>UB;
-        out.lp[i]=u64(std::uintptr_t(p.lines))+(out.ob[i]<<6);
+        out.lp[i]=u64(std::uintptr_t(p.lines))+out.ob[i]*PART_STAGE_BYTES;
     }
     return {regular,keep & ~regular};
 }
 
 #if defined(__x86_64__)
-template<bool CheckBad,bool Ifma>
+template<bool CheckBad,bool Ifma,bool Packed=false>
 PIPELINE_ROUTING_X64 inline EvMasks ev_packet(const EvBatch& eb,Out& out,std::size_t n,const EvP& p) {
     const auto user_key=splat8(p.ukey&keyrec::MASK), event_key=splat8(p.ekey&keyrec::MASK);
     const auto even=_mm512_setr_epi64(0,8,1,9,2,10,3,11),odd=_mm512_setr_epi64(4,12,5,13,6,14,7,15);
@@ -100,16 +112,23 @@ PIPELINE_ROUTING_X64 inline EvMasks ev_packet(const EvBatch& eb,Out& out,std::si
                      _mm512_or_si512(_mm512_slli_epi64(ins,16),_mm512_slli_epi64(userv,37)));
         auto ok=__mmask8(~(valid & ~normal) & evok);
         auto bucket=_mm512_srli_epi64(v,BB);
+        if constexpr(Packed) {
+            const auto q=_mm512_or_si512(word1,_mm512_slli_epi64(_mm512_maskz_mov_epi64(valid,alias),59));
+            word1=_mm512_rol_epi64(word0,32);
+            word0=q;
+            bucket=_mm512_mask_blend_epi64(ok,splat8(p.sinkb),bucket);
+        }
         _mm512_store_si512(out.rec.data()+j,_mm512_permutex2var_epi64(word0,even,word1));
         _mm512_store_si512(out.rec.data()+j+4,_mm512_permutex2var_epi64(word0,odd,word1));
         _mm512_store_si512(out.ob.data()+j,bucket);
-        _mm512_store_si512(out.lp.data()+j,_mm512_add_epi64(_mm512_slli_epi64(bucket,6),splat8(std::uintptr_t(p.lines))));
+        _mm512_store_si512(out.lp.data()+j,_mm512_add_epi64(mulu32_8(bucket,splat8(Packed?R12_STAGE:PART_STAGE_BYTES)),splat8(std::uintptr_t(p.lines))));
         badb |= u64(bad)<<j;
         purchases |= u64(pm)<<j;
         regular |= u64(ok)<<j;
     }
     auto active=active_mask(n);
     purchases &= active;
+    if constexpr(Packed) return {regular&active,~regular&active,(badb&active)!=0,purchases};
     while(purchases) {
         const auto i=std::countr_zero(purchases);
         purchases &= purchases-1;
@@ -156,7 +175,7 @@ PIPELINE_ROUTING_X64 inline CkMasks ck_packet(const CkBatch& cb,Out& out,std::si
         _mm256_store_si256(reinterpret_cast<__m256i*>(out.rec.data()+j),_mm256_permutex2var_epi64(o0,even,o1));
         _mm256_store_si256(reinterpret_cast<__m256i*>(out.rec.data()+j+2),_mm256_permutex2var_epi64(o0,odd,o1));
         _mm256_store_si256(reinterpret_cast<__m256i*>(out.ob.data()+j),bucket);
-        _mm256_store_si256(reinterpret_cast<__m256i*>(out.lp.data()+j),_mm256_add_epi64(_mm256_slli_epi64(bucket,6),splat4(std::uintptr_t(p.lines))));
+        _mm256_store_si256(reinterpret_cast<__m256i*>(out.lp.data()+j),_mm256_add_epi64(_mm256_mul_epu32(bucket,splat4(PART_STAGE_BYTES)),splat4(std::uintptr_t(p.lines))));
         regular |= u64(ok)<<j;
         kept |= u64(keep)<<j;
     }
@@ -165,14 +184,14 @@ PIPELINE_ROUTING_X64 inline CkMasks ck_packet(const CkBatch& cb,Out& out,std::si
 }
 #endif
 
-template<bool CheckBad> inline EvMasks ev_vec(const EvBatch& eb,Out& out,std::size_t n,const EvP& p) {
+template<bool CheckBad,bool Packed=false> inline EvMasks ev_vec(const EvBatch& eb,Out& out,std::size_t n,const EvP& p) {
 #if defined(__x86_64__)
     if(routing_x64()) {
-        if(__builtin_cpu_supports("avx512ifma")) return ev_packet<CheckBad,true>(eb,out,n,p);
-        return ev_packet<CheckBad,false>(eb,out,n,p);
+        if(__builtin_cpu_supports("avx512ifma")) return ev_packet<CheckBad,true,Packed>(eb,out,n,p);
+        return ev_packet<CheckBad,false,Packed>(eb,out,n,p);
     }
 #endif
-    return ev_scalar<CheckBad>(eb,out,n,p);
+    return ev_scalar<CheckBad,Packed>(eb,out,n,p);
 }
 template<bool Ranged,bool ModeA>
 inline CkMasks ck_vec(const CkBatch& cb,Out& out,std::size_t n,const CkP& p) {

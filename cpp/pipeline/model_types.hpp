@@ -4,10 +4,17 @@
 #include <utility>
 
 namespace pipeline {
+#ifndef SHOP_PARTITION_STAGE_BYTES
+#define SHOP_PARTITION_STAGE_BYTES 192
+#endif
+namespace parse {
+inline constexpr std::size_t PART_STAGE_BYTES=SHOP_PARTITION_STAGE_BYTES;
+static_assert(PART_STAGE_BYTES==64 || PART_STAGE_BYTES==192);
+}
 using i32 = std::int32_t;
 using i16 = std::int16_t;
 using i8 = std::int8_t;
-inline constexpr u32 BB = 14, UB = 12;
+inline constexpr u32 BB = 15, UB = 12;
 inline constexpr std::size_t BSIZE = std::size_t{1} << BB, UBSIZE = std::size_t{1} << UB;
 inline constexpr u64 SPIN_US_DEFAULT = 400;
 inline constexpr i64 DAY_MS = 86400000;
