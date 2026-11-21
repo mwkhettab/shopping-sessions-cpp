@@ -1,4 +1,7 @@
 #pragma once
+#if SHOP_SPARSE_USER_OUTPUT
+#include "../out_clean.hpp"
+#endif
 #include "driver.hpp"
 #include "../pqw.hpp"
 
@@ -80,9 +83,13 @@ inline void write_campaigns(const fs::path &path,const Acc &acc,std::span<const 
     write_file(path,cols,Opts{},Method::stream(1<<20));
 }
 inline void clear_parquet(const fs::path &path) {
+#if SHOP_SPARSE_USER_OUTPUT
+    pipeline::out::clear_output_files(path);
+#else
     for(const auto &e:fs::directory_iterator(path))
         if(e.symlink_status().type()==fs::file_type::regular && e.path().extension()==".parquet")
             fs::remove(e.path());
+#endif
 }
 inline void run(const fs::path &data,const fs::path &out,std::size_t ncpu) {
     run_tables(data,ncpu,[&](const UserShards &rows,const Acc &acc,const DatesAndDimensions &dim,std::size_t nt) {

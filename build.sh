@@ -3,7 +3,7 @@ set -eu
 mkdir -p build
 compiler=${CXX:-c++}
 platform=$(uname -s)-$(uname -m)
-set -- -std=c++20 -O3 -DNDEBUG -pthread
+set -- -std=c++20 -O3 -DSHOP_SPARSE_USER_OUTPUT=1 -DNDEBUG -pthread
 paired_events=0
 if [ "${PAIRED_EVENT_KERNEL:-1}" = 1 ] && [ "$platform" = Linux-x86_64 ]; then
     paired_events=1

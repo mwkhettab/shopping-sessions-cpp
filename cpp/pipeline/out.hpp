@@ -7,6 +7,10 @@
 #include <numeric>
 #include <string>
 #include "pqw.hpp"
+#if SHOP_SPARSE_USER_OUTPUT
+#include "out_user_groups.hpp"
+#include "out_clean.hpp"
+#endif
 
 namespace pipeline::out {
 using Path=std::filesystem::path;
@@ -38,6 +42,12 @@ inline void write_rows(const View& v,std::size_t a,std::size_t b,const Path& pat
     try {write_file(path,cols,{},Method::stream(1<<20));}
     catch (const std::exception& e) {die(e.what());}
 }
+#if !SHOP_SPARSE_USER_OUTPUT
+struct WorkerUserOutput {
+    void add(const View& v,std::size_t a,std::size_t b,const Path& path,pqw::StrCol cats) {write_rows(v,a,b,path,cats);}
+    void finish() {}
+};
+#endif
 struct Strings {
     std::vector<u32> offsets{0};
     std::vector<u8> data;
@@ -109,6 +119,9 @@ inline std::pair<Path,Path> folders(const std::string& dir) {
     std::error_code err;std::filesystem::create_directories(ud,err);
     if(err) die("cannot create the output folders");
     std::filesystem::create_directories(cd,err);if(err) die("cannot create the output folders");
+#if SHOP_SPARSE_USER_OUTPUT
+    clear_output_files(ud);clear_output_files(cd);
+#endif
     return {ud,cd};
 }
 inline std::vector<Piece> cut(std::span<const Range> rows,std::size_t np) {
@@ -148,15 +161,17 @@ template<class G> void stage5(G& g,const std::string& dir) {
     auto pieces=cut(rows,2*g.nt);if(pieces.empty()) pieces.push_back({0,0,0});
     std::atomic<std::size_t> next{};
     sys::run_par(g.nt,[&](std::size_t){
+        WorkerUserOutput user;
         for (;;) {
             const auto i=next.fetch_add(1,std::memory_order_relaxed);
             if (!i) {
                 auto s=write_campaign_part(g,part(cd,0),0,g.nc+1);if (g.check) check_totals(g,s);
             } else if (i<=pieces.size()) {
                 const auto [t,a,b]=pieces[i-1];
-                write_rows(view(g.t(t).core),a,b,part(ud,i-1),cats.column());
-            } else return;
+                user.add(view(g.t(t).core),a,b,part(ud,i-1),cats.column());
+            } else break;
         }
+        user.finish();
     });
 }
 template<class G> void stage45(G& g,const std::string& dir) {
@@ -177,6 +192,7 @@ template<class G> void stage45(G& g,const std::string& dir) {
     const auto* mapped_input=g.region;
     std::atomic_bool rg_todo{REGION_UNMAP.load(relaxed) && rg_len && mapped_input};
     sys::run_par(nt,[&](std::size_t tid){
+        WorkerUserOutput user;
         complex::clicks_a(g,tid);ca_done.fetch_add(1,acqrel);
         complex::PScratch sc;
         for (;;) {
@@ -195,7 +211,7 @@ template<class G> void stage45(G& g,const std::string& dir) {
                 if (pq.load(relaxed)<np) {
                     const auto i=pq.fetch_add(1,relaxed);
                     if (i<np) {
-                        const auto [t,a,b]=pieces[i];write_rows(before[t],a,b,part(ud,i),cats.column());continue;
+                        const auto [t,a,b]=pieces[i];user.add(before[t],a,b,part(ud,i),cats.column());continue;
                     }
                 }
                 if (!done) {sys::spin_loop();continue;}
@@ -205,9 +221,10 @@ template<class G> void stage45(G& g,const std::string& dir) {
             if (i<nt) csum[i]=write_campaign_part(g,part(cd,i),ncp*i/nt,ncp*(i+1)/nt);
             else {
                 const auto t=i-nt;const auto v=view(g.t(t).core);
-                if(v.rows>before[t].rows || (!np && !t)) write_rows(v,before[t].rows,v.rows,part(ud,np+t),cats.column());
+                if(v.rows>before[t].rows || (!np && !t)) user.add(v,before[t].rows,v.rows,part(ud,np+t),cats.column());
             }
         }
+        user.finish();
     });
     if(g.check) {
         Totals total{};for(const auto& x:csum) for(unsigned k=0;k<4;++k) total[k]+=x[k];
