@@ -17,6 +17,22 @@ The entrant reported **0.88 s** for `BB-1F2F9464` at `25a940f0d0a8`. The entered
 
 The scorer entered `BB-3FCA75FD` in the final at **0.87 s**. Queue wait was 220 ms. This improved the prior official 0.99 s time by 12.1%. The entrant supplied these scores. The 0.99 s run reduced the previous best by 12.4%. The scorer marked the earlier `BB-BE7C95B8` as entered in the final with 3 ms queue wait. Its 1.13 s runtime was 32.7% lower than the previous 1.68 s best. Entries `BB-065C223B` and `BB-E8D93ABE` listed 41 ms and 105 ms of queue wait separately. Relative to `61e9ba6`, the 512-shard release decodes each field as its delimiter is encountered, raises the event and person shard count from 128 to 512, reserves identity storage from input size, and compares inline canonical IDs bytewise without a separate display-name vector. It also reserves Arrow builder capacity and uses unchecked numeric appends within that reservation. Its compiler flags, Dockerfile, global deduplication rules, session boundaries and attribution algorithm match the official baseline. Its official run was 0.03 s slower. Two submissions of the identical baseline pipeline differed by 0.02 s.
 
+## Release candidate with two CPU training paths
+
+The release processes eight CSV records together after validating their field boundaries and quote placement. The build trains both the automatically selected reader and the AVX2 reader with generated short and wide inputs. The executable selects its supported instructions at runtime. IDs, timestamps, product presence and purchase fields retain their original validation.
+
+On a Xeon 6975P-C with four pinned vCPUs, both Docker images read the same preloaded files, started fresh for each sample, and wrote both complete tables. The table gives the median time from process launch through exit. Seed 733 was held out when selecting the build.
+
+| Input | Official 0.87 s source | Two-path build | Faster pairs |
+| --- | ---: | ---: | ---: |
+| 20M, seed 23 | 0.981 s | **0.892 s** | 5/5 |
+| 60M, seed 47 | 3.055 s | **2.761 s** | 3/3 |
+| 60M, seed 733 | 3.029 s | **2.738 s** | 3/3 |
+
+The five candidate practice samples ranged from 0.883 to 0.898 s. On seed 733 its peak process RSS was 8,436.8 MiB. The same Debian executable capped at AVX2 took 0.9547 s against 0.9768 s at 20M, and 2.9791 s against 3.0369 s on seed 47. Capping instruction dispatch at AVX-512F/BW gave 0.9639 against 0.9853 s and 2.9452 against 3.0373 s respectively. These capped measurements share the physical 6975P-C. The competition supplies eight pinned vCPUs. [Native Linux qualification](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44926117266/job/136912466173)
+
+Both tables matched at every tested scale. The native release image passed all 36 fixtures, both published 1M tables, five independent edge suites and an 8,388,673-event single-alias input with conflicting revisions. Eight-worker ThreadSanitizer passed. A separate build of the same Git sources passed 24 scalar-oracle populations, the Nehalem fallback and exact 20M and 60M comparisons under a 7 GiB container limit. Its eight-worker 60M process reached 7,141.7 MiB RSS under x86 emulation. [Native Docker, race and stress checks](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44926117266/job/136912466173)
+
 ## Eight-row event decoding on native Intel
 
 The prototype transposes the verified CSV field boundaries of eight events. It identifies views and carts with nonempty products in one pass and then validates the original IDs and clocks. Purchases, other record shapes and irregular CSV retain their general parsers. Four pinned vCPUs, preloaded CSVs, fresh output directories and a fresh Docker process were used for each run.
@@ -57,6 +73,7 @@ These release builds use a single automatic compiler training pass per input lay
 | --- | --- | ---: | ---: | ---: | ---: |
 | [6973P-C](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44922707304/job/136901997278) | `ship8bw-pgo` | 1.088 → 0.995 s (5/5) | 3.469 → 3.141 s (3/3) | 3.413 → 3.216 s (3/3) | 8.29 GiB |
 | [Platinum 8370C](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44922707304/job/136901997630) | `ship8lean-pgo` | 1.389 → 1.274 s (5/5) | 4.254 → 3.985 s (3/3) | 4.278 → 4.005 s (3/3) | 8.31 GiB |
+| [6975P-C](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44922707304/job/136901997544) | `ship8bw-pgo` | 0.994 → 0.914 s (5/5) | 3.073 → 2.833 s (3/3) | 3.126 → 2.870 s (3/3) | 8.32 GiB |
 
 All clean decoders passed 36 fixtures and both published reference tables. Each selected Docker image passed five independent comparison suites, full output comparisons on all three populations, the 8,388,673-event single-alias stress case, and eight-worker ThreadSanitizer. On the 6973P-C the input and partitioning phase fell from 0.607 to 0.522 s. Deduplication took 0.093 s, grouping with singleton sessions 0.190 s, graph resolution 0.027 s, linked sessions 0.158 s, and the final merge and output close 0.007 s. User Parquet writes also occur during session processing. One-pass CSV markers, immutable scatter ordinals and segmented linked-session bins all finished behind the release selected on that runner. [Full timings and profiles](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44922707304/job/136901997278)
 
