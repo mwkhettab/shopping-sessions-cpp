@@ -69,6 +69,19 @@ Four instrumented rounds per host sampled every sixteenth work chunk. Four worke
 
 At 20M the sampling changed whole-process time by −0.5% and +0.4% relative to the shipping binary in the same rounds. At 60M the changes were +1.8% and +0.4%. The slowest worker's final flush and wait took at most 0.12 ms in the median round. [First Intel scanner and component profile](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44951545002/job/136990357949) · [Independent Intel repeat](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44951545002/job/136990358243)
 
+Three further four-vCPU Xeon 6975P-C runners compared calendar lookup changes and LLVM profile-guided builds against the corrected Clang release. Every variant passed the fixtures, the two published tables, 54 additional cases and the complete 20M and 60M comparisons. Each host ran nine warm practice pairs and five warm final-size pairs per variant. The table shows the range of median paired changes across hosts. [First Xeon](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44951898065/job/136991454551) · [Second Xeon](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44951898065/job/136991454751) · [Third Xeon](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44951898065/job/136991454762)
+
+| Build against corrected Clang | 20M paired change | 20M wins out of 27 | 60M paired change | 60M wins out of 15 |
+| --- | ---: | ---: | ---: | ---: |
+| Clang with shared event and ingest date lookup | +0.98% to +2.50% | 1 | +0.83% to +2.32% | 2 |
+| GCC with shared date lookup | +3.47% to +3.60% | 0 | +3.38% to +4.64% | 1 |
+| Clang with offline profile training | −0.72% to +0.44% | 15 | −1.25% to −0.02% | 10 |
+| Trained Clang with shared date lookup | +0.29% to +1.86% | 4 | +1.94% to +3.01% | 1 |
+
+The shared lookup removed 78,829 of 81,720 second lookups on a diagnostic input. Its extra comparisons increased elapsed time on all three hosts. Offline LLVM training used synthetic compact and general inputs and instrumented the native wide reader. The small observed differences did not establish a repeatable practice gain. The release keeps the original event calendar and unprofiled Clang build.
+
+An AMD EPYC 7763 runner exercised the portable reader with four storage alternatives. Writing events directly to partition pages gave a median paired change of −0.63% at 20M and −0.77% at 60M and won all 12 warm pairs. Indexing click ordinals reduced peak process RSS from 2,003.2 to 1,719.2 MiB at 60M. All four variants matched both large tables. [Portable storage comparison](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44951221273/job/136989342150)
+
 ## Partitioned C++ pipeline qualification
 
 The release sources at `faf1047c6cb00cc8099572f5e067d18076375571` decode batches of 64 rows, partition event revisions by ID, build a per-user click index, reconcile sessions across partition boundaries and write the two Parquet tables while processing the remaining people. The executable restarts on its general parser when an input exceeds the compact representation. The Linux build checks CPU features before entering each specialized instruction path.
