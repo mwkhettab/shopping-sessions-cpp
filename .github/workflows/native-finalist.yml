@@ -44,6 +44,12 @@ jobs:
           ref: dc216ac44dcaeb30ace2af3f2d2ff1d782ef78f0
           path: .acceptance/previous
           persist-credentials: false
+      - name: Check out the corrected GCC reference
+        uses: actions/checkout@v4
+        with:
+          ref: 5230d4835e1b2f9f6b48d1dc53319a3e2b658077
+          path: .acceptance/corrected-gcc
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -54,6 +60,8 @@ jobs:
         run: |
           old="$RUNNER_TEMP/shopping-trials/previous"
           docker buildx build --platform linux/amd64 --output "type=local,dest=$old" .acceptance/previous
+          gcc="$RUNNER_TEMP/shopping-trials/corrected-gcc"
+          docker buildx build --platform linux/amd64 --output "type=local,dest=$gcc" .acceptance/corrected-gcc
           python="$RUNNER_TEMP/shopping-python/bin/python"
           if "$python" .acceptance/candidate/tests/pipeline/long_link.py "$old/app/shopping" >"$old/long-link.log" 2>&1; then
             echo '::notice title=Previous release identity check::This build produced the expected 43 user-day rows.'
@@ -69,6 +77,7 @@ jobs:
         run: |
           "$RUNNER_TEMP/shopping-python/bin/python" perf/native/port_acceptance.py \
             --candidate-source "$GITHUB_WORKSPACE/.acceptance/candidate" \
+            --comparison-binary "corrected-gcc=$RUNNER_TEMP/shopping-trials/corrected-gcc/app/shopping" \
             --previous-release "$RUNNER_TEMP/shopping-trials/previous/app/shopping" \
             --release-generated-practice --release-generated-final \
             --warm-20 3 --warm-60 3 --cold-runs 1 --container-lifetime-pairs 5 --input-policy-rounds 5
@@ -108,6 +117,27 @@ jobs:
           SHIPPING_SHA: ${{ steps.image.outputs.commit }}
         run: |
           "$RUNNER_TEMP/shopping-python/bin/python" perf/native/holdout_shipping.py --shipping-commit "$SHIPPING_SHA"
+      - name: Verify both 1M tables with baseline x86-64 instruction dispatch
+        if: steps.qualify.outcome == 'success'
+        shell: bash
+        run: |
+          if ! command -v qemu-x86_64; then sudo apt-get -qq update && sudo apt-get install -y qemu-user; fi
+          area="$RUNNER_TEMP/shopping-trials"
+          out="$area/results/baseline-isa"
+          mkdir -p "$out"
+          export NCPU=1 XL_TIMING=1
+          for mode in compact generic; do
+            flags=()
+            if test "$mode" = generic; then flags=(--generic); fi
+            temp=$(mktemp -d "$RUNNER_TEMP/isa-output.XXXXXX")
+            qemu-x86_64 -cpu Nehalem "$area/accept-binaries/candidate/shopping" "${flags[@]}" \
+              "$area/dev" "$temp" > "$out/$mode.log" 2>&1
+            if test "$mode" = compact; then grep -q 'parse=' "$out/$mode.log"; fi
+            "$RUNNER_TEMP/shopping-python/bin/python" "$area/starter-pyspark/scripts/compare.py" \
+              "$temp" "$area/dev-answer" >> "$out/$mode.log"
+            rm -r -- "$temp"
+          done
+          echo '::notice title=Portable x86-64 release::The compact and explicitly selected generic parsers each matched both published 1M tables on a Nehalem CPU model.'
       - name: Exercise native SIMD and parked-worker retry paths
         if: always() && steps.qualify.outcome == 'success'
         env:
