@@ -1,0 +1,126 @@
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -21,8 +21,11 @@
+   Time ingest;
+   Event event;
+ };
++#include "repeat_sketch.hpp"
+ template <class T> using Bins = std::array<std::vector<T>, shards>;
+ struct Worker {
++  RevisionPages pages;
++  RepeatSketch sketch;
+   Bins<Candidate> candidates;
+   Bins<std::pair<RoutedUser, Event>> events;
+   Bins<std::pair<RoutedUser, Click>> clicks;
+@@ -321,14 +324,8 @@
+   size_t event_bytes = 0;
+   for (auto chunk : events)
+     event_bytes += chunk.size();
+-  // A bounded capacity hint only. All vectors grow independently on skew
+-  // or unusual row widths. Allow up to 2 GiB total initial storage.
+-  auto hint =
+-      std::min(event_bytes / 88, (size_t(2) << 30) / sizeof(Candidate)) /
+-      threads / shards;
+-  for (auto &worker : workers)
+-    for (auto &bin : worker.candidates)
+-      bin.reserve(hint);
++  size_t words = std::bit_ceil(std::clamp<size_t>(event_bytes / 700, 64, (64ULL<<20)/threads));
++  for (auto &w : workers) w.sketch.reset(words);
+   parallel(events.size() + 1, threads, [&](size_t job, unsigned t) {
+     if (job == 0) {
+       auto begin = Timer::Clock::now();
+@@ -358,21 +355,51 @@
+       workers[t].valid_events += e.ts != bad;
+ #endif
+       Key user = e.ts == bad ? Key{} : workers[t].pool.encode(r[1], 'u');
+-      workers[t].candidates[bucket(id)].push_back({id, user, ingest, e});
++      workers[t].pages.append({id,user,ingest,e});
++      workers[t].sketch.observe(id.hash());
+     });
+   });
+   timer.mark("event CSV, validation and partition");
+-#ifdef SHOPPING_DIAGNOSTICS
+-  size_t revision_count = 0, revision_capacity = 0;
+-  for (const auto &worker : workers)
+-    for (const auto &bin : worker.candidates) {
+-      revision_count += bin.size();
+-      revision_capacity += bin.capacity();
+-    }
+-  std::cerr << "revision storage " << revision_count * sizeof(Candidate)
+-            << " used bytes, " << revision_capacity * sizeof(Candidate)
+-            << " capacity bytes\n";
+-#endif
++  std::vector<uint64_t> maybe_repeated(words);
++  constexpr size_t block_words=4096;
++  parallel((words+block_words-1)/block_words,threads,[&](size_t part,unsigned) {
++    const size_t begin=part*block_words, end=std::min(words,begin+block_words);
++    for (size_t i=begin;i<end;++i) {
++      uint64_t seen=0, repeated=0;
++      for (const auto &w:workers) {
++        auto bits=w.sketch.seen[i];
++        repeated |= (bits & seen) | w.sketch.repeated[i];
++        seen |= bits;
++      }
++      maybe_repeated[i]=repeated;
++    }
++  });
++  struct Page { std::unique_ptr<Candidate[]> rows; size_t n; };
++  std::vector<Page> pages;
++  for (auto &w:workers) {
++    w.sketch={};
++    size_t remaining=w.pages.count;
++    for (auto &p:w.pages.pages) {
++      auto n=std::min(remaining,RevisionPages::length);
++      pages.push_back({std::move(p),n});
++      remaining-=n;
++    }
++  }
++  parallel(pages.size(),threads,[&](size_t page,unsigned t) {
++    auto &p=pages[page];
++    auto &w=workers[t];
++    for (const Candidate &e:std::span(p.rows.get(),p.n)) {
++      const auto h=e.id.hash();
++      if ((maybe_repeated[(h>>6)&(words-1)]>>(h&63)) & 1)
++        w.candidates[h % shards].push_back(e);
++      else if (e.event.ts != bad) {
++        auto route=w.route(ids,e.user);
++        w.events[route.shard].emplace_back(route.user,e.event);
++      }
++    }
++    p.rows.reset();
++  });
++  timer.mark("classify multiplicities and route unique events");
+   parallel(shards, threads, [&](size_t b, unsigned t) {
+     size_t count = 0;
+     for (auto &w : workers)
+--- /dev/null
++++ b/cpp/repeat_sketch.hpp
+@@ -0,0 +1,28 @@
++#pragma once
++#include <cstdlib>
++
++struct RevisionPages {
++  static constexpr size_t length = 2048;
++  std::vector<std::unique_ptr<Candidate[]>> pages;
++  size_t count{};
++  Candidate *append(Candidate value) {
++    size_t offset = count++ % length;
++    if (!offset)
++      pages.emplace_back(std::make_unique_for_overwrite<Candidate[]>(length));
++    auto *dest = pages.back().get() + offset;
++    *dest = value;
++    return dest;
++  }
++};
++
++struct RepeatSketch {
++  std::vector<uint64_t> seen, repeated;
++  void reset(size_t words) { seen.resize(words); repeated.resize(words); }
++  void observe(size_t hash) {
++    auto word = (hash >> 6) & (seen.size()-1);
++    auto bit = uint64_t{1} << (hash & 63);
++    auto old = seen[word];
++    if (old & bit) repeated[word] |= bit;
++    seen[word] = old | bit;
++  }
++};

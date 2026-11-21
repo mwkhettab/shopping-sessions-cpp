@@ -1,0 +1,193 @@
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -156,7 +156,9 @@
+ struct ActiveCampaign {
+   size_t count{}, slot{};
+ };
++#include "session_bins.hpp"
+ struct Result {
++  SessionBins bins;
+ #ifdef SHOPPING_DIAGNOSTICS
+   size_t people{}, events_seen{}, clicks_seen{}, max_events{}, max_clicks{};
+ #endif
+@@ -169,6 +171,7 @@
+   int32_t first_day{};
+   size_t campaigns{};
+   void configure(Window w, const Catalog &cat, unsigned threads) {
++    bins.configure(w);
+     size_t count = cat.campaigns.size();
+     activity.configure(count);
+     spend.configure(cat.categories.size());
+@@ -210,16 +213,15 @@
+   result.max_events = std::max(result.max_events, events.size());
+   result.max_clicks = std::max(result.max_clicks, clicks.size());
+ #endif
++  const bool use_bins = !result.bins.cells.empty() && events.size() >= 32;
+   {
+     MEASURE(sorting);
+-    std::sort(events.begin(), events.end(),
+-              [](auto a, auto b) { return a.ts < b.ts; });
++    if (!use_bins)
++      std::sort(events.begin(), events.end(), [](auto a, auto b) { return a.ts < b.ts; });
+     std::sort(clicks.begin(), clicks.end(), [](const auto &a, const auto &b) {
+       return a.ts == b.ts ? a.id > b.id : a.ts < b.ts;
+     });
+   }
+-  // Exact click copies have no effect on the winner or distinct active
+-  // campaigns.
+   size_t left = 0, right = 0;
+   UserDay daily{user, 0, 0, 0, 0, {}};
+   auto finish_day = [&] {
+@@ -236,31 +238,23 @@
+     result.users.push_back(daily);
+     result.purchased.clear();
+   };
+-  for (size_t i = 0; i < events.size();) {
+-    auto start = events[i].ts;
++  auto begin_session = [&](Time start) {
+     auto day = utc_day(start);
+     if (daily.sessions && day != daily.day) {
+       finish_day();
+       daily = {user, day, 0, 0, 0, {}};
+     }
+     daily.day = day;
+-    size_t first = i;
+-    int64_t revenue = 0;
+-    {
+-      MEASURE(session);
+-      do {
+-        auto e = events[i++];
+-        if (e.price) {
+-          auto &spent = result.spend[e.category];
+-          if (!spent)
+-            result.purchased.push_back(e.category);
+-          spent += e.price;
+-          revenue += e.price;
+-        }
+-      } while (i < events.size() && events[i].ts - events[i - 1].ts <= 1800000);
+-    }
++  };
++  auto spend = [&](int category, int64_t price) {
++    auto &value = result.spend[category];
++    if (!value) result.purchased.push_back(category);
++    value += price;
++  };
++  auto end_session = [&](Time start, int64_t count, int64_t revenue) {
++    auto day = daily.day;
+     ++daily.sessions;
+-    daily.events += i - first;
++    daily.events += count;
+     daily.revenue += revenue;
+     {
+       MEASURE(attribution);
+@@ -290,6 +284,29 @@
+     counts.revenue += revenue;
+     for (int campaign : result.active)
+       ++result.at(campaign, day).assists;
++  };
++  if (use_bins) {
++    MEASURE(session);
++    result.bins.scan(events, begin_session, spend, end_session);
++  } else {
++    size_t i = 0;
++    while (i < events.size()) {
++      Time start = events[i].ts;
++      begin_session(start);
++      size_t first = i;
++      int64_t revenue = 0;
++      {
++        MEASURE(session);
++        do {
++          auto e = events[i++];
++          if (e.price) {
++            spend(e.category, e.price);
++            revenue += e.price;
++          }
++        } while (i < events.size() && events[i].ts - events[i - 1].ts <= session_gap);
++      }
++      end_session(start, i - first, revenue);
++    }
+   }
+   finish_day();
+   for (int campaign : result.active)
+--- /dev/null
++++ b/cpp/session_bins.hpp
+@@ -0,0 +1,78 @@
++#pragma once
++
++constexpr Time session_gap = 1'800'000;
++
++struct SessionBins {
++  struct Bin {
++    Time first, last;
++    int64_t count{}, revenue;
++    size_t purchases;
++  };
++  struct Purchase {
++    int category, price;
++    size_t previous;
++  };
++  Time origin{};
++  std::vector<Bin> cells;
++  std::vector<uint64_t> occupied;
++  std::vector<Purchase> purchases;
++
++  void configure(Window window) {
++    origin = window.start;
++    uint64_t width = uint64_t(window.end) - uint64_t(origin);
++    auto n = 1 + (width - 1) / session_gap;
++    // Bound each worker's scratch space. Wide windows use the normal sort.
++    if (n <= 8192) {
++      cells.resize(n);
++      occupied.resize((n + 63) / 64);
++    }
++  }
++
++  template <class Begin, class Spend, class End>
++  void scan(std::span<const Event> events, Begin begin, Spend spend, End end) {
++    for (const auto &e : events) {
++      size_t index = (uint64_t(e.ts) - uint64_t(origin)) / session_gap;
++      auto &cell = cells[index];
++      if (cell.count++ == 0) {
++        occupied[index / 64] |= uint64_t{1} << (index % 64);
++        cell.first = cell.last = e.ts;
++        cell.purchases = 0;
++        cell.revenue = 0;
++      } else {
++        cell.first = std::min(cell.first, e.ts);
++        cell.last = std::max(cell.last, e.ts);
++      }
++      if (e.price) {
++        cell.revenue += e.price;
++        purchases.push_back({e.category, e.price, cell.purchases});
++        cell.purchases = purchases.size();
++      }
++    }
++    Time start{}, last{};
++    int64_t count = 0, revenue = 0;
++    for (size_t word = 0; word < occupied.size(); ++word) {
++      uint64_t bits = occupied[word];
++      occupied[word] = 0;
++      while (bits) {
++        auto &cell = cells[word * 64 + std::countr_zero(bits)];
++        bits &= bits - 1;
++        // All times within one half-open bin are less than one gap apart.
++        if (!count || cell.first - last > session_gap) {
++          if (count)
++            end(start, count, revenue);
++          start = cell.first;
++          begin(start);
++          count = revenue = 0;
++        }
++        for (size_t i = cell.purchases; i; i = purchases[i - 1].previous)
++          spend(purchases[i - 1].category, purchases[i - 1].price);
++        count += cell.count;
++        revenue += cell.revenue;
++        last = cell.last;
++        cell.count = 0;
++      }
++    }
++    end(start, count, revenue);
++    purchases.clear();
++  }
++};

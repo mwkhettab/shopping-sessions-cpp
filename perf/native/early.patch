@@ -1,0 +1,257 @@
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -156,7 +156,9 @@
+ struct ActiveCampaign {
+   size_t count{}, slot{};
+ };
++#include "session_bins.hpp"
+ struct Result {
++  SessionBins bins;
+ #ifdef SHOPPING_DIAGNOSTICS
+   size_t people{}, events_seen{}, clicks_seen{}, max_events{}, max_clicks{};
+ #endif
+@@ -169,6 +171,7 @@
+   int32_t first_day{};
+   size_t campaigns{};
+   void configure(Window w, const Catalog &cat, unsigned threads) {
++    bins.configure(w);
+     size_t count = cat.campaigns.size();
+     activity.configure(count);
+     spend.configure(cat.categories.size());
+@@ -200,8 +203,8 @@
+ };
+ 
+ void summarize(Key user, std::span<Event> events, std::span<Click> clicks,
+-               const Catalog &cat, Result &result) {
+-  if (events.empty())
++               const Catalog &cat, Result &result, SessionBins *ready = nullptr) {
++  if (events.empty() && !ready)
+     return;
+ #ifdef SHOPPING_DIAGNOSTICS
+   ++result.people;
+@@ -210,16 +213,15 @@
+   result.max_events = std::max(result.max_events, events.size());
+   result.max_clicks = std::max(result.max_clicks, clicks.size());
+ #endif
++  const bool use_bins = ready || (!result.bins.cells.empty() && events.size() >= 32);
+   {
+     MEASURE(sorting);
+-    std::sort(events.begin(), events.end(),
+-              [](auto a, auto b) { return a.ts < b.ts; });
++    if (!use_bins)
++      std::sort(events.begin(), events.end(), [](auto a, auto b) { return a.ts < b.ts; });
+     std::sort(clicks.begin(), clicks.end(), [](const auto &a, const auto &b) {
+       return a.ts == b.ts ? a.id > b.id : a.ts < b.ts;
+     });
+   }
+-  // Exact click copies have no effect on the winner or distinct active
+-  // campaigns.
+   size_t left = 0, right = 0;
+   UserDay daily{user, 0, 0, 0, 0, {}};
+   auto finish_day = [&] {
+@@ -236,31 +238,23 @@
+     result.users.push_back(daily);
+     result.purchased.clear();
+   };
+-  for (size_t i = 0; i < events.size();) {
+-    auto start = events[i].ts;
++  auto begin_session = [&](Time start) {
+     auto day = utc_day(start);
+     if (daily.sessions && day != daily.day) {
+       finish_day();
+       daily = {user, day, 0, 0, 0, {}};
+     }
+     daily.day = day;
+-    size_t first = i;
+-    int64_t revenue = 0;
+-    {
+-      MEASURE(session);
+-      do {
+-        auto e = events[i++];
+-        if (e.price) {
+-          auto &spent = result.spend[e.category];
+-          if (!spent)
+-            result.purchased.push_back(e.category);
+-          spent += e.price;
+-          revenue += e.price;
+-        }
+-      } while (i < events.size() && events[i].ts - events[i - 1].ts <= 1800000);
+-    }
++  };
++  auto spend = [&](int category, int64_t price) {
++    auto &value = result.spend[category];
++    if (!value) result.purchased.push_back(category);
++    value += price;
++  };
++  auto end_session = [&](Time start, int64_t count, int64_t revenue) {
++    auto day = daily.day;
+     ++daily.sessions;
+-    daily.events += i - first;
++    daily.events += count;
+     daily.revenue += revenue;
+     {
+       MEASURE(attribution);
+@@ -290,6 +284,30 @@
+     counts.revenue += revenue;
+     for (int campaign : result.active)
+       ++result.at(campaign, day).assists;
++  };
++  if (use_bins) {
++    MEASURE(session);
++    if (ready) ready->finish(begin_session, spend, end_session);
++    else result.bins.scan(events, begin_session, spend, end_session);
++  } else {
++    size_t i = 0;
++    while (i < events.size()) {
++      Time start = events[i].ts;
++      begin_session(start);
++      size_t first = i;
++      int64_t revenue = 0;
++      {
++        MEASURE(session);
++        do {
++          auto e = events[i++];
++          if (e.price) {
++            spend(e.category, e.price);
++            revenue += e.price;
++          }
++        } while (i < events.size() && events[i].ts - events[i - 1].ts <= session_gap);
++      }
++      end_session(start, i - first, revenue);
++    }
+   }
+   finish_day();
+   for (int campaign : result.active)
+@@ -437,9 +455,10 @@
+   parallel(shards, threads, [&](size_t b, unsigned t) {
+     struct Group {
+       Key user;
+-      size_t event_end{}, click_end{};
++      size_t event_end{}, click_end{}, hot_index{};
+     };
+     std::vector<Group> groups;
++    std::vector<SessionBins> hot;
+     std::vector<Event> ordered_events;
+     std::vector<Click> ordered_clicks;
+     {
+@@ -480,14 +499,21 @@
+         size_t events = g.event_end, clicks = g.click_end;
+         g.event_end = ne;
+         g.click_end = nc;
+-        ne += events;
++        if (events>=1024 && !results[t].bins.cells.empty() &&
++            hot.size() < (8u<<20)/sizeof(SessionBins::Bin)/results[t].bins.cells.size()) {
++          hot.emplace_back().configure(window);
++          g.hot_index=hot.size();
++        } else ne += events;
+         nc += clicks;
+       }
+       ordered_events.resize(ne);
+       ordered_clicks.resize(nc);
+       for (auto &w : workers) {
+-        for (auto &[u, e] : w.events[b])
+-          ordered_events[groups[u.bits].event_end++] = e;
++        for (auto &[u,e] : w.events[b]) {
++          auto &g=groups[u.bits];
++          if (g.hot_index) hot[g.hot_index-1].add(e);
++          else ordered_events[g.event_end++]=e;
++        }
+         for (auto &[u, c] : w.clicks[b])
+           if (u.bits != UINTPTR_MAX)
+             ordered_clicks[groups[u.bits].click_end++] = c;
+@@ -499,7 +525,7 @@
+     for (auto &g : groups) {
+       summarize(g.user, std::span(ordered_events).subspan(ep, g.event_end - ep),
+                 std::span(ordered_clicks).subspan(cp, g.click_end - cp), cat,
+-                results[t]);
++                results[t], g.hot_index ? &hot[g.hot_index-1] : nullptr);
+       ep = g.event_end;
+       cp = g.click_end;
+     }
+--- /dev/null
++++ b/cpp/session_bins.hpp
+@@ -0,0 +1,84 @@
++#pragma once
++
++constexpr Time session_gap = 1'800'000;
++
++struct SessionBins {
++  struct Bin {
++    Time first, last;
++    int64_t count{}, revenue;
++    size_t purchases;
++  };
++  struct Purchase {
++    int category, price;
++    size_t previous;
++  };
++  Time origin{};
++  std::vector<Bin> cells;
++  std::vector<uint64_t> occupied;
++  std::vector<Purchase> purchases;
++
++  void configure(Window window) {
++    origin = window.start;
++    uint64_t width = uint64_t(window.end) - uint64_t(origin);
++    auto n = 1 + (width - 1) / session_gap;
++    // Bound each worker's scratch space. Wide windows use the normal sort.
++    if (n <= 8192) {
++      cells.resize(n);
++      occupied.resize((n + 63) / 64);
++    }
++  }
++
++  void add(const Event &e) {
++    size_t index = (uint64_t(e.ts) - uint64_t(origin)) / session_gap;
++    auto &cell = cells[index];
++    if (cell.count++ == 0) {
++      occupied[index / 64] |= uint64_t{1} << (index % 64);
++      cell.first = cell.last = e.ts;
++      cell.purchases = 0;
++      cell.revenue = 0;
++    } else {
++      cell.first = std::min(cell.first, e.ts);
++      cell.last = std::max(cell.last, e.ts);
++    }
++    if (e.price) {
++      cell.revenue += e.price;
++      purchases.push_back({e.category, e.price, cell.purchases});
++      cell.purchases = purchases.size();
++    }
++  }
++
++  template<class Begin, class Spend, class End>
++  void finish(Begin begin, Spend spend, End end) {
++    Time start{}, last{};
++    int64_t count = 0, revenue = 0;
++    for (size_t word = 0; word < occupied.size(); ++word) {
++      uint64_t bits = occupied[word];
++      occupied[word] = 0;
++      while (bits) {
++        auto &cell = cells[word * 64 + std::countr_zero(bits)];
++        bits &= bits - 1;
++        // All times within one half-open bin are less than one gap apart.
++        if (!count || cell.first - last > session_gap) {
++          if (count) end(start, count, revenue);
++          start = cell.first;
++          begin(start);
++          count = revenue = 0;
++        }
++        for (size_t i = cell.purchases; i; i = purchases[i-1].previous)
++          spend(purchases[i-1].category, purchases[i-1].price);
++        count += cell.count;
++        revenue += cell.revenue;
++        last = cell.last;
++        cell.count = 0;
++      }
++    }
++    end(start, count, revenue);
++    purchases.clear();
++  }
++  template<class Begin, class Spend, class End>
++  void scan(std::span<const Event> events, Begin begin, Spend spend, End end) {
++    for (const auto &e : events) add(e);
++    finish(begin, spend, end);
++  }
++
++};

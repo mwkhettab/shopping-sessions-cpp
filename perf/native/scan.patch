@@ -1,0 +1,91 @@
+--- a/cpp/input.hpp
++++ b/cpp/input.hpp
+@@ -146,8 +146,10 @@
+ }
+ #endif
+ #include "csv_x86.hpp"
++#include "validated_csv.hpp"
+ template <size_t N, class F> void parse_rows(Str data, F &&callback) {
+ #ifdef SHOPPING_X86_CSV
++  if (checked_csv_supported()) { checked_csv_rows<N>(data,callback); return; }
+   if (wide_csv_supported()) {
+     wide_csv_rows<N>(data, callback);
+     return;
+--- /dev/null
++++ b/cpp/validated_csv.hpp
+@@ -0,0 +1,75 @@
++#pragma once
++#ifdef SHOPPING_X86_CSV
++// A batch on the common path consists entirely of complete, well-formed
++// records. No callback is invoked until the whole batch has been checked.
++inline bool checked_csv_supported() {
++  return wide_csv_supported() && __builtin_cpu_supports("pclmul");
++}
++template <size_t N, class F>
++__attribute__((target("avx2,bmi,popcnt,pclmul"))) bool checked_batch(Str s, F &f) {
++  constexpr unsigned maximum = 4096;
++  uint16_t stops[maximum + 8];
++  unsigned used = 0, lines = 0, carry = 0, previous_end = 1, bad_bits = 0;
++  for (size_t at = 0; at < s.size(); at += 32) {
++    const char *bytes = s.data() + at;
++    size_t left = s.size() - at;
++    alignas(32) char tail[32]{};
++    if (left < 32) {
++      std::memcpy(tail,bytes,left);
++      bytes = tail;
++    }
++    auto v = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(bytes));
++    auto newline = _mm256_cmpeq_epi8(v,_mm256_set1_epi8('\n'));
++    unsigned lf = _mm256_movemask_epi8(newline);
++    unsigned ends = _mm256_movemask_epi8(_mm256_or_si256(newline,
++                                    _mm256_cmpeq_epi8(v,_mm256_set1_epi8(','))));
++    unsigned quotes = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v,_mm256_set1_epi8('"')));
++    // A syntactic quote is adjacent to a delimiter and the parity at
++    // every delimiter is even. Together these characterize whole-field quoting.
++    bool next_end = left > 32 && (s[at+32] == ',' || s[at+32] == '\n');
++    unsigned adjacent = (ends << 1) | previous_end | (ends >> 1) | (unsigned(next_end) << 31);
++    bad_bits |= quotes & ~adjacent;
++    __m128i prefix = _mm_clmulepi64_si128(_mm_cvtsi32_si128(quotes),_mm_set1_epi8(-1),0);
++    unsigned inside = static_cast<unsigned>(_mm_cvtsi128_si32(prefix)) ^ carry;
++    bad_bits |= inside & ends;
++    carry = 0u - (inside >> 31);
++    previous_end = ends >> 31;
++    lines += __builtin_popcount(lf);
++    while (ends) {
++      stops[used++] = static_cast<uint16_t>(at + __builtin_ctz(ends));
++      ends &= ends-1;
++    }
++  }
++  if (bad_bits || used != lines*N) return false;
++  for (unsigned cut=N-1; cut<used; cut+=N)
++    if (s[stops[cut]] != '\n') return false;
++  std::array<Str,N> fields;
++  unsigned start = 0;
++  for (unsigned cut=0; cut<used; cut+=N) {
++    for (unsigned j=0; j<N; ++j) {
++      unsigned end=stops[cut+j];
++      const char *p=s.data()+start;
++      unsigned q = *p == '"';
++      fields[j] = Str(p+q, end-start-2*q);
++      start=end+1;
++    }
++    f(fields);
++  }
++  return true;
++}
++template <size_t N,class F>
++__attribute__((target("avx2,bmi,popcnt,pclmul"))) void checked_csv_rows(Str data,F& f) {
++  while (!data.empty()) {
++    size_t n=std::min<size_t>(4096,data.size());
++    while (n && data[n-1]!='\n') --n;
++    if (!n) {
++      const size_t end=data.find('\n',std::min<size_t>(4096,data.size()));
++      n=end==Str::npos ? data.size() : end+1;
++      wide_csv_rows<N>(data.substr(0,n),f);
++    } else if (!checked_batch<N>(data.substr(0,n),f)) {
++      wide_csv_rows<N>(data.substr(0,n),f);
++    }
++    data.remove_prefix(n);
++  }
++}
++#endif

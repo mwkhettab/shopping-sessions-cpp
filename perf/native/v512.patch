@@ -1,0 +1,108 @@
+--- a/cpp/input.hpp
++++ b/cpp/input.hpp
+@@ -146,8 +146,10 @@
+ }
+ #endif
+ #include "csv_x86.hpp"
++#include "validated_csv.hpp"
+ template <size_t N, class F> void parse_rows(Str data, F &&callback) {
+ #ifdef SHOPPING_X86_CSV
++  if (checked_csv_supported()) { checked_csv_rows<N>(data,callback); return; }
+   if (wide_csv_supported()) {
+     wide_csv_rows<N>(data, callback);
+     return;
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -125,7 +125,7 @@
+       throw std::runtime_error("invalid manifest window");
+   }
+ };
+-Event validate(const std::array<Str, 7> &r, Time ingest, const Catalog &catalog,
++template <class Row> Event validate(const Row &r, Time ingest, const Catalog &catalog,
+                Window w) {
+   Event drop{bad, 0, 0};
+   if (r[1].empty() || r[5].empty())
+--- /dev/null
++++ b/cpp/validated_csv.hpp
+@@ -0,0 +1,81 @@
++#pragma once
++#ifdef SHOPPING_X86_CSV
++// A batch on the common path consists entirely of complete, well-formed
++// records. No callback is invoked until the whole batch has been checked.
++inline bool checked_csv_supported() {
++  return __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
++         wide_csv_supported() && __builtin_cpu_supports("pclmul");
++}
++template <size_t N> struct FieldOffsets {
++  const char *base;
++  const uint32_t *stops;
++  unsigned first;
++  Str operator[](size_t i) const {
++    unsigned start = i ? stops[i-1]+1 : first;
++    unsigned q = base[start]=='"';
++    return {base+start+q,stops[i]-start-2*q};
++  }
++  operator std::array<Str,N>() const {
++    std::array<Str,N> fields;
++    for (size_t i=0;i<N;++i) fields[i]=(*this)[i];
++    return fields;
++  }
++};
++template <size_t N, class F>
++__attribute__((target("avx512f,avx512bw,avx2,bmi,popcnt,pclmul"))) bool checked_batch(Str s, F &f) {
++  constexpr unsigned maximum = 4096;
++  uint32_t stops[maximum + 16];
++  unsigned used=0, lines=0;
++  uint64_t carry=0, previous_end=1, bad_bits=0;
++  __m512i positions=_mm512_setr_epi32(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15);
++  const auto sixteen=_mm512_set1_epi32(16);
++  for (size_t at=0;at<s.size();at+=64) {
++    const char *p=s.data()+at;
++    size_t left=s.size()-at;
++    auto v=left>=64 ? _mm512_loadu_si512(p) :
++                       _mm512_maskz_loadu_epi8((uint64_t{1}<<left)-1,p);
++    uint64_t lf=_mm512_cmpeq_epi8_mask(v,_mm512_set1_epi8('\n'));
++    uint64_t ends=lf | _mm512_cmpeq_epi8_mask(v,_mm512_set1_epi8(','));
++    uint64_t quotes=_mm512_cmpeq_epi8_mask(v,_mm512_set1_epi8('"'));
++    uint64_t next_end=left>64 && (p[64]==',' || p[64]=='\n');
++    uint64_t adjacent=(ends<<1) | previous_end | (ends>>1) | (next_end<<63);
++    bad_bits |= quotes & ~adjacent;
++    __m128i prefix = _mm_clmulepi64_si128(_mm_cvtsi64_si128(quotes),_mm_set1_epi8(-1),0);
++    uint64_t inside=uint64_t(_mm_cvtsi128_si64(prefix))^carry;
++    bad_bits |= inside & ends;
++    carry=0ULL-(inside>>63);
++    previous_end=ends>>63;
++    lines+=__builtin_popcountll(lf);
++    for (unsigned part=0;part<4;++part) {
++      auto mask=__mmask16(ends);
++      _mm512_mask_compressstoreu_epi32(stops+used,mask,positions);
++      used+=__builtin_popcount(mask);
++      positions=_mm512_add_epi32(positions,sixteen);
++      ends>>=16;
++    }
++  }
++  if (bad_bits || used != lines*N) return false;
++  for (unsigned cut=N-1; cut<used; cut+=N)
++    if (s[stops[cut]] != '\n') return false;
++  for (unsigned cut=0;cut<used;cut+=N) {
++    FieldOffsets<N> row{s.data(),stops+cut,cut ? unsigned(stops[cut-1]+1) : 0};
++    f(row);
++  }
++  return true;
++}
++template <size_t N,class F>
++__attribute__((target("avx512f,avx512bw,avx2,bmi,popcnt,pclmul"))) void checked_csv_rows(Str data,F& f) {
++  while (!data.empty()) {
++    size_t n=std::min<size_t>(4096,data.size());
++    while (n && data[n-1]!='\n') --n;
++    if (!n) {
++      const size_t end=data.find('\n',std::min<size_t>(4096,data.size()));
++      n=end==Str::npos ? data.size() : end+1;
++      wide_csv_rows<N>(data.substr(0,n),f);
++    } else if (!checked_batch<N>(data.substr(0,n),f)) {
++      wide_csv_rows<N>(data.substr(0,n),f);
++    }
++    data.remove_prefix(n);
++  }
++}
++#endif

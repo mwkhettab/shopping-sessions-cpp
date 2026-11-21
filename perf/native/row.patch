@@ -1,0 +1,71 @@
+--- a/cpp/input.hpp
++++ b/cpp/input.hpp
+@@ -146,8 +146,10 @@
+ }
+ #endif
+ #include "csv_x86.hpp"
++#include "line_csv.hpp"
+ template <size_t N, class F> void parse_rows(Str data, F &&callback) {
+ #ifdef SHOPPING_X86_CSV
++  if (wide_csv_supported()) { line_csv_rows<N>(data,callback); return; }
+   if (wide_csv_supported()) {
+     wide_csv_rows<N>(data, callback);
+     return;
+--- /dev/null
++++ b/cpp/line_csv.hpp
+@@ -0,0 +1,55 @@
++#pragma once
++#ifdef SHOPPING_X86_CSV
++struct RowMask32 { unsigned comma, lf, quotes; };
++__attribute__((target("avx2,bmi,popcnt"),always_inline)) inline RowMask32 row_mask32(const char *p) {
++  auto v=_mm256_loadu_si256(reinterpret_cast<const __m256i *>(p));
++  return {unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v,_mm256_set1_epi8(',')))),
++          unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v,_mm256_set1_epi8('\n')))),
++          unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v,_mm256_set1_epi8('"'))))};
++}
++template <size_t N,class F>
++__attribute__((target("avx2,bmi,popcnt"))) void line_csv_rows(Str data,F& f) {
++  std::array<Str,N> fields;
++  while (data.size()>=128) {
++    const char *p=data.data();
++    uint64_t lo=0,hi=0;
++    unsigned quote_count=0,end=0;
++    for (unsigned at=0; at<128; at+=32) {
++      auto m=row_mask32(p+at);
++      unsigned valid=m.lf ? (m.lf & -m.lf)-1 : ~0u;
++      uint64_t commas=uint64_t(m.comma & valid) << (at % 64);
++      if (at<64) lo|=commas; else hi|=commas;
++      quote_count+=__builtin_popcount(m.quotes & valid);
++      if (m.lf) {
++        end=at+__builtin_ctz(m.lf)+1;
++        break;
++      }
++    }
++    if (!end) {
++      auto lf=data.find('\n',128);
++      size_t n=lf==Str::npos ? data.size() : lf+1;
++      wide_csv_rows<N>(data.substr(0,n),f);
++      data.remove_prefix(n);
++      continue;
++    }
++    if (__builtin_popcountll(lo)+__builtin_popcountll(hi)==N-1) {
++      unsigned start=0, expected=0;
++      for (size_t i=0;i<N;++i) {
++        unsigned cut=end-1;
++        if (i+1<N) {
++          if (lo) { cut=__builtin_ctzll(lo); lo&=lo-1; }
++          else { cut=64+__builtin_ctzll(hi); hi&=hi-1; }
++        }
++        unsigned len=cut-start;
++        bool q=len>=2 && ((p[start]=='"') & (p[cut-1]=='"'));
++        expected+=2*q;
++        fields[i]={p+start+q,len-2*q};
++        start=cut+1;
++      }
++      if (expected==quote_count) f(fields);
++    }
++    data.remove_prefix(end);
++  }
++  wide_csv_rows<N>(data,f);
++}
++#endif
