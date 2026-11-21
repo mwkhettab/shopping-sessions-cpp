@@ -22,9 +22,11 @@ RUNTIME_BUILDS = {
     "control": (),
     "paired": ("PAIRED_CLICK_SORT",),
     "memory": ("CUSTOM_MEMORY",),
+    "dictionary": ("DIRECT_DICT_LOOPS",),
     "paired-memory": ("PAIRED_CLICK_SORT", "CUSTOM_MEMORY"),
     "paired-memory-layout": ("PAIRED_CLICK_SORT", "CUSTOM_MEMORY", "INTEL_LAYOUT"),
     "paired-memory-v4": ("PAIRED_CLICK_SORT", "CUSTOM_MEMORY", "INTEL_LAYOUT", "V4_SIDECAR"),
+    "complete": ("PAIRED_CLICK_SORT", "CUSTOM_MEMORY", "INTEL_LAYOUT", "V4_SIDECAR", "DIRECT_DICT_LOOPS"),
 }
 
 
@@ -205,7 +207,7 @@ def paired(scale, data, bins, area, results, env, warm_count, cold_count):
                 metric["paired_change_median"] = statistics.median(deltas)
                 metric["faster_pairs"] = sum(d < 0 for d in deltas)
             metric["versus"] = {}
-            for control_label in ("candidate", "peer", "control", "paired-memory", "paired-memory-layout"):
+            for control_label in ("candidate", "peer", "control", "paired-memory", "paired-memory-layout", "paired-memory-v4"):
                 if control_label not in bins or control_label == label:
                     continue
                 control = {r["round"]: r["wall_s"] for r in records if r["label"] == control_label and r["cache"] == mode}

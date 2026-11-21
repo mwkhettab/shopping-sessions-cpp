@@ -75,7 +75,7 @@ jobs:
         if: steps.hardware.outputs.run == 'yes' && matrix.lane != 'portable'
         uses: actions/checkout@v4
         with:
-          ref: 04a48ef48c6f96a6ee0baedcd21d58639d1acde8
+          ref: b5f19ac6cc222f166ae9581a8cef9b87bb3c4263
           path: .acceptance/runtime
           persist-credentials: false
       - name: Check out optional comparison sources
@@ -133,8 +133,8 @@ jobs:
           peer="$RUNNER_TEMP/shopping-peer"
           extra=()
           case '${{ matrix.lane }}' in
-            primary) extra+=(--runtime-source "$GITHUB_WORKSPACE/.acceptance/runtime" --runtime-builds control paired memory paired-memory) ;;
-            secondary) extra+=(--runtime-source "$GITHUB_WORKSPACE/.acceptance/runtime" --runtime-builds control paired-memory paired-memory-layout paired-memory-v4) ;;
+            primary) extra+=(--runtime-source "$GITHUB_WORKSPACE/.acceptance/runtime" --runtime-builds control paired memory paired-memory dictionary) ;;
+            secondary) extra+=(--runtime-source "$GITHUB_WORKSPACE/.acceptance/runtime" --runtime-builds control paired-memory paired-memory-layout paired-memory-v4 complete) ;;
           esac
           if [[ -n "$PEER_REPOSITORY" || -n "$PEER_REVISION" ]]; then
             if [[ -n "$PEER_RUN_ID" || -n "$PEER_ARTIFACT" || -z "$PEER_REPOSITORY" || ! "$PEER_REVISION" =~ ^[0-9a-f]{40}$ ]]; then
