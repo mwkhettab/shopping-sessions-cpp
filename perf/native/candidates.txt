@@ -1,1 +1,1 @@
-base fin-slabkey-pgo shipresident-pgo resordinal-pgo cleanorddual-pgo slotordinal-pgo slot8ordinal-pgo chainraw-pgo chain8-pgo chainevents-pgo net32-pgo cutvector-pgo netcut32-pgo netcut64-pgo spshufflecomma-pgo spshuffleall-pgo sptransposeall-pgo spdepositcomma-pgo vertshape1-pgo vertshape2-pgo vertkeys1-pgo vertkeys2-pgo vertkeys4-pgo vertkeysbw-pgo
+base fin-slabkey-pgo shipresident-pgo ordrichlane-pgo shiprichwide-pgo shiprichdual-pgo shiprichbw-pgo caprichdual-pgo caprichbw-pgo
