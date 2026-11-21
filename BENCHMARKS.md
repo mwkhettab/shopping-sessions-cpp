@@ -32,6 +32,8 @@ These measurements include process launch, Parquet output and exit. Each run use
 
 Both the host executable and the statically linked linux/amd64 Docker image passed all 36 public fixtures and the additional catalog, long-line, identity and boundary tests. Docker ran the exact Git build with user 1000, eight vCPUs, a 7 GiB memory limit and read-only input. Its local image ID is `sha256:3de67ac7f30a553b0c080892736293c11df617a1a819c786c6291d4212b0d5f1`. The published seed-1 reference matched every value and key for 117,038 user-day and 27,400 campaign-day rows. Host and Docker 20M outputs each matched the validated implementation across all 2,226,509 user-day and 28,014 campaign-day rows, with zero duplicate keys.
 
+Across 54 additional runs against the 0.87-second implementation, all output rows and unique keys matched. All 36 independently salted fixture embeddings used the partitioned engine. A user spanning a 16,384-slot partition also stayed on that path with regular IDs and linked opaque aliases. Fourteen runs exercised the generic fallback through shuffled identity ordering, historical revisions or noncanonical catalogs. The release image repeated the three partition-boundary cases under a 1 GiB memory limit.
+
 Component tests also check the complete 1,804-byte inner click loop and its 59 ELF relocations, session state and attribution, union-find, bucket joining, worker ownership, all 32 Parquet key widths and file bytes across three output methods. The large Parquet test produced three files of 1,015,543 bytes each matching the oracle at every offset. Interpreter and emulation checks establish behavior and produce no native performance estimate.
 
 ## Release candidate with two CPU training paths
