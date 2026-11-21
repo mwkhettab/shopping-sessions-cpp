@@ -59,6 +59,7 @@ struct G {
     std::atomic<u64> *claim{};
     u32 *csr_off{};
     std::array<u64,2> *csr{};
+    u8* word_bucket{};
     std::size_t csr_cap{};
     std::vector<std::size_t> csr_base;
     std::size_t ncsr{};
@@ -97,9 +98,18 @@ struct G {
             out.insert(out.end(),p,p+n);
         }
     }
+    bool simple_words(u32 u) const {return word_bucket && word_bucket[u>>UB] && !(utab[u]&COMPLEX);}
+    std::span<const u64> click_words(u32 u) const {
+        const auto i=std::size_t(u)+(u>>UB);
+        return {reinterpret_cast<const u64*>(csr)+csr_off[i],csr_off[i+1]-csr_off[i]};
+    }
     std::span<const std::array<u64,2>> csr_range(u32 u) const {
         const std::size_t i=std::size_t(u)+(u>>UB);
         const auto a=csr_off[i],b=csr_off[i+1];
+        if(word_bucket && word_bucket[u>>UB]) {
+            if(!(utab[u]&COMPLEX) || (b-a)%2) sys::fallback("expected full click records");
+            return {reinterpret_cast<const std::array<u64,2>*>(reinterpret_cast<const u64*>(csr)+a),(b-a)/2};
+        }
         return {csr+a,b-a};
     }
 };

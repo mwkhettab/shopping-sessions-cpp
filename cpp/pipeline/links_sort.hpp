@@ -20,6 +20,7 @@ template<class T> struct ScratchAlloc:std::allocator<T> {
 template<class T> using ScratchVec=std::vector<T,ScratchAlloc<T>>;
 struct Scratch {
     ScratchVec<Click> tmp;
+    ScratchVec<Click> records;
     ScratchVec<u64> lk;
     std::array<ScratchVec<u32>,4> lens;
 };
@@ -185,13 +186,14 @@ PIPELINE_ROUTING_X64 inline void classify_users(const u32 *off,std::size_t a,std
     } for(unsigned j=0;j<4;++j)lens[j].resize(ns[j]);
 }
 #endif
-template<class G> inline void sort_users(const G& g,const u32* off,std::size_t ua,std::size_t ub,Scratch& sc) {
+template<class G> inline void sort_users(const G& g,const u32* off,std::size_t ua,std::size_t ub,Scratch& sc,Click* records=nullptr) {
+    if(!records) records=g.csr;
     auto& lists=sc.lens;
 #if defined(__x86_64__)
     if(parse::routing_x64()) classify_users(off,ua,ub,lists);else
 #endif
     {for(auto& l:lists){l.clear();l.reserve(ub-ua+16);}for(auto u=ua;u<ub;++u){const auto n=off[u+1]-off[u];if(n>=2)lists[n==2?0:n<=8?1:n<=16?2:3].push_back(u32(u));}}
     for(unsigned cat=0;cat<4;++cat){const std::size_t stride=(cat==1 || cat==2)?8:1;
-        const auto& l=lists[cat];for(std::size_t phase=0;phase<stride;++phase)for(auto i=phase;i<l.size();i+=stride){const u32 u=l[i],a=off[u],n=off[u+1]-a;sort_from(g,g.csr+a,std::span<Click>(g.csr+a,n),sc);}}
+        const auto& l=lists[cat];for(std::size_t phase=0;phase<stride;++phase)for(auto i=phase;i<l.size();i+=stride){const u32 u=l[i],a=off[u],n=off[u+1]-a;sort_from(g,records+a,std::span<Click>(records+a,n),sc);}}
 }
 }

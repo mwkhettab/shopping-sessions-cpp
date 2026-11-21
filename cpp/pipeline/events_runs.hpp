@@ -36,6 +36,14 @@ inline u32 class_of(u16 tv,u32 bits) {
     return !(bits&~mask) ? mask : !(bits&(bits-1)) ? bits : 0;
 }
 template<class G,class T> void finish_simple(const G& g,T& t,u32 u,u32 klass,const core::St& st) {
+    if constexpr(requires{g.simple_words(u);g.click_words(u);}) {
+        if(g.simple_words(u)) {
+            t.ck.clear();
+            for(auto key:g.click_words(u)) if((klass>>(key&15))&1) t.ck.push_back({key,0});
+            t.core.finish(g,st,t.ck,core::Name::Simple(u,klass));
+            return;
+        }
+    }
     auto clicks=g.csr_range(u);
     if (!std::all_of(clicks.begin(),clicks.end(),[&](const auto& c){return (klass>>(c[0]&15))&1;})) {
         t.ck.clear();

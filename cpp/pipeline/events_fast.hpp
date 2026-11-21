@@ -257,7 +257,9 @@ inline auto fast_name_v(u64 ukey,u32 u,u32 klass) {
     }
     flush();
 }
-template<bool All> inline void run_clicks_k(Fast& fx,std::span<const std::array<u64,2>> cks,u32 klass,
+inline u64 click_key(u64 key) {return key;}
+inline u64 click_key(const std::array<u64,2>& row) {return row[0];}
+template<bool All,class C> inline void run_clicks_k(Fast& fx,std::span<const C> cks,u32 klass,
                                               std::size_t s0,std::size_t nsr,u32 org) {
     auto* last=reinterpret_cast<u32*>(fx.last);
     if (std::size_t(fx.gbase)+nsr+1>=(1ULL<<31)) {std::memset(last,0,4*(CBOUND+2));fx.gbase=0;}
@@ -278,10 +280,10 @@ template<bool All> inline void run_clicks_k(Fast& fx,std::span<const std::array<
     auto cpv=orgv,hiv=get512(sts),lov=lo_load(hiv);
     const auto cl=klass|(klass<<16);
     for (std::size_t k=0;k<cks.size();++k) {
-        const u64 k0=cks[k][0];
+        const u64 k0=click_key(cks[k]);
         if constexpr (!All) if (!((cl>>(k0&31))&1)) continue;
         const auto c=(k0>>4)&(CBOUND-1);
-        if (k+4<cks.size()) __builtin_prefetch(fx.asst+((cks[k+4][0]>>4)&(CBOUND-1)));
+        if (k+4<cks.size()) __builtin_prefetch(fx.asst+((click_key(cks[k+4])>>4)&(CBOUND-1)));
         const auto tv=_mm512_set1_epi32(k0>>32);
         auto m=_mm512_cmple_epu32_mask(hiv,tv);
         while (m==0xffff) {hib+=16;hiv=get512(sts+hib);m=_mm512_cmple_epu32_mask(hiv,tv);}
