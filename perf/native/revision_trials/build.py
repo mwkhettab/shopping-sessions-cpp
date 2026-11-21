@@ -34,6 +34,8 @@ def build(source_archive, name, changes, output):
             flags.append("-DSHOP_SPARSE_USER_OUTPUT=1")
         if "event12-scatter" in changes:
             flags.append("-DSHOP_R12_SCATTER=1")
+        if "batched-walk" in changes:
+            flags.append("-DSHOP_BATCHED_WALK=1")
         if flags:
             tag = "set -- -std=c++20 -O3"
             replace_one(tree / "build.sh", tag, tag + " " + " ".join(flags))
@@ -82,13 +84,20 @@ def build(source_archive, name, changes, output):
             if "event12-scatter" in changes:
                 shutil.copy2(HERE / "edge_packets.cpp", tree / "tests/pipeline")
                 cpp_tests.append("edge_packets")
+            if "batched-walk" in changes:
+                cpp_tests.append("session_runs")
             for test in cpp_tests:
                 exe = tree / test
                 subprocess.run(["g++-12", "-std=c++20", "-O2", "-pthread", "-Wno-ignored-attributes",
-                                *flags, "-Icpp/pipeline", f"tests/pipeline/{test}.cpp",
+                                *flags, *(["-DSESSION_TEST_FAST"] if test == "session_runs" else []),
+                                "-Icpp/pipeline", f"tests/pipeline/{test}.cpp",
                                 "cpp/pipeline/sys_global_alloc.cpp", "-o", exe],
                                cwd=tree, stdout=stream, stderr=subprocess.STDOUT, check=True)
-                subprocess.run([exe], stdout=stream, stderr=subprocess.STDOUT, check=True)
+                if test == "session_runs":
+                    for pattern in range(5):
+                        subprocess.run([exe, str(pattern)], stdout=stream, stderr=subprocess.STDOUT, check=True)
+                else:
+                    subprocess.run([exe], stdout=stream, stderr=subprocess.STDOUT, check=True)
             if "sparse-groups" in changes:
                 exe=tree/"check-user-groups"
                 subprocess.run(["g++-12","-std=c++20","-O2","-pthread","-Wno-ignored-attributes",

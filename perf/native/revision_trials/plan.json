@@ -1,29 +1,29 @@
 {
   "base": "29ee0cc5c26291c511cad44aec18c6531f050f79",
   "variants": {
-    "mapped-release": [
-      "input-release"
-    ],
-    "packed-events": [
-      "stage192",
-      "packed12",
-      "event12-scatter"
-    ],
-    "packed-events-32k": [
-      "stage192",
-      "packed12",
-      "event12-scatter",
-      "bb15"
-    ],
-    "combined-reader": [
-      "stage192",
-      "packed12",
-      "event12-scatter",
-      "bb15",
-      "input-release",
+    "pair-repair": [
       "paired-events",
+      "repair-store"
+    ],
+    "pair-click-output": [
+      "paired-events",
+      "repair-store",
       "click-pairs",
       "sparse-groups"
+    ],
+    "pair-batched-runs": [
+      "paired-events",
+      "repair-store",
+      "click-pairs",
+      "sparse-groups",
+      "batched-walk"
+    ],
+    "pair-lazy-pages": [
+      "paired-events",
+      "repair-store",
+      "click-pairs",
+      "sparse-groups",
+      "lazy-pages"
     ]
   },
   "reference_revision": "2398c62544e81903c91ba1aa564d8d0ac02ca80a"

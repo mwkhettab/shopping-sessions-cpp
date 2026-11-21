@@ -1,0 +1,202 @@
+--- a/cpp/pipeline/events_fast.hpp
++++ b/cpp/pipeline/events_fast.hpp
+@@ -67,9 +67,17 @@
+     std::vector<V16> f;
+     u64* last;u32 gbase{};V16* asst;u32* cred;Rc* rc;
+     u32 *wl_s,*wl_r,*alist;Edge* edge{};
++#if SHOP_BATCHED_WALK
++    u32 *walk_user,*walk_class,*click_run,*click_start,*click_size;
++#endif
+     Fast(std::size_t nc,std::size_t nd,const Share& sh):f(64) {
+         const auto [dense,hot]=fast_sizes(nc,nd);
+-        constexpr auto cold=OP_ROWCAT+OP_NMBEST+r64(8*FN_);
++        constexpr auto cold_names=OP_ROWCAT+OP_NMBEST+r64(8*FN_);
++#if SHOP_BATCHED_WALK
++        constexpr auto cold=cold_names+5*r64(4*FN_);
++#else
++        constexpr auto cold=cold_names;
++#endif
+         auto *hp=sh.dense?sh.dense:sys::anon(dense);
+         if (sh.dense) std::memset(hp,0,r64(16*(BSIZE+16)));
+         const auto spn=cold+(sh.hot?0:r4k(hot));
+@@ -90,8 +98,13 @@
+         run_row0=at<u32>(plist,-std::ptrdiff_t(OP_RUNROW0));run_pidx=at<u32>(plist,-std::ptrdiff_t(OP_RUNPIDX));
+         p_cell=at<u32>(plist,OP_CELL);p_sid=at<u32>(plist,OP_SID);p_row=at<u32>(plist,OP_ROW);p_w=at<u32>(plist,OP_W);
+         nm_v=at<u64>(plist,OP_NMV);nm_k=at<u64>(plist,OP_NMK);nm_r=at<u32>(plist,OP_NMR);nm_best=at<u64>(plist,OP_NMBEST);
++        #if SHOP_BATCHED_WALK
++        walk_user=at<u32>(cd,cold_names);walk_class=at<u32>(walk_user,r64(4*FN_));
++        click_run=at<u32>(walk_class,r64(4*FN_));click_start=at<u32>(click_run,r64(4*FN_));
++        click_size=at<u32>(click_start,r64(4*FN_));
++#endif
+         if (at<u8>(row_rev,r64(4*FN_))!=hp+dense || at<u8>(alist,r64(4*(AL_CAP+64)))!=ht+hot ||
+-            at<u8>(nm_best,r64(8*FN_))!=cd+cold) sys::fallback("scratch layout");
++            at<u8>(nm_best,r64(8*FN_))!=cd+cold_names) sys::fallback("scratch layout");
+         if (sh.hot) {
+             std::memset(last,0,r64(8*(CBOUND+2)));std::memset(asst,0,r64(64*(nc+2)));
+             std::memset(cred,0,r64(4*(nc+2)*nd));
+@@ -376,6 +389,9 @@
+     std::size_t cw{};u64 cb{};std::size_t nw{},nrc{},nm_np{},nm_na{},mixp{};
+     u64 c_runs{},c_simple{},c_sess{};
+ };
++#if SHOP_BATCHED_WALK
++#include "events_walk_runs.hpp"
++#else
+ template<class G> [[gnu::noinline]] std::size_t walk_runs(Fast& fx,const G& g,Walk& wk,std::size_t r,
+                                                            std::size_t nrun,u32 pidx0,u32 org) {
+     const auto orgv=_mm512_set1_epi32(org);
+@@ -448,6 +464,7 @@
+     wk.cw=cw;wk.cb=cb;wk.nw=nw;wk.nrc=nrc;wk.nm_np=np;wk.nm_na=na;wk.mixp=mixp;
+     wk.c_runs+=cnt;wk.c_simple+=simple;wk.c_sess+=sess;return r;
+ }
++#endif
+ template<class T> inline std::size_t pass_a(Fast& fx,T& worker,u64 gen) {
+     const auto inv=_mm512_set1_epi64(INVALID_TS),m16=_mm512_set1_epi64(65535),m15=_mm512_set1_epi64(15);
+     const auto oddi=_mm512_setr_epi64(1,3,5,7,9,11,13,15),pmask=_mm512_set1_epi64(u64{0xffffff}<<9);
+@@ -471,7 +488,11 @@
+     for(std::size_t b=0;b<BSIZE/8;b+=2) {step(b);step(b+1);}
+     fx.blkk[BSIZE/8]=u16(k);return k;
+ }
+-inline std::pair<std::size_t,std::size_t> pass_c(Fast& fx,u64 ws_mod,std::size_t ns,std::size_t k) {
++inline std::pair<std::size_t,std::size_t> pass_c(Fast& fx,u64 ws_mod,std::size_t ns,std::size_t k
++#if SHOP_BATCHED_WALK
++                                                ,u32 organic=0
++#endif
++                                                ) {
+     constexpr u64 DIV_M=6515625;
+     const auto wsm=_mm512_set1_epi32(ws_mod); const auto mg=_mm256_set1_epi64x(DIV_M);
+     const auto flag=_mm512_set1_epi32(FLAG),m31=_mm512_set1_epi32(M31);
+@@ -482,6 +503,9 @@
+     };
+     fx.sday[-1]=UINT32_MAX;std::size_t nrow=0;
+     for (std::size_t s=0;s<ns;s+=16) {
++#if SHOP_BATCHED_WALK
++        put512(fx.scamp+s,_mm512_set1_epi32(organic));
++#endif
+         const auto x=_mm512_srli_epi32(_mm512_add_epi32(get512(fx.sts+s),wsm),10);
+         const auto day=join32(div(_mm512_castsi512_si256(x)),div(_mm512_extracti64x4_epi64(x,1)));
+         put512(fx.sday+s,day);
+@@ -592,7 +616,11 @@
+         t.prof[0]+=ns_since(ta,tb);t.prof[1]+=ns_since(tb,tc);
+         if (!k) continue;
+         const auto ns=pass_b(fx,k,g.utab);fx.sidx[ns]=u32(k)|FLAG;
++        #if SHOP_BATCHED_WALK
++        const auto [nrow,nrun]=pass_c(fx,g.ws_mod,ns,k,org);
++#else
+         const auto [nrow,nrun]=pass_c(fx,g.ws_mod,ns,k);
++#endif
+         Walk wk;std::array<DigRun,2> digs{};std::size_t ndig=0,r=0;
+         for (;;) {
+             r=walk_runs(fx,g,wk,r,nrun,u32(t.core.names_off.len()-1),org);
+@@ -601,7 +629,11 @@
+             const u32 u=fx.q[a]>>36;const auto tv=g.utab[u];
+             const bool special=fx.mix[wk.mixp]<e,edge=!r || r+1==nrun;
+             fx.run_pidx[r]=NONE;
++            #if SHOP_BATCHED_WALK
++            std::fill(fx.scamp+s0,fx.scamp+s1,trash);
++#else
+             for(auto x=s0;x<s1;x+=16) put512(fx.scamp+x,_mm512_set1_epi32(trash));
++#endif
+             if (edge && !special && !(tv&COMPLEX) && e-a>=dig_min && 3+2*(s1-s0)+e-a<=EP_WORDS) {
+                 digs[ndig++]={!r,u,a,e,s0,s1};info.n=r?2:1;
+             } else if (!r) {info.first=edge_copy_k(tid,u,fx,a,e-a);info.n=1;}
+--- /dev/null
++++ b/cpp/pipeline/events_walk_runs.hpp
+@@ -0,0 +1,98 @@
++// Included within pipeline::events and its feature-dispatched ISA region.
++template<class G> [[gnu::noinline]] std::size_t walk_runs(Fast& fx,const G& g,Walk& wk,std::size_t first,
++                                                           std::size_t nrun,u32 pidx0,u32 org) {
++    if(first>=nrun) return first;
++    const auto begin=fx.sidx[fx.run_s0[first]]&M31;
++    while(fx.mix[wk.mixp]<begin) ++wk.mixp;
++    if(!first || first+1>=nrun) return first;
++    const auto next_mixed=fx.mix[wk.mixp];
++    std::size_t stop=first,at=begin;
++    while(stop+1<nrun) {
++        const auto end=fx.sidx[fx.run_s0[stop+1]]&M31;const auto qa=fx.q[at];
++        const auto user=u32(qa>>36);const auto tv=g.utab[user];
++        if(next_mixed<end || (tv&(COMPLEX|EXTRA))) break;
++        const auto mask=u32(tv&MASK),bit=u32{1}<<((qa>>32)&15);
++        fx.walk_user[stop]=user;fx.walk_class[stop]=(bit&mask)?mask:bit;
++        at=end;++stop;
++    }
++    if(stop==first) return stop;
++    wk.c_runs+=stop-first;wk.c_simple+=at-begin;wk.c_sess+=fx.run_s0[stop]-fx.run_s0[first];
++    std::size_t listed=0;
++    for(std::size_t r=first;r<stop;++r) {
++        const auto u=fx.walk_user[r];
++        if((u>>6)!=wk.cw) {claim_word(g,wk.cw,wk.cb);wk.cw=u>>6;wk.cb=0;}
++        const u64 ub=u64{1}<<(u&63);
++        if(wk.cb&ub) sys::fallback("a user has two runs");
++        wk.cb|=ub;
++        if constexpr(requires{g.csr_off;g.csr_cap;}) {
++            const auto pos=std::size_t(u)+(u>>UB);const auto base=g.csr_off[pos];
++            const auto n=g.csr_off[pos+1]-base;
++            fx.click_run[listed]=u32(r);fx.click_start[listed]=base;fx.click_size[listed]=n;listed+=n!=0;
++        } else {
++            if(!g.csr_range(u).empty()) fx.click_run[listed++]=u32(r);
++        }
++    }
++    auto np=wk.nm_np,na=wk.nm_na;
++    for(std::size_t r=first;r<stop;++r,++na) {
++        const auto u=fx.walk_user[r],klass=fx.walk_class[r];
++        fx.run_pidx[r]=pidx0+u32(na);
++        const auto ncl=std::size_t(std::popcount(klass));fx.nm_best[na]=UINT64_MAX;
++        if(ncl-1>=8) fx.nm_best[na]=name_key_scalar(g.ukey,u,klass);
++        else {
++            const auto al=_mm512_cvtepu32_epi64(_mm512_castsi512_si256(_mm512_maskz_compress_epi32(klass,iota16())));
++            put512(fx.nm_v+np,_mm512_or_si512(_mm512_set1_epi64(u64(u)<<9),al));
++            put256(fx.nm_r+np,_mm256_set1_epi32(na));np+=ncl;
++        }
++    }
++    wk.nm_np=np;wk.nm_na=na;
++    auto nw=wk.nw,nrc=wk.nrc;
++    for(std::size_t j=0;j<listed;++j) {
++        const auto r=fx.click_run[j],s0=fx.run_s0[r],nsr=fx.run_s0[r+1]-s0,klass=fx.walk_class[r];
++        std::span<const std::array<u64,2>> cks;
++        if constexpr(requires{g.csr_off;g.csr_cap;}) cks={g.csr+fx.click_start[j],fx.click_size[j]};
++        else cks=g.csr_range(fx.walk_user[r]);
++        const auto n=cks.size();
++        bool light=false;
++        if (n<=16 && nsr<=WL_RUN) {
++            if (nrc==RC_N || nw+nsr>WL_CAP) {light_flush(fx,nw,org);nw=0;nrc=0;}
++            const auto* p=cks.data();
++            __m512i ka,kb;
++            bool padded=false;
++            if constexpr(requires{g.csr_cap;g.ncsr;}) {
++                // Published CSR buffers include sixteen guard records. Small stand-alone ranges
++                // use a masked boundary load when they do not share that padded storage.
++                const auto off=std::size_t(p-g.csr);
++                padded=off<=g.csr_cap && g.csr_cap-off>=16;
++            }
++            if (padded) {
++                ka=_mm512_permutex2var_epi64(get512(p),even64(),get512(p+4));
++                kb=_mm512_permutex2var_epi64(get512(p+8),even64(),get512(p+12));
++            } else {
++                auto load=[&](unsigned off) PIPELINE_EV_ATTR {
++                    if (off+4<=n) return get512(p+off);
++                    if (off>=n) return _mm512_setzero_si512();
++                    return _mm512_maskz_loadu_epi64((1u<<(2*(n-off)))-1,p+off);
++                };
++                ka=_mm512_permutex2var_epi64(load(0),even64(),load(4));
++                kb=_mm512_permutex2var_epi64(load(8),even64(),load(12));
++            }
++            const auto lo=join32(_mm512_cvtepi64_epi32(ka),_mm512_cvtepi64_epi32(kb));
++            const auto ts=join32(_mm512_cvtepi64_epi32(_mm512_srli_epi64(ka,32)),_mm512_cvtepi64_epi32(_mm512_srli_epi64(kb,32)));
++            const auto vm=(1u<<n)-1;
++            const auto inc=_mm512_test_epi32_mask(_mm512_sllv_epi32(_mm512_set1_epi32(1),_mm512_and_si512(lo,_mm512_set1_epi32(15))),_mm512_set1_epi32(klass));
++            if ((inc&vm)==vm) {
++                light=true;
++                const auto camp=_mm512_and_si512(lo,_mm512_set1_epi32((CBOUND-1)<<4));
++                auto& rc=fx.rc[nrc];_mm512_store_si512(rc.ts,ts);_mm512_store_si512(rc.camp,camp);
++                _mm512_store_si512(rc.conf,_mm512_conflict_epi32(camp));rc.vm=vm;
++                for (std::size_t x=0;x<nsr;x+=16) {
++                    put512(fx.wl_s+nw+x,_mm512_add_epi32(_mm512_set1_epi32(s0+x),iota16()));
++                    put512(fx.wl_r+nw+x,_mm512_set1_epi32(nrc*sizeof(Rc)));
++                }
++                ++nrc;nw+=nsr;
++            }
++        }
++        if (!light) run_clicks(fx,cks,klass,s0,nsr,org);
++    }
++    wk.nw=nw;wk.nrc=nrc;return stop;
++}

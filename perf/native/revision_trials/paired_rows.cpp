@@ -104,6 +104,14 @@ static void paired_errors() {
         }
         guarded<true>(data);
     }
+    // Repair the first row of a pair after the second ingest has been decoded.
+    // A double-width repair store would replace the second timestamp with midnight.
+    std::string mixed_ingest;
+    for(unsigned n=0;n<1800;++n) {
+        if(n%31==0) mixed_ingest+="eab705c83,u14b28a21,2024-02-29T23:58:00Z,2024-01-01T00:00:00Z,view,p359,\n";
+        else mixed_ingest+=row;
+    }
+    guarded<true>(mixed_ingest);
     std::string ids;
     for(auto event_id:{"e0","e01","e1","e12345678","eabcdefgh","eA","e0000012","e0000000","eabcdefghi","",",","\"e12345678\""})
         for(auto uid:{"","u0","u01","u1","u12345678","uabcxyz","u_12345",",","\"u23456789\""})

@@ -1,0 +1,19 @@
+--- a/cpp/pipeline/parse_part.hpp
++++ b/cpp/pipeline/parse_part.hpp
+@@ -1,5 +1,6 @@
+ #pragma once
+ #include "model_types.hpp"
++#include "sys.hpp"
+ 
+ #include <array>
+ #include <bit>
+@@ -26,7 +27,8 @@
+ inline bool popw() {
+     static const bool value = [] {
+         const char* setting = std::getenv("XL_POPW");
+-        return !setting || std::string_view(setting) != "0";
++        if (setting) return std::string_view(setting) != "0";
++        return sys::SMALLPAGES.load(std::memory_order_relaxed);
+     }();
+     return value;
+ }

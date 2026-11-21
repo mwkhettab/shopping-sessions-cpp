@@ -1,0 +1,13 @@
+--- a/cpp/pipeline/k_free_x86.cpp
++++ b/cpp/pipeline/k_free_x86.cpp
+@@ -360,8 +360,8 @@
+     auto ksub=_mm256_testn_epi64_mask(d,ld2(j.f.ksel.data()));
+     auto r=_mm256_add_epi64(_mm256_mask_sub_epi64(_mm256_add_epi64(t,f),ksub,t,f),st.days);
+     cx.b->ts[w]=_mm_extract_epi64(_mm256_castsi256_si128(r),1);
+-    auto dst=reinterpret_cast<u8 *>(cx.b)+offsetof(EvBatch,ing)+8*w;
+-    _mm_storeu_si128(reinterpret_cast<V *>(dst),_mm256_extracti128_si256(r,1));
++    // The next ingest slot can already hold the other half of a decoded pair.
++    cx.b->ing[w]=_mm_cvtsi128_si64(_mm256_extracti128_si256(r,1));
+     if (nz(_mm256_ternarylogic_epi64(ba,bb,st.bad2,0xfe))) {
+         auto other=_mm256_or_si256(st.bad,_mm256_and_si256(_mm256_or_si256(ba,bb),_mm256_set_epi64x(-1,-1,0,0)));
+         if (nz(other)) return {ev_cold(cx,p,w),true};
