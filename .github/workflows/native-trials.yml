@@ -19,8 +19,6 @@ jobs:
         include:
           - {os: ubuntu-24.04, lane: primary}
           - {os: ubuntu-22.04, lane: secondary}
-          - {os: ubuntu-latest, lane: recent}
-          - {os: ubuntu-24.04, lane: repeat}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 115
     steps:
@@ -66,7 +64,7 @@ jobs:
           df -h .
       - name: Validate and measure fresh processes
         if: steps.hardware.outputs.run == 'yes'
-        run: "$RUNNER_TEMP/shopping-python/bin/python perf/native/batch_and_scatter.py"
+        run: "$RUNNER_TEMP/shopping-python/bin/python perf/native/qualify_mixed_batches.py"
       - uses: actions/upload-artifact@v4
         if: always() && steps.hardware.outputs.run == 'yes'
         with:

@@ -1,1 +1,1 @@
-base fin-slabkey-pgo shipresident-pgo portablerich-pgo vertshape2-pgo ship8rich-pgo ship8lean-pgo ship8bw-pgo ship8safe-pgo batchmarks2-pgo batchbw-pgo batchavx-pgo spanbins-pgo spanmask32-pgo vecmask32-pgo rankback-pgo rankfront-pgo rankoffset-pgo rankshapeoffset-pgo
+base fin-slabkey-pgo shipresident-pgo portablerich-pgo shapemix-pgo release2rich-pgo release2lean-pgo release3rich-pgo release3lean-pgo
