@@ -1,0 +1,51 @@
+--- a/src/user.rs
++++ b/src/user.rs
+@@ -64,6 +64,8 @@
+     pub starts: Vec<Vec<u32>>,
+     /// Each file's cumulative share of the rows.
+     shares: Vec<f64>,
++    part_class: usize,
++    classes: usize,
+ }
+ 
+ impl Parts {
+@@ -72,10 +74,13 @@
+             bytes: vec![Vec::new(); shares.len()],
+             starts: vec![Vec::new(); shares.len()],
+             shares: shares.to_vec(),
++            part_class: std::env::var("PART_CLASS").ok().and_then(|x| x.parse().ok()).unwrap_or(0),
++            classes: std::env::var("PART_CLASSES").ok().and_then(|x| x.parse().ok()).unwrap_or(1),
+         }
+     }
+ 
+     fn push(&mut self, part: usize, line: &[u8]) {
++        if part % self.classes != self.part_class { return; }
+         self.starts[part].push(self.bytes[part].len() as u32);
+         self.bytes[part].extend_from_slice(line);
+         self.bytes[part].push(b'\n');
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -93,7 +93,7 @@
+     let event_parts: Vec<&Parts> = shards.iter().map(|shard| &shard.events).collect();
+     let click_parts: Vec<&Parts> = shards.iter().map(|shard| &shard.clicks).collect();
+     let link_parts: Vec<&Parts> = shards.iter().map(|shard| &shard.links).collect();
+-    let jobs: Vec<(&[&Parts], usize, &str, Stream, &str)> = (0..dataset.event_parts.len())
++    let mut jobs: Vec<(&[&Parts], usize, &str, Stream, &str)> = (0..dataset.event_parts.len())
+         .map(|part| {
+             (
+                 event_parts.as_slice(),
+@@ -122,10 +122,13 @@
+             )
+         }))
+         .collect();
++    let class: usize = std::env::var("PART_CLASS").unwrap().parse().unwrap();
++    let classes: usize = std::env::var("PART_CLASSES").unwrap().parse().unwrap();
++    jobs.retain(|(_, part, _, _, _)| part % classes == class);
+     let next = AtomicUsize::new(0);
+     let failure: Mutex<Option<io::Error>> = Mutex::new(None);
+     thread::scope(|scope| {
+-        for _ in 0..threads {
++        for _ in 0..1 {
+             scope.spawn(|| {
+                 while let Some(&(parts, part, folder, stream, header)) =
+                     jobs.get(next.fetch_add(1, Ordering::Relaxed))

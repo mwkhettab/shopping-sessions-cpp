@@ -77,7 +77,22 @@ def main():
             run(floor,area/'practice',mode,env['NCPU'])
             if i: times.append(time.monotonic()-start)
         note('Floor '+mode,str([round(x,4) for x in times]))
-    for scale in ['practice']:
+    final_list=(root/'perf/native/final.txt').read_text().split()
+    for scale in (['practice','final'] if final_list else ['practice']):
+        if scale=='final':
+            binaries=[b for b in binaries if b.name in final_list]
+            # Retain the public generator's RNG order and shuffle. Bound peak
+            # memory by materializing disjoint output files in separate passes.
+            gen=area/'generator'
+            with (root/'perf/native/generator-memory.patch').open('rb') as patch:
+                subprocess.run(['patch','-s','-p1'],cwd=gen,stdin=patch,check=True)
+            run('cargo','build','--release','--offline',cwd=gen)
+            exe=gen/'target/release/generate'
+            for part in range(3):
+                run(exe,'--seed','1','--events','1000000','--clicks','250000','--threads','4','--output',area/'dev-check',extra={'PART_CLASSES':'3','PART_CLASS':str(part)})
+            run('diff','-qr',area/'dev',area/'dev-check')
+            for part in range(3):
+                run(exe,'--seed','47','--events','60000000','--clicks','15000000','--threads','4','--output',area/'final',extra={'PART_CLASSES':'3','PART_CLASS':str(part)})
         data=area/scale
         ref=area/(scale+'-oracle')
         binary0=area/'bin/base'
@@ -88,7 +103,7 @@ def main():
                 run(b,data,d)
                 run(python,root/'perf/native/compare_large.py',d,ref)
         path=outcomes/(scale+'.jsonl')
-        run(python,root/'perf/measure.py',data,*binaries,'--profile','--preload','--runs','5',
+        run(python,root/'perf/measure.py',data,*binaries,'--profile','--preload','--runs','3' if scale=='final' else '5',
             '--warmup','1','--output-parent',area,'--log',path)
         for b in binaries:
             rows=[r for r in map(json.loads,path.read_text().splitlines()) if r['round']>=0 and r['binary']==str(b)]
