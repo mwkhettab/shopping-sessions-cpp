@@ -1,0 +1,110 @@
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -20,13 +20,14 @@
+ };
+ template <class T> using Bins = std::array<std::vector<T>, shards>;
+ #include "partition_slab.hpp"
++#include "raw_columns.hpp"
+ template <class Layout> struct ScanWorker {
+   using EventData = typename Layout::E;
+   using ClickData = typename Layout::C;
+   using Candidate = RevisionIndex;
+   std::vector<ExtendedRevision> extended;
+   PartitionSlab<Candidate> candidates;
+-  PartitionSlab<std::pair<Key, EventData>> events;
++  RawColumns<EventData,256> events;
+   PartitionSlab<std::pair<Key, ClickData>> clicks;
+   struct Vertex {
+     Key name;
+@@ -356,7 +357,7 @@
+           r.ingest & 0x80000000u ? w.extended[r.location].location : r.location;
+       if (location) {
+         --location;
+-        w.events[location % shards][location / shards].first.bits = 0;
++        w.events[location % shards].erase(location / shards);
+       }
+     };
+     for (unsigned owner = 0; owner < workers.size(); ++owner) {
+@@ -456,16 +457,12 @@
+     auto &store = storage[b];
+     size_t event_count = 0, click_count = 0;
+     for (auto &w : workers) {
+-      for (auto part : w.events[b].spans())
+-        for (auto &[u, e] : part) {
+-          if (!u.bits) {
+-            u.bits = UINTPTR_MAX;
+-            continue;
+-          }
+-          u.bits = intern(Key{u.bits});
+-          ++groups[u.bits].event_end;
+-          ++event_count;
++      w.events[b].each([&](auto keys,auto) {
++        for(auto &bits:keys) {
++          if(!bits){bits=UINTPTR_MAX;continue;}
++          bits=intern(Key{bits});++groups[bits].event_end;++event_count;
+         }
++      });
+       for (auto part : w.clicks[b].spans())
+         for (auto &[u, c] : part) {
+           u.bits = intern(Key{u.bits});
+@@ -500,10 +497,10 @@
+       click_offset += clicks_in_group;
+     }
+     for (auto &w : workers) {
+-      for (auto part : w.events[b].spans())
+-        for (auto &[u, e] : part)
+-          if (u.bits != UINTPTR_MAX)
+-            store.events[groups[u.bits].event_end++] = e;
++      w.events[b].each([&](auto keys,auto values) {
++        for(size_t i=0;i<keys.size();++i)
++          if(keys[i]!=UINTPTR_MAX)store.events[groups[keys[i]].event_end++]=values[i];
++      });
+       for (auto part : w.clicks[b].spans())
+         for (auto &[u, c] : part)
+           store.clicks[groups[u.bits].click_end++] = c;
+--- /dev/null
++++ b/cpp/raw_columns.hpp
+@@ -0,0 +1,43 @@
++#pragma once
++template<class T,size_t Width> struct RawColumns {
++  static_assert(std::has_single_bit(Width));
++  struct Block {uintptr_t keys[Width];T values[Width];};
++  static_assert(std::is_trivially_destructible_v<Block>);
++  struct Bin {
++    Block *blocks{};
++    size_t used{},limit{};
++    std::vector<Block> overflow;
++    size_t size() const{return used;}
++    Block &block(size_t i){return i<limit?blocks[i/Width]:overflow[(i-limit)/Width];}
++    void emplace_back(Key k,T value) {
++      size_t slot=used%Width;
++      if(!slot){
++        if(used<limit)::new(static_cast<void*>(blocks+used/Width)) Block;
++        else overflow.emplace_back();
++      }
++      auto &b=block(used++);
++      b.keys[slot]=k.bits;
++      b.values[slot]=value;
++    }
++    void erase(size_t i){block(i).keys[i%Width]=0;}
++    template<class Fn> void each(Fn visit) {
++      for(size_t i=0;i<used;i+=Width){
++        auto &b=block(i);
++        auto n=std::min(Width,used-i);
++        visit(std::span<uintptr_t>{b.keys,n},std::span<T>{b.values,n});
++      }
++    }
++    void release(){std::vector<Block>().swap(overflow);}
++  };
++  PartitionSlab<Block> slab;
++  std::array<Bin,shards> bins;
++  void reserve(size_t count){
++    slab.reserve((count+Width-1)/Width);
++    for(size_t i=0;i<shards;++i){
++      bins[i].blocks=slab[i].data;
++      bins[i].limit=slab[i].limit*Width;
++    }
++  }
++  void release(){slab.release();}
++  Bin &operator[](size_t i){return bins[i];}
++};

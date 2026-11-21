@@ -1,0 +1,109 @@
+--- /dev/null
++++ b/cpp/discover_repeats.hpp
+@@ -0,0 +1,73 @@
++#pragma once
++class PossibleRevisions {
++  static constexpr unsigned partitions=256;
++  std::vector<uint64_t> repeated;
++  uint32_t mask{};
++  template<class F> static void first_fields(Str data,F callback) {
++    if(data.empty())return;
++    const char *p=data.data(),*end=p+data.size();
++    auto field=[&](const char *from,const char *to) {
++      const char *comma=nullptr;
++#if defined(__SSE2__)
++      if(end-from>=16) {
++        auto first=_mm_loadu_si128(reinterpret_cast<const __m128i*>(from));
++        auto hits=unsigned(_mm_movemask_epi8(_mm_cmpeq_epi8(first,_mm_set1_epi8(','))));
++        if(hits){auto at=std::countr_zero(hits);if(to-from>at)comma=from+at;else return;}
++      }
++#endif
++      if(!comma)comma=static_cast<const char*>(std::memchr(from,',',size_t(to-from)));
++      if(!comma)return;
++      Str s(from,comma-from);
++      if(s.size()>=2 && s.front()=='"' && s.back()=='"'){s.remove_prefix(1);s.remove_suffix(1);}
++      if(!s.empty())callback(s);
++    };
++#if defined(__SSE2__)
++    const char *q=p;
++    while(end-q>=16) {
++      auto v=_mm_loadu_si128(reinterpret_cast<const __m128i*>(q));
++      unsigned lf=unsigned(_mm_movemask_epi8(_mm_cmpeq_epi8(v,_mm_set1_epi8('\n'))));
++      while(lf){auto *line=q+std::countr_zero(lf);field(p,line);p=line+1;lf&=lf-1;}
++      q+=16;
++    }
++#endif
++    while(p<end){
++      auto lf=static_cast<const char*>(std::memchr(p,'\n',end-p));
++      if(!lf){field(p,end);break;}
++      field(p,lf);p=lf+1;
++    }
++  }
++public:
++  PossibleRevisions(const std::vector<InputChunk> &parts,size_t estimate,unsigned threads) {
++    auto count=std::bit_ceil(std::clamp<size_t>(estimate,4096,size_t(1)<<26))*DISCOVERY_FACTOR;
++    mask=uint32_t(count-1);
++    repeated.resize(count/64);
++    using Queues=std::array<std::vector<uint32_t>,partitions>;
++    std::vector<Queues> queues(threads);
++    parallel(parts.size(),threads,[&](size_t i,unsigned owner){
++      KeyPool ids;
++      auto &out=queues[owner];
++      first_fields(parts[i].body(),[&](Str id){
++        auto tag=uint32_t(ids.encode(id,'e').hash())&mask;
++        out[tag%partitions].push_back(tag/partitions);
++      });
++    });
++    auto words=count/partitions/64;
++    parallel(partitions,threads,[&](size_t part,unsigned){
++      std::vector<uint64_t> seen(words);
++      auto *dup=repeated.data()+part*words;
++      for(auto &src:queues){
++        auto &values=src[part];
++        for(auto v:values){
++          auto bit=uint64_t{1}<<(v%64);auto &word=seen[v/64];
++          dup[v/64]|=word&bit;word|=bit;
++        }
++        std::vector<uint32_t>().swap(values);
++      }
++    });
++  }
++  bool contains(size_t hash) const {
++    auto v=uint32_t(hash)&mask;
++    auto at=size_t(v%partitions)*(repeated.size()/partitions)+(v/partitions)/64;
++    return (repeated[at]>>((v/partitions)%64))&1;
++  }
++};
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -20,6 +20,8 @@
+ };
+ template <class T> using Bins = std::array<std::vector<T>, shards>;
+ #include "partition_slab.hpp"
++#define DISCOVERY_FACTOR 8
++#include "discover_repeats.hpp"
+ template <class Layout> struct ScanWorker {
+   using EventData = typename Layout::E;
+   using ClickData = typename Layout::C;
+@@ -663,10 +665,12 @@
+     return sampled ? size_t(double(total) * count / sampled) : 0;
+   };
+   auto event_count = estimate(events), click_count = estimate(clicks);
++  PossibleRevisions maybe(events,event_count,threads);
++  timer.mark("locate possible repeated event ID fingerprints");
+   auto hint = [&](size_t count, size_t row_bytes, size_t budget) {
+     return std::min(count + count / 8, budget / row_bytes) / threads / shards;
+   };
+-  auto rev_hint = hint(event_count, sizeof(Candidate), size_t(1536) << 20);
++  auto rev_hint = hint(event_count/2, sizeof(Candidate), size_t(1536) << 20);
+   auto event_hint =
+       hint(event_count, sizeof(std::pair<Key, typename Layout::E>),
+            size_t(1536) << 20);
+@@ -735,6 +739,7 @@
+             location = uint64_t(rows.size()) * shards + b + 1;
+             rows.emplace_back(Key{user.bits}, layout.pack(e));
+           }
++          if(!maybe.contains(id.hash()))return;
+           Time seconds = ingest / 1000;
+           Time relative = seconds - anchor;
+           // Bias signed seconds into 31 bits. The high bit selects the overflow

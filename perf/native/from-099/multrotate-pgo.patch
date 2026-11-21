@@ -1,0 +1,28 @@
+--- a/cpp/input.hpp
++++ b/cpp/input.hpp
+@@ -367,14 +367,8 @@
+   return x;
+ }();
+ static_assert(key_multiplier*key_inverse==1);
+-inline uint64_t permute_key(uint64_t n) {
+-  n^=n>>27; n=(n*key_multiplier)&key_mask;
+-  return n^(n>>31);
+-}
+-inline uint64_t recover_key(uint64_t n) {
+-  n^=(n>>31)^(n>>62); n=(n*key_inverse)&key_mask;
+-  return n^(n>>27)^(n>>54);
+-}
++inline uint64_t permute_key(uint64_t n){return (n*key_multiplier)&key_mask;}
++inline uint64_t recover_key(uint64_t n){return (n*key_inverse)&key_mask;}
+ struct BorrowedKey { Str text; size_t hash; };
+ struct Key {
+   uintptr_t bits{};
+@@ -386,7 +380,7 @@
+   size_t hash() const {
+     if (indirect())
+       return reinterpret_cast<const BorrowedKey *>(bits-1)->hash;
+-    return bits >> 1;
++    return std::rotr(uint64_t(bits),32);
+   }
+   Str user_text(std::array<char, 9> &buffer, char prefix = 'u') const {
+     if (indirect())

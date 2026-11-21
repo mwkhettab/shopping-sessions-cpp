@@ -1,0 +1,95 @@
+--- a/cpp/input.hpp
++++ b/cpp/input.hpp
+@@ -147,8 +147,11 @@
+ #endif
+ #include "csv_x86.hpp"
+ #include "line_csv.hpp"
++#define SHOPPING_LEARN_WIDTH 1
++#include "typed_csv.hpp"
+ template <size_t N, class F> void parse_rows(Str data, F &&callback) {
+ #ifdef SHOPPING_X86_CSV
++  if constexpr (N == 7) if(wide_csv_supported()) { typed_events(data,callback); return; }
+   if (wide_csv_supported()) { line_csv_rows<N>(data,callback); return; }
+   if (wide_csv_supported()) {
+     wide_csv_rows<N>(data, callback);
+--- /dev/null
++++ b/cpp/typed_csv.hpp
+@@ -0,0 +1,78 @@
++#pragma once
++#ifdef SHOPPING_X86_CSV
++struct TypedEventFields {
++  const char *start;
++  std::array<uint8_t, 7> offsets, sizes;
++  Str operator[](size_t i) const { return {start + offsets[i], sizes[i]}; }
++  operator std::array<Str, 7>() const {
++    std::array<Str, 7> row;
++    for (unsigned i = 0; i < 7; ++i) row[i] = (*this)[i];
++    return row;
++  }
++};
++template<class F> __attribute__((target("avx2,bmi,popcnt"),always_inline))
++inline bool typed_prefix(const char *p, unsigned length, uint64_t lo, uint64_t hi,
++                         unsigned quote_count, unsigned first_width, unsigned second_width, F &fn) {
++  if (length < 52 || first_width > 20 || second_width > 20) return false;
++  // The two ID widths are predictions. Confirm every boundary, quote and field count.
++  unsigned q0 = p[0] == '"', c0 = first_width + 2*q0;
++  unsigned s1 = c0 + 1, q1 = p[s1] == '"', c1 = s1 + second_width + 2*q1;
++  unsigned s2=c1+1, q2=p[s2]=='"';
++  const char *clock=p+s2+q2;
++  unsigned tw=clock[4]=='-'?(clock[19]=='Z'?20:25):13;
++  unsigned c2=s2+tw+2*q2, s3=c2+1, q3=p[s3]=='"', c3=s3+20+2*q3;
++  unsigned s4=c3+1, q4=p[s4]=='"', tw4=p[s4+q4]=='p'?8:4, c4=s4+tw4+2*q4;
++  unsigned c5=hi?127u-unsigned(std::countl_zero(hi)):63u-unsigned(std::countl_zero(lo));
++  if(c4>=c5 || c5>=length) return false;
++  if((unsigned(p[c0]!=',') | unsigned(p[c1]!=',') | unsigned(p[c2]!=',') |
++      unsigned(p[c3]!=',') | unsigned(p[c4]!=','))) return false;
++  unsigned s5=c4+1, s6=c5+1;
++  unsigned q5=c5-s5>=2 && (p[s5]=='"' && p[c5-1]=='"');
++  unsigned q6=length-s6>=2 && (p[s6]=='"' && p[length-1]=='"');
++  if(2*(q0+q1+q2+q3+q4+q5+q6)!=quote_count ||
++     (q0 && p[c0-1]!='"') || (q1 && p[c1-1]!='"') ||
++     (q2 && p[c2-1]!='"') || (q3 && p[c3-1]!='"') || (q4 && p[c4-1]!='"')) return false;
++  TypedEventFields row{p,
++      {uint8_t(q0),uint8_t(s1+q1),uint8_t(s2+q2),uint8_t(s3+q3),uint8_t(s4+q4),uint8_t(s5+q5),uint8_t(s6+q6)},
++      {uint8_t(first_width),uint8_t(second_width),uint8_t(tw),20,uint8_t(tw4),uint8_t(c5-s5-2*q5),uint8_t(length-s6-2*q6)}};
++  fn(row);return true;
++}
++template<class F> __attribute__((target("avx2,bmi,popcnt")))
++void typed_events(Str data,F &fn) {
++  unsigned first=9,second=9;
++  while(data.size()>=160) {
++    const char *p=data.data();uint64_t lo=0,hi=0;unsigned quotes=0,len=0;
++    for(unsigned at=0;at<128;at+=32) {
++      auto m=row_mask32(p+at);
++      unsigned inside=m.lf?(m.lf&-m.lf)-1:~0u;
++      uint64_t bits=uint64_t(m.comma&inside)<<(at%64);
++      if(at<64)lo|=bits;else hi|=bits;
++      quotes+=std::popcount(m.quotes&inside);
++      if(m.lf){len=at+std::countr_zero(m.lf)+1;break;}
++    }
++    if(!len) {
++      auto lf=data.find('\n',128),n=lf==Str::npos?data.size():lf+1;
++      wide_csv_rows<7>(data.substr(0,n),fn);data.remove_prefix(n);continue;
++    }
++    data.remove_prefix(len);unsigned length=len-1;
++    if(std::popcount(lo)+std::popcount(hi)!=6)continue;
++    if(typed_prefix(p,length,lo,hi,quotes,first,second,fn))continue;
++    std::array<Str,7> generic;
++    unsigned start=0,pairs=0;
++    for(unsigned i=0;i<7;++i){
++      unsigned end=length;
++      if(i!=6){if(lo){end=std::countr_zero(lo);lo&=lo-1;}else{end=64+std::countr_zero(hi);hi&=hi-1;}}
++      unsigned q=end-start>=2 && ((p[start]=='"') & (p[end-1]=='"'));
++      pairs+=2*q; generic[i]={p+start+q,end-start-2*q};start=end+1;
++    }
++    if(pairs==quotes){
++#ifdef SHOPPING_LEARN_WIDTH
++      first=std::min<size_t>(generic[0].size(),21);
++      second=std::min<size_t>(generic[1].size(),21);
++#endif
++      fn(generic);
++    }
++  }
++  line_csv_rows<7>(data,fn);
++}
++#endif

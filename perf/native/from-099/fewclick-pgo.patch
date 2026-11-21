@@ -1,0 +1,107 @@
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -220,10 +220,10 @@
+     if (!use_bins)
+       std::sort(events.begin(), events.end(),
+                 [&](auto a, auto b) { return layout.less(a, b); });
+-    std::sort(clicks.begin(), clicks.end(), [](const auto &a, const auto &b) {
++  }
++  auto order_clicks=[&] {std::sort(clicks.begin(), clicks.end(), [](const auto &a, const auto &b) {
+       return a.ts == b.ts ? b.id.user_less(a.id, 'k') : a.ts < b.ts;
+-    });
+-  }
++    });};
+   size_t left = 0, right = 0;
+   UserDay daily{user, 0, 0, 0, 0, {}};
+   auto finish_day = [&] {
+@@ -254,11 +254,12 @@
+       result.purchased.push_back(category);
+     value += price;
+   };
+-  auto end_session = [&](Time start, int64_t count, int64_t revenue) {
+-    auto day = daily.day;
+-    ++daily.sessions;
+-    daily.events += count;
+-    daily.revenue += revenue;
++  struct Pending {Time start;int32_t day;int64_t revenue;};
++  auto credit=[&](int campaign,int32_t day,int64_t revenue) {
++    auto &counts=result.at(campaign,day);
++    ++counts.sessions;counts.purchases+=revenue!=0;counts.revenue+=revenue;
++  };
++  auto sliding=[&](Time start,int32_t day,int64_t revenue) {
+     {
+       MEASURE(attribution);
+       while (right < clicks.size() &&
+@@ -288,6 +289,36 @@
+     counts.revenue += revenue;
+     for (int campaign : result.active)
+       ++result.at(campaign, day).assists;
++  };
++  constexpr size_t max_pending=0,max_clicks=3;
++  std::array<Pending,max_pending> pending;
++  size_t saved=0;
++  bool sorted=false;
++  auto end_session=[&](Time start,int64_t count,int64_t revenue) {
++    int32_t day=daily.day;
++    ++daily.sessions;daily.events+=count;daily.revenue+=revenue;
++    if(clicks.empty()){credit(0,day,revenue);return;}
++    if constexpr(max_clicks>0) {
++      if(clicks.size()<=max_clicks) {
++        size_t winner=clicks.size();
++        std::array<int,max_clicks> assisted;unsigned seen=0;
++        for(size_t i=0;i<clicks.size();++i) {
++          auto &c=clicks[i];Time ct=layout.click_time(c);
++          if(ct>start || ct<start-reach)continue;
++          if(winner==clicks.size() || c.ts>clicks[winner].ts ||
++             (c.ts==clicks[winner].ts && c.id.user_less(clicks[winner].id,'k')))winner=i;
++          bool prior=false;for(unsigned j=0;j<seen;++j)prior|=assisted[j]==c.campaign;
++          if(!prior){assisted[seen++]=c.campaign;++result.at(c.campaign,day).assists;}
++        }
++        credit(winner==clicks.size()?0:clicks[winner].campaign,day,revenue);return;
++      }
++    }
++    if(!sorted) {
++      if constexpr(max_pending) if(saved<max_pending){pending[saved++]={start,day,revenue};return;}
++      order_clicks();sorted=true;
++      for(size_t i=0;i<saved;++i)sliding(pending[i].start,pending[i].day,pending[i].revenue);
++    }
++    sliding(start,day,revenue);
+   };
+   if (use_bins) {
+     MEASURE(session);
+@@ -313,6 +344,35 @@
+       }
+       end_session(start, i - first, revenue);
+     }
++  }
++  if constexpr(max_pending) if(!sorted && saved) {
++    std::array<Key,max_pending> best_id{};
++    std::array<Time,max_pending> best_time;
++    std::array<int,max_pending> winners{};
++    best_time.fill(bad);
++    for(auto &c:clicks) {
++      auto ts=layout.click_time(c);
++      size_t qualifies=0;
++      for(size_t i=0;i<saved;++i){
++        if(ts>pending[i].start || ts<pending[i].start-reach)continue;
++        qualifies|=size_t(1)<<i;
++        if(ts>best_time[i] || (ts==best_time[i] && c.id.user_less(best_id[i],'k'))){
++          best_time[i]=ts;best_id[i]=c.id;winners[i]=c.campaign;
++        }
++      }
++      if(!qualifies)continue;
++      auto &mask=result.activity[c.campaign].count;
++      if(!mask)result.active.push_back(c.campaign);
++      mask|=qualifies;
++    }
++    for(int campaign:result.active){
++      auto active_mask=result.activity[campaign].count;
++      while(active_mask){
++        ++result.at(campaign,pending[std::countr_zero(active_mask)].day).assists;
++        active_mask&=active_mask-1;
++      }
++    }
++    for(size_t i=0;i<saved;++i)credit(winners[i],pending[i].day,pending[i].revenue);
+   }
+   finish_day();
+   for (int campaign : result.active)

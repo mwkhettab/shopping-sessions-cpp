@@ -10,13 +10,13 @@ def emit(title, message):
     print(f'::notice file=BENCHMARKS.md,line=1,title={title}::{text}',flush=True)
 
 for root in map(Path,sys.argv[1:]):
-    for source in root.rglob('source-lines.txt'):
+    for source in root.rglob('source-lines*.txt'):
         folder=source.parent
         records=[]
         for line in source.read_text(errors='replace').splitlines():
             match=re.match(r'\s*([0-9.]+)%\s+(.+)',line)
             if match and len(records)<22:records.append(match.group(1)+'% '+match.group(2).strip()[:125])
-        emit('Source samples '+folder.name,' / '.join(records) or 'Source line report contained no samples.')
+        emit('Source samples '+folder.name+' '+source.stem,' / '.join(records) or 'Source line report contained no samples.')
     for profile in root.rglob('holdout-head-to-head.jsonl'):
         records={}
         for line in profile.read_text().splitlines():
@@ -37,5 +37,5 @@ for root in map(Path,sys.argv[1:]):
         if rows:emit('Top CPU symbols '+report.parent.name,' / '.join(rows[:9]))
     for report in root.rglob('all-notes.json'):
         notes=json.loads(report.read_text())
-        selected=[x for x in notes if x.startswith(('20M process PMU','ThreadSanitizer','Sampled source lines','Source line mapping','Line profile unavailable','Docker holdout'))]
+        selected=[x for x in notes if x.startswith(('Sampled branch-misses','Sampled cache-misses','20M process PMU','ThreadSanitizer','Sampled source lines','Source line mapping','Line profile unavailable','Docker holdout'))]
         if selected:emit('Image, counters and race checks', ' || '.join(selected)[:46500])

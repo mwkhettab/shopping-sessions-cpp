@@ -1,0 +1,154 @@
+--- /dev/null
++++ b/cpp/group_arena.hpp
+@@ -0,0 +1,39 @@
++#pragma once
++template<class T> class TimelineArena {
++  static_assert(std::is_trivially_copyable_v<T> && std::is_trivially_destructible_v<T>);
++  struct Block {T *data;size_t size;};
++  std::allocator<T> allocator;
++  std::vector<Block> blocks;
++  T *remaining_data{};
++  size_t remaining{};
++  T *block(size_t n) {
++    auto *p=allocator.allocate(n);
++    try {blocks.push_back({p,n});} catch(...) {allocator.deallocate(p,n);throw;}
++    return p;
++  }
++public:
++  TimelineArena()=default;
++  TimelineArena(const TimelineArena&)=delete;
++  ~TimelineArena(){for(auto b:blocks)allocator.deallocate(b.data,b.size);}
++  T *allocate(size_t n) {
++    constexpr size_t chunk=32768/sizeof(T);
++    if(n>chunk/2)return block(n);
++    if(n>remaining){remaining_data=block(chunk);remaining=chunk;}
++    auto *out=remaining_data;remaining_data+=n;remaining-=n;return out;
++  }
++};
++template<class T,size_t Initial> struct GrowingTimeline {
++  T *data{};
++  size_t count{};
++  void append(const T &value,TimelineArena<T> &arena) {
++    if(count==0)data=arena.allocate(Initial);
++    else if(count>=Initial && std::has_single_bit(count)) {
++      if(count>SIZE_MAX/2/sizeof(T))throw std::length_error("timeline too large");
++      T *next=arena.allocate(2*count);
++      std::memcpy(next,data,count*sizeof(T));
++      data=next;
++    }
++    std::construct_at(data+count,value);++count;
++  }
++  std::span<T> view() const{return {data,count};}
++};
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -398,6 +398,7 @@
+   for (auto &w : workers)
+     w.candidates.release();
+ }
++#include "group_arena.hpp"
+ template <class Layout>
+ void process_people(std::vector<ScanWorker<Layout>> &workers,
+                     std::vector<Result> &results, const Catalog &cat,
+@@ -406,17 +407,15 @@
+   using Vertex = typename Worker::Vertex;
+   using E = typename Layout::E;
+   using C = typename Layout::C;
+-  struct Store {
+-    std::vector<E> events;
+-    std::vector<C> clicks;
+-  };
++  struct Store {TimelineArena<E> events;TimelineArena<C> clicks;};
+   std::array<Store, shards> storage;
+   std::array<std::vector<Vertex>, shards> vertices;
+   parallel(shards, threads, [&](size_t b, unsigned t) {
+     MEASURE(grouping);
+     struct Group {
+       Key key;
+-      size_t event_end{}, click_end{};
++      GrowingTimeline<E,4> events;
++      GrowingTimeline<C,2> clicks;
+       size_t vertex{};
+     };
+     struct Slot {
+@@ -451,27 +450,15 @@
+       }
+       return x.group;
+     };
+-    // First count each alias, then scatter into disjoint contiguous spans.
+-    // A linked person may own spans in several of these raw-user shards.
+-    auto &store = storage[b];
+-    size_t event_count = 0, click_count = 0;
+-    for (auto &w : workers) {
+-      for (auto part : w.events[b].spans())
+-        for (auto &[u, e] : part) {
+-          if (!u.bits) {
+-            u.bits = UINTPTR_MAX;
+-            continue;
+-          }
+-          u.bits = intern(Key{u.bits});
+-          ++groups[u.bits].event_end;
+-          ++event_count;
+-        }
+-      for (auto part : w.clicks[b].spans())
+-        for (auto &[u, c] : part) {
+-          u.bits = intern(Key{u.bits});
+-          ++groups[u.bits].click_end;
+-        }
+-      click_count += w.clicks[b].size();
++    // Each alias owns a contiguous growing span. Completing the group needs no second scatter.
++    auto &store=storage[b];
++    for(auto &w:workers) {
++      for(auto part:w.events[b].spans())
++        for(auto &[key,e]:part)if(key.bits)groups[intern(key)].events.append(e,store.events);
++      for(auto part:w.clicks[b].spans())
++        for(auto &[key,c]:part)groups[intern(key)].clicks.append(c,store.clicks);
++      w.events[b].release();
++      w.clicks[b].release();
+     }
+     auto &nodes = vertices[b];
+     size_t nv = 0;
+@@ -489,40 +476,14 @@
+       typename std::remove_reference_t<decltype(w.endpoints)>::value_type()
+           .swap(w.endpoints[b]);
+     }
+-    store.events.resize(event_count);
+-    store.clicks.resize(click_count);
+-    size_t event_offset = 0, click_offset = 0;
+-    for (auto &g : groups) {
+-      auto events_in_group = g.event_end, clicks_in_group = g.click_end;
+-      g.event_end = event_offset;
+-      g.click_end = click_offset;
+-      event_offset += events_in_group;
+-      click_offset += clicks_in_group;
+-    }
+-    for (auto &w : workers) {
+-      for (auto part : w.events[b].spans())
+-        for (auto &[u, e] : part)
+-          if (u.bits != UINTPTR_MAX)
+-            store.events[groups[u.bits].event_end++] = e;
+-      for (auto part : w.clicks[b].spans())
+-        for (auto &[u, c] : part)
+-          store.clicks[groups[u.bits].click_end++] = c;
+-      w.events[b].release();
+-      w.clicks[b].release();
+-    }
+-    event_offset = click_offset = 0;
+-    for (auto &g : groups) {
+-      auto ev = std::span(store.events)
+-                    .subspan(event_offset, g.event_end - event_offset);
+-      auto cl = std::span(store.clicks)
+-                    .subspan(click_offset, g.click_end - click_offset);
++    for(auto &g:groups) {
++      auto ev=g.events.view();
++      auto cl=g.clicks.view();
+       if (g.vertex) {
+         auto &v = nodes[g.vertex - 1];
+         v = {g.key, &v, &v, 1, ev, cl};
+       } else
+         summarize(g.key, ev, cl, cat, results[t], layout);
+-      event_offset = g.event_end;
+-      click_offset = g.click_end;
+     }
+   });
+   for (auto &w : workers) {

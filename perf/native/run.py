@@ -204,6 +204,8 @@ def main():
                 # This job generated these input files and finished all seed-47 comparisons.
                 shutil.rmtree(data)
         publish()
+    from line_profile import collect as source_profile
+    source_profile(root,area,note,run,env,practice_winner)
     from input_profile import collect
     collect(root,area,'base',note,run,env)
     from extra_checks import scaling, race

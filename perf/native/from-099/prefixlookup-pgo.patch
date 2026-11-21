@@ -1,0 +1,76 @@
+--- a/cpp/input.hpp
++++ b/cpp/input.hpp
+@@ -147,8 +147,11 @@
+ #endif
+ #include "csv_x86.hpp"
+ #include "line_csv.hpp"
++#define SHOPPING_NIBBLE_GRAMMAR 1
++#include "predicted_prefix.hpp"
+ template <size_t N, class F> void parse_rows(Str data, F &&callback) {
+ #ifdef SHOPPING_X86_CSV
++  if constexpr (N == 7) if(wide_csv_supported()){contract_events(data,callback);return;}
+   if (wide_csv_supported()) { line_csv_rows<N>(data,callback); return; }
+   if (wide_csv_supported()) {
+     wide_csv_rows<N>(data, callback);
+--- /dev/null
++++ b/cpp/predicted_prefix.hpp
+@@ -0,0 +1,59 @@
++#pragma once
++#ifdef SHOPPING_X86_CSV
++__attribute__((target("avx2,bmi,popcnt"),always_inline))
++inline unsigned structural32(const char *p) {
++  auto v=_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
++#ifdef SHOPPING_NIBBLE_GRAMMAR
++  auto low=_mm256_and_si256(v,_mm256_set1_epi8(15));
++  auto high=_mm256_and_si256(v,_mm256_set1_epi8(char(0xf0)));
++  // Each of the three CSV structural bytes has a distinct low nibble.
++  auto table=_mm256_broadcastsi128_si256(_mm_setr_epi8(1,1,32,1,1,1,1,1,1,1,0,1,32,1,1,1));
++  auto special=_mm256_cmpeq_epi8(high,_mm256_shuffle_epi8(table,low));
++#else
++  auto special=_mm256_or_si256(_mm256_cmpeq_epi8(v,_mm256_set1_epi8('\n')),
++      _mm256_or_si256(_mm256_cmpeq_epi8(v,_mm256_set1_epi8(',')),_mm256_cmpeq_epi8(v,_mm256_set1_epi8('"'))));
++#endif
++  return unsigned(_mm256_movemask_epi8(special));
++}
++template<class F> __attribute__((target("avx2,bmi,popcnt"),always_inline))
++inline unsigned contracted_row(const char *p,unsigned w0,unsigned w1,F &emit) {
++  unsigned q0=p[0]=='"',c0=w0+2*q0,s1=c0+1,q1=p[s1]=='"',c1=s1+w1+2*q1;
++  unsigned s2=c1+1,q2=p[s2]=='"',t=s2+q2;
++  unsigned width=p[t+4]=='-'?(p[t+19]=='Z'?20:25):13;
++  unsigned c2=s2+width+2*q2,s3=c2+1,q3=p[s3]=='"',c3=s3+20+2*q3;
++  unsigned s4=c3+1,q4=p[s4]=='"',kind=p[s4+q4]=='p'?8:4,c4=s4+kind+2*q4;
++  if((unsigned(p[c0]!=',')|unsigned(p[c1]!=',')|unsigned(p[c2]!=',')|unsigned(p[c3]!=',')|unsigned(p[c4]!=',')) ||
++      (q0 && p[c0-1]!='"') || (q1 && p[c1-1]!='"') || (q2 && p[c2-1]!='"') ||
++      (q3 && p[c3-1]!='"') || (q4 && p[c4-1]!='"')) return 0;
++  unsigned prefix=c4+1,seen=0,at=0;
++  for(;at+32<=prefix;at+=32)seen+=std::popcount(structural32(p+at));
++  if(at<prefix)seen+=std::popcount(structural32(p+at)&((1u<<(prefix-at))-1));
++  if(seen!=5+2*(q0+q1+q2+q3+q4))return 0;
++  auto tail=row_mask32(p+prefix);
++  if(!tail.lf)return 0;
++  unsigned lf=std::countr_zero(tail.lf),inside=(1u<<lf)-1,commas=tail.comma&inside;
++  if(!std::has_single_bit(commas))return 0;
++  unsigned item=std::countr_zero(commas),c5=prefix+item,end=prefix+lf,s6=c5+1;
++  unsigned q5=item>=2 && ((p[prefix]=='"') & (p[c5-1]=='"'));
++  unsigned q6=end-s6>=2 && ((p[s6]=='"') & (p[end-1]=='"'));
++  if(2*(q5+q6)!=unsigned(std::popcount(tail.quotes&inside)))return 0;
++  std::array<Str,7> row={Str(p+q0,w0),Str(p+s1+q1,w1),Str(p+t,width),Str(p+s3+q3,20),
++                         Str(p+s4+q4,kind),Str(p+prefix+q5,item-2*q5),Str(p+s6+q6,end-s6-2*q6)};
++  emit(row);return end+1;
++}
++template<class F> __attribute__((target("avx2,bmi,popcnt")))
++void contract_events(Str data,F &emit) {
++  unsigned w0=9,w1=9,misses=0;
++  while(data.size()>=192){
++    if(auto n=contracted_row(data.data(),w0,w1,emit)){data.remove_prefix(n);misses=0;continue;}
++    if(++misses>=12)break;
++    auto lf=data.find('\n'),n=lf==Str::npos?data.size():lf+1;
++    scalar_rows<7>(data.substr(0,n),[&](auto &row){
++      if(row[0].size()<=24 && row[1].size()<=24){w0=unsigned(row[0].size());w1=unsigned(row[1].size());}
++      emit(row);
++    });
++    data.remove_prefix(n);
++  }
++  line_csv_rows<7>(data,emit);
++}
++#endif

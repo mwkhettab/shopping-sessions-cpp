@@ -1,1 +1,1 @@
-base fin-slabkey-pgo releasewriter-pgo releasecampaign-pgo pagelines-pgo reservelines-pgo densereserve-pgo streamout-pgo shard64r512-pgo shard256r512-pgo shard512r128-pgo shard512r1024-pgo ntall-pgo ntraw-pgo unifiedhot-pgo pipe1-pgo probe6-pgo
+base fin-slabkey-pgo releasehot-pgo colpage-pgo colpagelines-pgo allcolpage-pgo rawcol256-pgo col256-pgo streamhot-pgo releasecampaign-pgo arena4-pgo discover8-pgo typedwidth-pgo prefixlookup-pgo onesweep-pgo fewclick-pgo multrotate-pgo
