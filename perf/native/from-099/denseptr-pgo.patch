@@ -1,0 +1,58 @@
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -233,7 +233,7 @@
+       auto &v = result.spend[k];
+       if (v > best || (v == best && cat.categories[k] < *daily.category)) {
+         best = v;
+-        daily.category = cat.categories[k];
++        daily.category = &cat.categories[k];
+       }
+       v = 0;
+     }
+@@ -779,13 +779,29 @@
+                     ("part-" + std::to_string(i) + ".parquet"),
+                 results[i].users);
+   });
+-  Totals merged;
+-  for (auto &r : results)
+-    r.merge_into(merged);
+   std::vector<CampaignDay> campaigns;
+-  for (auto &[key, c] : merged)
+-    campaigns.push_back(
+-        {cat.campaigns[key.first], cat.channels[key.first], key.second, c});
++  auto append=[&](size_t id,int32_t day,const Counts &c){
++    campaigns.push_back({cat.campaigns[id],cat.channels[id],day,c});
++  };
++  const auto &first=results.front();
++  if(!first.table.empty()) {
++    for(size_t start=0;start<first.table.size();start+=first.campaigns) {
++      int32_t day=first.first_day+int32_t(start/first.campaigns);
++      for(size_t id=0;id<first.campaigns;++id) {
++        Counts c{};
++        for(const auto &r:results) {
++          const auto &part=r.table[start+id];
++          c.sessions+=part.sessions;c.purchases+=part.purchases;
++          c.revenue+=part.revenue;c.assists+=part.assists;
++        }
++        if(c.sessions||c.assists)append(id,day,c);
++      }
++    }
++  } else {
++    Totals merged;
++    for(auto &r:results)r.merge_into(merged);
++    for(auto &[key,c]:merged)append(key.first,key.second,c);
++  }
+   write_campaigns(output / "campaign_daily" / "part-0.parquet", campaigns);
+   timer.mark("merge and Parquet output");
+ #ifdef SHOPPING_DIAGNOSTICS
+--- a/cpp/output.hpp
++++ b/cpp/output.hpp
+@@ -3,7 +3,7 @@
+   Key user;
+   int32_t day;
+   int64_t sessions, events, revenue;
+-  std::optional<Str> category;
++  const Str *category{};
+ };
+ struct Counts {
+   int64_t sessions{}, purchases{}, revenue{}, assists{};

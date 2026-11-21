@@ -1,0 +1,104 @@
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -20,12 +20,13 @@
+ };
+ template <class T> using Bins = std::array<std::vector<T>, shards>;
+ #include "partition_slab.hpp"
++#include "rev_columns.hpp"
+ template <class Layout> struct ScanWorker {
+   using EventData = typename Layout::E;
+   using ClickData = typename Layout::C;
+   using Candidate = RevisionIndex;
+   std::vector<ExtendedRevision> extended;
+-  PartitionSlab<Candidate> candidates;
++  RevisionColumns<256> candidates;
+   PartitionSlab<std::pair<Key, EventData>> events;
+   PartitionSlab<std::pair<Key, ClickData>> clicks;
+   struct Vertex {
+@@ -344,7 +345,6 @@
+     while (capacity < count + count / 2)
+       capacity *= 2;
+     MEASURE(dedup);
+-    std::vector<uint64_t> best(capacity);
+     auto seconds = [&](const Candidate &r, unsigned owner) {
+       return r.ingest & 0x80000000u
+                  ? workers[owner].extended[r.location].seconds
+@@ -359,13 +359,14 @@
+         w.events[location % shards][location / shards].first.bits = 0;
+       }
+     };
++    std::vector<uint64_t> best(capacity);
+     for (unsigned owner = 0; owner < workers.size(); ++owner) {
+       auto &refs = workers[owner].candidates[b];
+       // Reserve zero for an empty slot. Six low bits identify one of at most
+       // 64 input workers, and the remaining bits locate its immutable revision.
+       for (size_t i = 0; i < refs.size(); ++i) {
+-        auto &r = refs[i];
+-        size_t at = (r.id.hash() / shards) & (capacity - 1);
++        Key key = refs.key(i);
++        size_t at = (key.hash() / shards) & (capacity - 1);
+         for (;;) {
+           auto code = best[at];
+           if (!code) {
+@@ -373,8 +374,10 @@
+             break;
+           }
+           auto old_owner = unsigned((code - 1) & 63);
+-          auto &old = workers[old_owner].candidates[b][(code - 1) >> 6];
+-          if (old.id == r.id) {
++          auto &previous=workers[old_owner].candidates[b];
++          if (previous.key((code-1)>>6)==key) {
++            auto old=previous[(code-1)>>6];
++            auto r=refs[i];
+ #ifdef SHOPPING_DIAGNOSTICS
+             ++workers[t].duplicates;
+ #endif
+--- /dev/null
++++ b/cpp/rev_columns.hpp
+@@ -0,0 +1,46 @@
++#pragma once
++template<size_t Width> struct RevisionColumns {
++  struct Block {
++    uintptr_t keys[Width];
++    std::array<uint32_t,2> data[Width];
++  };
++  struct Bin {
++    Block *blocks{};
++    size_t used{},limit{};
++    std::vector<Block> more;
++    size_t size() const{return used;}
++    size_t capacity() const{return limit+more.capacity()*Width;}
++    const Block &block(size_t i) const{return i<limit?blocks[i/Width]:more[(i-limit)/Width];}
++    Key key(size_t i) const{return {block(i).keys[i%Width]};}
++    RevisionIndex operator[](size_t i) const {
++      const auto &b=block(i);auto j=i%Width;
++      return {Key{b.keys[j]},b.data[j][0],b.data[j][1]};
++    }
++    void push_back(RevisionIndex r) {
++      Block *p;
++      size_t j=used%Width;
++      if(used<limit){
++        p=&blocks[used/Width];
++        if(!j)::new(static_cast<void*>(p)) Block;
++      }
++      else {
++        if(!j)more.emplace_back();
++        p=&more.back();
++      }
++      p->keys[j]=r.id.bits;p->data[j]={r.ingest,r.location};++used;
++    }
++    void release(){std::vector<Block>().swap(more);}
++  };
++  PartitionSlab<Block> slab;
++  std::array<Bin,shards> bins;
++  void reserve(size_t count) {
++    slab.reserve((count+Width-1)/Width);
++    for(size_t i=0;i<bins.size();++i){
++      bins[i].blocks=slab[i].data;bins[i].limit=slab[i].limit*Width;
++    }
++  }
++  void release(){slab.release();}
++  Bin &operator[](size_t i){return bins[i];}
++  const Bin &operator[](size_t i)const{return bins[i];}
++  auto begin()const{return bins.begin();}auto end()const{return bins.end();}
++};

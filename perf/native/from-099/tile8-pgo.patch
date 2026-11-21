@@ -1,0 +1,104 @@
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -124,12 +124,13 @@
+       throw std::runtime_error("invalid manifest window");
+   }
+ };
+-template <class Row>
++#include "tile_events.hpp"
++template <int Form=0, class Row>
+ Event validate(const Row &r, Time ingest, const Catalog &catalog, Window w) {
+   Event drop{bad, 0, 0};
+   if (r[1].empty() || r[5].empty())
+     return drop;
+-  Time ts = timestamp(r[2]);
++  Time ts = tile_timestamp<Form>(r[2]);
+   if (ts < w.start || ts >= w.end || ingest - ts > day_ms)
+     return drop;
+   if (r[4] == "view" || r[4] == "cart")
+@@ -715,13 +716,13 @@
+           });
+           return;
+         }
+-        rows<7>(events[job].body(), [&](auto &r) {
++        tiled_event_rows<8,false>(events[job].body(), [&]<int Form>(const auto &r) {
+           if (r[0].empty())
+             return;
+           Time ingest = ingest_time(r[3]);
+           // Invalid revisions still take part in earliest-ingest selection.
+           Key id = workers[t].pool.encode(r[0], 'e');
+-          Event e = validate(r, ingest, cat, window);
++          Event e = validate<Form>(r, ingest, cat, window);
+ #ifdef SHOPPING_DIAGNOSTICS
+           ++workers[t].revisions;
+           workers[t].valid_events += e.ts != bad;
+--- /dev/null
++++ b/cpp/tile_events.hpp
+@@ -0,0 +1,67 @@
++#pragma once
++template<int Form> inline Time tile_timestamp(Str s) {
++  if constexpr(Form==3) {
++    auto a=little_word(s.data()),b=little_word(s.data()+5);
++    if(!eight_digits(a)||!eight_digits(b))return bad;
++    return Time(decimal_eight(a))*100000+decimal_eight(b&~0xffffffULL);
++  } else if constexpr(Form==1||Form==2) {
++    const char *p=s.data();
++    if(p[4]!='-')return number(s,INT64_MAX);
++    int sec=clock_seconds<true>(p+11);
++    if(p[10]!='T'||sec<0)return bad;
++    if constexpr(Form==1) {
++      if(p[19]!='Z')return bad;
++    } else {
++      int h=pair_digits(p+20),m=pair_digits(p+23);
++      if((p[19]!='+'&&p[19]!='-')||p[22]!=':'||unsigned(h)>23||unsigned(m)>59)return bad;
++      sec-=(h*3600+m*60)*(p[19]=='+'?1:-1);
++    }
++    Time base=midnight(p);
++    return base==bad?bad:base+sec*1000LL;
++  } else return timestamp(s);
++}
++
++struct TileView {
++  const char *base{};
++  std::array<uint8_t,7> from{},length{};
++  Str operator[](size_t i) const {return {base+from[i],length[i]};}
++  bool assign(const std::array<Str,7> &r) {
++    base=r[0].data();
++    auto total=r[6].data()-base;
++    if(size_t(total)>255||r[6].size()>255||size_t(total)+r[6].size()>255)return false;
++    for(unsigned i=0;i<7;++i) {
++      from[i]=uint8_t(r[i].data()-base);
++      length[i]=uint8_t(r[i].size());
++    }
++    return true;
++  }
++};
++
++template<unsigned Count, bool Compact,class F>
++void tiled_event_rows(Str body,F process) {
++  using Stored=std::conditional_t<Compact,TileView,std::array<Str,7>>;
++  struct Tile {std::array<Stored,Count> values;unsigned used{};};
++  std::array<Tile,4> sets;
++  auto flush=[&]<int Form>(Tile &rows) {
++    for(unsigned i=0;i<rows.used;++i)process.template operator()<Form>(rows.values[i]);
++    rows.used=0;
++  };
++  auto put=[&]<int Form>(const std::array<Str,7> &r) {
++    Tile &set=sets[Form];
++    if constexpr(Compact) {
++      if(!set.values[set.used].assign(r)){process.template operator()<Form>(r);return;}
++    } else set.values[set.used]=r;
++    if(++set.used==Count)flush.template operator()<Form>(set);
++  };
++  rows<7>(body,[&](const auto &fields){
++    size_t n=fields[2].size();
++    switch(n) {
++      case 20:put.template operator()<1>(fields);break;
++      case 25:put.template operator()<2>(fields);break;
++      case 13:put.template operator()<3>(fields);break;
++      default:put.template operator()<0>(fields);break;
++    }
++  });
++  flush.template operator()<0>(sets[0]);flush.template operator()<1>(sets[1]);
++  flush.template operator()<2>(sets[2]);flush.template operator()<3>(sets[3]);
++}

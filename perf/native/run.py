@@ -179,6 +179,9 @@ def main():
         for b,obs in observations.items():
             if obs: note('Eviction '+scale+' '+b.name,f"(seconds, starting residency, major faults) {obs}")
         if scale=='practice':
+            from line_profile import collect as measure_lines
+            measure_lines(root,area,note,run,env)
+            publish()
             practice_times=performance.copy()
             practice_winner=best.name
             src=area/best.name
@@ -205,8 +208,6 @@ def main():
     from extra_checks import scaling, race
     scaling(root,area,practice_winner,note,run,env)
     race(root,area,practice_winner,note,run,env)
-    from line_profile import collect as measure_lines
-    measure_lines(root,area,note,run,env)
 
 published=0
 def publish():

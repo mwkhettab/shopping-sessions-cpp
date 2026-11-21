@@ -1,0 +1,82 @@
+--- a/cpp/input.hpp
++++ b/cpp/input.hpp
+@@ -147,8 +147,10 @@
+ #endif
+ #include "csv_x86.hpp"
+ #include "line_csv.hpp"
++#include "line_tile.hpp"
+ template <size_t N, class F> void parse_rows(Str data, F &&callback) {
+ #ifdef SHOPPING_X86_CSV
++  if(wide_csv_supported()){tiled_lines<N,8>(data,callback);return;}
+   if (wide_csv_supported()) { line_csv_rows<N>(data,callback); return; }
+   if (wide_csv_supported()) {
+     wide_csv_rows<N>(data, callback);
+--- /dev/null
++++ b/cpp/line_tile.hpp
+@@ -0,0 +1,66 @@
++#pragma once
++#ifdef SHOPPING_X86_CSV
++inline uint64_t mask_to(unsigned n){return n>=64?~uint64_t{}:(uint64_t{1}<<n)-1;}
++template<size_t N,class F>
++__attribute__((target("avx2,bmi,popcnt"),always_inline))
++inline void split_known_line(const char *p,size_t len,const char *end,F &fn) {
++  if(len>=128||end-p<128) {
++    scalar_rows<N>(Str(p,len),fn);
++    return;
++  }
++  uint64_t lo,hi=0,ql,qh=0;
++  auto get=[&](unsigned at,uint64_t &commas,uint64_t &quotes)
++      __attribute__((target("avx2,bmi,popcnt"),always_inline)) {
++    auto a=_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p+at));
++    auto b=_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p+at+32));
++    auto comma=_mm256_set1_epi8(','),quote=_mm256_set1_epi8('"');
++    uint64_t c0=unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a,comma)));
++    uint64_t q0=unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a,quote)));
++    uint64_t c1=unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b,comma)));
++    uint64_t q1=unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b,quote)));
++    auto mask=mask_to(unsigned(len)-at);
++    commas=(c0|(c1<<32))&mask;quotes=(q0|(q1<<32))&mask;
++  };
++  get(0,lo,ql);
++  if(len>64)get(64,hi,qh);
++  if(size_t(std::popcount(lo)+std::popcount(hi))!=N-1)return;
++  std::array<Str,N> fields;
++  unsigned start=0,wrapped=0;
++  for(unsigned i=0;i<N;++i) {
++    unsigned cut=unsigned(len);
++    if(i+1<N) {
++      if(lo){cut=std::countr_zero(lo);lo&=lo-1;}
++      else{cut=64+std::countr_zero(hi);hi&=hi-1;}
++    }
++    unsigned width=cut-start;
++    bool quotes=width>=2 && ((p[start]=='"') & (p[cut-1]=='"'));
++    wrapped+=2*quotes;
++    fields[i]={p+start+quotes,width-2*quotes};start=cut+1;
++  }
++  if(wrapped==unsigned(std::popcount(ql)+std::popcount(qh)))fn(fields);
++}
++
++template<size_t N,unsigned Batch,class F>
++__attribute__((target("avx2,bmi,popcnt"))) void tiled_lines(Str data,F &fn) {
++  size_t from=0,scan=0;
++  std::array<size_t,Batch> ends;
++  unsigned n=0;
++  auto flush=[&]() __attribute__((target("avx2,bmi,popcnt"),always_inline)){
++    for(unsigned i=0;i<n;++i) {
++      auto to=ends[i];split_known_line<N>(data.data()+from,to-from,data.data()+data.size(),fn);from=to+1;
++    }
++    n=0;
++  };
++  auto lf=_mm256_set1_epi8('\n');
++  for(;scan+32<=data.size();scan+=32) {
++    auto v=_mm256_loadu_si256(reinterpret_cast<const __m256i*>(data.data()+scan));
++    auto mask=unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v,lf)));
++    while(mask) {
++      ends[n++]=scan+std::countr_zero(mask);mask&=mask-1;
++      if(n==Batch)flush();
++    }
++  }
++  if(n)flush();
++  if(from<data.size())line_csv_rows<N>(data.substr(from),fn);
++}
++#endif

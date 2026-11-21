@@ -1,0 +1,72 @@
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -344,7 +344,6 @@
+     while (capacity < count + count / 2)
+       capacity *= 2;
+     MEASURE(dedup);
+-    std::vector<uint64_t> best(capacity);
+     auto seconds = [&](const Candidate &r, unsigned owner) {
+       return r.ingest & 0x80000000u
+                  ? workers[owner].extended[r.location].seconds
+@@ -359,6 +358,61 @@
+         w.events[location % shards][location / shards].first.bits = 0;
+       }
+     };
++    // The shard and primary bucket give the low hash bits for every resident.
++    // The primary word stores every remaining inline key bit and its winner.
++    // Arbitrary byte strings use their cached hash and retain exact equality.
++    constexpr size_t ways=8;
++    size_t most=0;
++    for(auto &w:workers)most=std::max(most,w.candidates[b].size());
++    unsigned owner_bits=std::bit_width(workers.size()-1);
++    unsigned loc_bits=std::bit_width(most)+owner_bits;
++    size_t bucket_count=std::max<size_t>(1,capacity/ways);
++    unsigned prefix_bits=std::countr_zero(shards)+std::countr_zero(bucket_count);
++    if(loc_bits>0 && loc_bits<=prefix_bits && loc_bits<63) {
++      auto loc_mask=(uint64_t{1}<<loc_bits)-1;
++      auto owner_mask=(size_t{1}<<owner_bits)-1;
++      std::vector<std::array<uint64_t,ways>> primary(bucket_count);
++      std::unordered_map<Key,uint64_t,KeyHash> extra;
++      for(unsigned owner=0;owner<workers.size();++owner) {
++        auto &refs=workers[owner].candidates[b];
++        for(size_t i=0;i<refs.size();++i) {
++          Key key=refs[i].id;
++          const uint64_t hash=key.hash();
++          auto &bucket=primary[(hash/shards)&(bucket_count-1)];
++          const uint64_t sig=((hash>>prefix_bits)<<(loc_bits+1))|(uint64_t(key.indirect())<<loc_bits);
++          const uint64_t here=1+(uint64_t(i)<<owner_bits)+owner;
++          auto choose=[&](uint64_t &entry){
++            uint64_t winner=(entry&loc_mask)-1;
++            auto old_owner=unsigned(winner&owner_mask);
++            auto old=workers[old_owner].candidates[b][winner>>owner_bits];
++            auto r=refs[i];
++            bool before=(r.ingest|old.ingest)&0x80000000u ? seconds(r,owner)<seconds(old,old_owner):r.ingest<old.ingest;
++            if(before){discard(old,old_owner);entry=(entry&~loc_mask)|here;}else discard(r,owner);
++#ifdef SHOPPING_DIAGNOSTICS
++            ++workers[t].duplicates;
++#endif
++          };
++          auto place=[&]{
++            for(auto &entry:bucket) {
++              if(!entry){entry=sig|here;return;}
++              if((entry&~loc_mask)!=sig)continue;
++              if(key.indirect()){
++                auto code=(entry&loc_mask)-1;
++                auto &old=workers[code&owner_mask].candidates[b];
++                if(!(old[code>>owner_bits].id==key))continue;
++              }
++              choose(entry);return;
++            }
++            auto [it,added]=extra.try_emplace(key,here);
++            if(!added)choose(it->second);
++          };
++          place();
++        }
++      }
++      for(auto &w:workers)w.candidates[b].release();
++      return;
++    }
++    std::vector<uint64_t> best(capacity);
+     for (unsigned owner = 0; owner < workers.size(); ++owner) {
+       auto &refs = workers[owner].candidates[b];
+       // Reserve zero for an empty slot. Six low bits identify one of at most

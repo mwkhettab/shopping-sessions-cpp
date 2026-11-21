@@ -1,1 +1,1 @@
-base fin-slabkey-pgo maingroups6-pgo groupscatter-pgo ptrcategory-pgo outreserve-pgo streamout-pgo bankall16-pgo bankraw-pgo schema-pgo cutlist-pgo partials-pgo partialprices-pgo
+base fin-slabkey-pgo denseend-pgo denseptr-pgo densereserve-pgo edgequote-pgo edgepdep-pgo line8-pgo eventlines-pgo tile8-pgo insert3-pgo col256-pgo ways8-pgo colways-pgo

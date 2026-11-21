@@ -1,0 +1,81 @@
+--- a/cpp/input.hpp
++++ b/cpp/input.hpp
+@@ -147,8 +147,13 @@
+ #endif
+ #include "csv_x86.hpp"
+ #include "line_csv.hpp"
++#define SHOPPING_PDEP_CUTS 1
++#include "quoted_bits.hpp"
+ template <size_t N, class F> void parse_rows(Str data, F &&callback) {
+ #ifdef SHOPPING_X86_CSV
++  if(wide_csv_supported() && __builtin_cpu_supports("bmi2")) {
++    edge_rows<N>(data,callback);return;
++  }
+   if (wide_csv_supported()) { line_csv_rows<N>(data,callback); return; }
+   if (wide_csv_supported()) {
+     wide_csv_rows<N>(data, callback);
+--- /dev/null
++++ b/cpp/quoted_bits.hpp
+@@ -0,0 +1,62 @@
++#pragma once
++#ifdef SHOPPING_X86_CSV
++struct MaskFields {
++  const char *base;
++  std::array<uint8_t,8> first,last;
++  Str operator[](size_t i) const {return {base+first[i],size_t(last[i]-first[i])};}
++  template<size_t N> operator std::array<Str,N>() const {
++    std::array<Str,N> out;for(size_t i=0;i<N;++i)out[i]=(*this)[i];return out;
++  }
++};
++template<size_t N,class F>
++__attribute__((target("avx2,bmi,bmi2,popcnt"))) void edge_rows(Str data,F &callback) {
++  while(data.size()>=128) {
++    const char *p=data.data();
++    uint64_t lo=0,hi=0,ql=0,qh=0;
++    unsigned len=0;
++    for(unsigned at=0;at<128;at+=32) {
++      auto m=row_mask32(p+at);
++      unsigned select=m.lf?(m.lf&-m.lf)-1:~0u;
++      auto cs=uint64_t(m.comma&select)<<(at%64);
++      auto qs=uint64_t(m.quotes&select)<<(at%64);
++      if(at<64){lo|=cs;ql|=qs;}else{hi|=cs;qh|=qs;}
++      if(m.lf){len=at+std::countr_zero(m.lf)+1;break;}
++    }
++    if(!len) {
++      auto n=data.find('\n',128);n=n==Str::npos?data.size():n+1;
++      wide_csv_rows<N>(data.substr(0,n),callback);data.remove_prefix(n);continue;
++    }
++    data.remove_prefix(len);
++    unsigned nl=len-1,low=std::popcount(lo);
++    if(low+std::popcount(hi)!=N-1)continue;
++    unsigned wrapped=0;
++    if(ql|qh) {
++      auto d0=lo,d1=hi;
++      if(nl<64)d0|=uint64_t{1}<<nl;else d1|=uint64_t{1}<<(nl-64);
++      auto starts0=(lo<<1)|1,starts1=(hi<<1)|(lo>>63);
++      auto ends0=(d0>>1)|(d1<<63),ends1=d1>>1;
++      if((ql&~(starts0^ends0))|(qh&~(starts1^ends1)))continue;
++      wrapped=unsigned(_pext_u64(ql,starts0)|(_pext_u64(qh,starts1)<<std::popcount(starts0)));
++      auto ends=_pext_u64((ql<<1),d0)|(_pext_u64((qh<<1)|(ql>>63),d1)<<std::popcount(d0));
++      if(wrapped!=ends)continue;
++    }
++    MaskFields row{p,{},{}};
++    unsigned start=0;
++    for(unsigned i=0;i<N;++i) {
++      unsigned end=nl;
++      if(i+1<N) {
++#ifdef SHOPPING_PDEP_CUTS
++        end=i<low?std::countr_zero(_pdep_u64(uint64_t{1}<<i,lo))
++                 :64+std::countr_zero(_pdep_u64(uint64_t{1}<<(i-low),hi));
++#else
++        if(lo){end=std::countr_zero(lo);lo&=lo-1;}else{end=64+std::countr_zero(hi);hi&=hi-1;}
++#endif
++      }
++      unsigned q=(wrapped>>i)&1;
++      row.first[i]=uint8_t(start+q);row.last[i]=uint8_t(end-q);start=end+1;
++    }
++    callback(row);
++  }
++  line_csv_rows<N>(data,callback);
++}
++#endif
