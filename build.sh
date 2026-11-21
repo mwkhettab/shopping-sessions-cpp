@@ -3,6 +3,9 @@ set -eu
 mkdir -p build
 compiler=${CXX:-c++}
 set -- -std=c++20 -O3 -DNDEBUG -pthread
+if [ "${DIRECT_DICT_LOOPS:-0}" = 1 ]; then
+    set -- "$@" -DSHOP_DIRECT_DICT_LOOPS=1
+fi
 if [ "${STATIC:-0}" = 1 ]; then
     set -- "$@" -static
 fi

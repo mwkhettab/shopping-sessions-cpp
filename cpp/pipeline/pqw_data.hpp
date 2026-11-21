@@ -73,11 +73,20 @@ struct Data {
                 if (nullable||plain) throw std::logic_error("offset dictionary encoding");
                 if (hi==lo) {d.strings.offsets={};break;}
                 const std::span v(static_cast<const pipeline::u32*>(d.keys.ptr),d.keys.n);
+#if defined(SHOP_DIRECT_DICT_LOOPS) && SHOP_DIRECT_DICT_LOOPS
+                u32 lowest=UINT32_MAX,highest=0;
+                for (const u32 key:v) {
+                    lowest=std::min(lowest,key);
+                    highest=std::max(highest,key);
+                }
+#else
                 const auto [mn,mx]=std::minmax_element(v.begin(),v.end());
-                if (*mn<keys.base || (std::size_t(*mx)-keys.base)>=strings.len())
+                const u32 lowest=*mn,highest=*mx;
+#endif
+                if (lowest<keys.base || (std::size_t(highest)-keys.base)>=strings.len())
                     throw std::range_error("dictionary key");
-                d.strings=strings.slice(*mn-keys.base,std::size_t(*mx-keys.base)+1);
-                d.keys.base=*mn;
+                d.strings=strings.slice(lowest-keys.base,std::size_t(highest-keys.base)+1);
+                d.keys.base=lowest;
                 break;
             }
         }

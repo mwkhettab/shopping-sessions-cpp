@@ -14,8 +14,15 @@ struct Meta {
 inline u8 *copy_string(u8* dst,const StrCol& s,std::size_t key) {
     const std::size_t start=s.offsets[key],len=s.offsets[key+1]-start;
     store(dst,u32(len));
+#if defined(SHOP_DIRECT_DICT_LOOPS) && SHOP_DIRECT_DICT_LOOPS
+    if (len<=16 && start+16<=s.data.size())
+        std::memcpy(dst+4,s.data.data()+start,16);
+    else if (len)
+        std::memcpy(dst+4,s.data.data()+start,len);
+#else
     auto n=(len<=16 && start+16<=s.data.size())?16:len;
     if(n) std::memcpy(dst+4,s.data.data()+start,n);
+#endif
     return dst+4+len;
 }
 inline void plain_strings(Out& o,const StrCol& s) {
