@@ -426,15 +426,15 @@ def main():
             state["implementations"][tag]["tested"] = True
             state["verified"]["1M/" + tag] = "36 fixtures, additional edge cases, both published 1M tables"
         mark("patterned rules")
-        for tag in ("candidate", *args.runtime_builds, *comparisons):
+        for tag in ("baseline", "candidate", *args.runtime_builds, *comparisons):
             if tag not in bins:
                 continue
             rules = results/(tag + "-patterned-rules.jsonl")
             try:
-                exec_logged([sys.executable, NATIVE/"port_patterns.py", bins[tag], bins["baseline"],
+                exec_logged([sys.executable, NATIVE/"port_patterns.py", bins[tag], bins.get("scored", bins["baseline"]),
                              area/"starter-pyspark/fixtures", "--log", rules], rules.with_suffix(".log"), env)
             except subprocess.CalledProcessError as error:
-                if tag == "candidate":
+                if tag in ("candidate", "baseline"):
                     raise
                 state["implementations"][tag].update(tested=False, excluded="patterned rules failure", error=str(error))
                 del bins[tag]

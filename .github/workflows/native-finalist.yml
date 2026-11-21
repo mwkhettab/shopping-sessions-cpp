@@ -1,4 +1,4 @@
-name: Native C++ column encoding and session qualification
+name: Native compact click and event layout qualification
 on:
   push:
     branches: [bench/native-x64-trials]
@@ -32,17 +32,23 @@ jobs:
           ref: ${{ steps.image.outputs.commit }}
           path: .acceptance/candidate
           persist-credentials: false
+      - name: Check out the compact click index with ordinary event records
+        uses: actions/checkout@v4
+        with:
+          ref: d15e54c5dcf22e04a0cce213a8816e7471875cac
+          path: .acceptance/baseline
+          persist-credentials: false
       - name: Check out the official 0.30 s release
         uses: actions/checkout@v4
         with:
           ref: 7f59c0b8c268d735ebc3e3ecbd68c7a17302e4b1
-          path: .acceptance/baseline
+          path: .acceptance/scored
           persist-credentials: false
-      - name: Check out the column encoder alone
+      - name: Check out the qualified writer and session port
         uses: actions/checkout@v4
         with:
-          ref: 7cddc342fa5c0cd5e08eb7cd6f6a9cc634d7a0f4
-          path: .acceptance/columns
+          ref: 665950e89ceefa8606400a2090f08964b9e16928
+          path: .acceptance/previous-port
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
@@ -61,11 +67,18 @@ jobs:
             c++ -std=c++20 -O3 "${flags[@]}" -I"$src/cpp/pipeline" "$src/tests/pipeline/sparse_user_groups.cpp" -o "$RUNNER_TEMP/user-groups"
             "$RUNNER_TEMP/shopping-python/bin/python" "$src/tests/pipeline/sparse_user_groups.py" "$RUNNER_TEMP/user-groups"
           done
+          for suite in click_words routing_part routing_event12 routing_input_release; do
+            g++-12 -std=c++20 -O3 -pthread -Wno-ignored-attributes -DSHOP_R12_SCATTER=1 -I"$src/cpp/pipeline" \
+              "$src/tests/pipeline/$suite.cpp" "$src/cpp/pipeline/sys_global_alloc.cpp" -o "$RUNNER_TEMP/layout-test"
+            "$RUNNER_TEMP/layout-test"
+          done
       - name: Prepare comparison executables
         shell: bash
         run: |
           area="$RUNNER_TEMP/shopping-trials"
-          docker buildx build --platform linux/amd64 --output "type=local,dest=$area/columns" .acceptance/columns
+          for tag in scored previous-port; do
+            docker buildx build --platform linux/amd64 --output "type=local,dest=$area/$tag" ".acceptance/$tag"
+          done
           gzip -dc perf/native/revision_trials/reference.elf.gz > "$area/reference"
           chmod +x "$area/reference"
       - name: Compare full processes and shipping containers
@@ -76,8 +89,9 @@ jobs:
           area="$RUNNER_TEMP/shopping-trials"
           "$RUNNER_TEMP/shopping-python/bin/python" perf/native/port_acceptance.py \
             --candidate-source "$GITHUB_WORKSPACE/.acceptance/candidate" \
-            --require-baseline-commit 7f59c0b8c268d735ebc3e3ecbd68c7a17302e4b1 \
-            --comparison-binary "columns=$area/columns/app/shopping" \
+            --require-baseline-commit d15e54c5dcf22e04a0cce213a8816e7471875cac \
+            --comparison-binary "scored=$area/scored/app/shopping" \
+            --comparison-binary "previous-port=$area/previous-port/app/shopping" \
             --peer-binary "$area/reference" --peer-binary-sha256 6f6779cb7ec58760b69325369b5ac6657405230b0c3c2231214c6680038a86ce \
             --release-generated-practice --release-generated-final \
             --warm-20 9 --warm-60 5 --cold-runs 1 --container-lifetime-pairs 3
@@ -85,7 +99,7 @@ jobs:
           import json,sys
           state=json.load(open(sys.argv[1]))
           for size in ("1M","20M","60M"):
-              assert f"{size}/columns" in state["verified"],size
+              assert all(f"{size}/{tag}" in state["verified"] for tag in ("scored","previous-port","baseline","candidate")),size
           PYTHON
       - name: Publish native measurements and qualification
         if: always()
@@ -97,7 +111,14 @@ jobs:
         env:
           SHIPPING_SHA: ${{ steps.image.outputs.commit }}
         run: |
-          "$RUNNER_TEMP/shopping-python/bin/python" perf/native/holdout_shipping.py --shipping-commit "$SHIPPING_SHA" --baseline-commit 7f59c0b8c268d735ebc3e3ecbd68c7a17302e4b1
+          "$RUNNER_TEMP/shopping-python/bin/python" perf/native/holdout_shipping.py --shipping-commit "$SHIPPING_SHA" --baseline-commit d15e54c5dcf22e04a0cce213a8816e7471875cac
+          python3 - "$RUNNER_TEMP/shopping-trials/results" <<'PYTHON'
+          from pathlib import Path
+          import sys,json
+          record=json.loads(next(Path(sys.argv[1]).glob("shipping-733-*/status.json")).read_text())
+          expected={'campaign_daily': {'rows': 28014, 'sha256': '26f47d8f745a814bf3c80fbe53af7f21a87d252ef91ea1e3afa9437daedb74f5'}, 'user_daily': {'rows': 6621736, 'sha256': '11821bf58ec2cb4407bef662c80988e20b3860587110d7d345dfe06c7c104d96'}}
+          assert record["tables"]["baseline"] == record["tables"]["shipping"] == expected
+          PYTHON
       - name: Verify both 1M tables with baseline x86-64 instruction dispatch
         if: steps.qualify.outcome == 'success'
         shell: bash
@@ -107,16 +128,18 @@ jobs:
           out="$area/results/baseline-isa"
           mkdir -p "$out"
           export NCPU=1 XL_TIMING=1
+          for tag in baseline candidate; do
           for mode in compact generic; do
             flags=()
             if test "$mode" = generic; then flags=(--generic); fi
             temp=$(mktemp -d "$RUNNER_TEMP/isa-output.XXXXXX")
-            qemu-x86_64 -cpu Nehalem "$area/accept-binaries/candidate/shopping" "${flags[@]}" \
+            qemu-x86_64 -cpu Nehalem "$area/accept-binaries/$tag/shopping" "${flags[@]}" \
               "$area/dev" "$temp" > "$out/$mode.log" 2>&1
             if test "$mode" = compact; then grep -q 'parse=' "$out/$mode.log"; fi
             "$RUNNER_TEMP/shopping-python/bin/python" "$area/starter-pyspark/scripts/compare.py" \
               "$temp" "$area/dev-answer" >> "$out/$mode.log"
             rm -r -- "$temp"
+          done
           done
           echo '::notice title=Portable x86-64 release::The compact and explicitly selected generic parsers each matched both published 1M tables on a Nehalem CPU model.'
       - name: Exercise native SIMD and parked-worker retry paths
