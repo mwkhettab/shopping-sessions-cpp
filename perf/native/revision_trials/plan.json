@@ -1,0 +1,9 @@
+{
+  "base": "29ee0cc5c26291c511cad44aec18c6531f050f79",
+  "variants": {
+    "paired-events": ["paired-events"],
+    "click-pairs": ["click-pairs"],
+    "stage192": ["stage192"],
+    "sparse-groups": ["sparse-groups"]
+  }
+}

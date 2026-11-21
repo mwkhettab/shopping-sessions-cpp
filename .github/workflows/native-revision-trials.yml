@@ -1,0 +1,100 @@
+name: Native event, click and output revisions
+on:
+  push:
+    branches: [bench/native-x64-trials]
+    paths:
+      - .github/workflows/native-revision-trials.yml
+      - perf/native/revision_trials/**
+permissions:
+  contents: read
+jobs:
+  compare:
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [first, second, third]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    env:
+      CXX: g++-12
+      BUILDKIT_PROGRESS: plain
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Identify a native Intel worker
+        id: cpu
+        run: python3 perf/native/intel-wide-runner.py
+      - name: Select the paired control revision
+        id: release
+        if: steps.cpu.outputs.wide == 'true'
+        run: |
+          python3 - <<'PYTHON'
+          import json, os, re
+          rev=json.load(open("perf/native/revision_trials/plan.json"))["base"]
+          assert re.fullmatch(r"[0-9a-f]{40}",rev)
+          with open(os.environ["GITHUB_OUTPUT"],"a") as f: print("commit="+rev,file=f)
+          PYTHON
+      - name: Check out the qualified Clang release
+        if: steps.cpu.outputs.wide == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.release.outputs.commit }}
+          path: .acceptance/candidate
+          persist-credentials: false
+      - name: Check out the independent reference implementation
+        if: steps.cpu.outputs.wide == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: 4db76beed31640ddf4b414ed19deba5ebc660b81
+          path: .acceptance/baseline
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        if: steps.cpu.outputs.wide == 'true'
+        with:
+          python-version: '3.12'
+      - name: Prepare the input files and published reference tables
+        if: steps.cpu.outputs.wide == 'true'
+        run: bash perf/native/prepare-port-runner.sh
+      - name: Build revisions independently and run native row guards
+        if: steps.cpu.outputs.wide == 'true'
+        run: python3 perf/native/revision_trials/build.py .acceptance/candidate "$RUNNER_TEMP/shopping-trials/revision-binaries"
+      - name: Compare whole tables and time rotated fresh processes
+        if: steps.cpu.outputs.wide == 'true'
+        run: |
+          area="$RUNNER_TEMP/shopping-trials"
+          variants=()
+          while read -r variant; do
+            variants+=(--comparison-binary "$variant=$area/revision-binaries/$variant/app/shopping")
+          done < "$area/revision-binaries/passed.txt"
+          if test -f perf/native/revision_trials/reference.elf.gz; then
+            gzip -dc perf/native/revision_trials/reference.elf.gz > "$area/revision-binaries/reference"
+            chmod +x "$area/revision-binaries/reference"
+            expected=$(cat perf/native/revision_trials/reference.sha256)
+            variants+=(--peer-binary "$area/revision-binaries/reference" --peer-binary-sha256 "$expected")
+          fi
+          "$RUNNER_TEMP/shopping-python/bin/python" perf/native/port_acceptance.py \
+            --candidate-source "$GITHUB_WORKSPACE/.acceptance/candidate" "${variants[@]}" \
+            --release-generated-practice --warm-20 9 --warm-60 5 --cold-runs 1
+          python3 - "$area/results/port-acceptance/status.json" <<'PY'
+          import json, sys
+          state = json.load(open(sys.argv[1]))
+          assert state["verified"]["kernel"] == "wide SIMD"
+          for name in json.load(open("perf/native/revision_trials/plan.json"))["variants"]:
+              matched=[s for s in ("1M","20M","60M") if f"{s}/{name}" in state["verified"]]
+              annotation="notice" if len(matched)==3 else "warning"
+              print(f"::{annotation} title={name} qualification::Full table checks {matched}, {state['implementations'].get(name,{}).get('excluded','')}.")
+          PY
+      - name: Publish stage and end-to-end results
+        if: always() && steps.cpu.outputs.wide == 'true'
+        run: |
+          area="$RUNNER_TEMP/shopping-trials/results"
+          if test -f "$area/port-acceptance/status.json"; then python3 perf/native/publish_profile.py "$area"; fi
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.cpu.outputs.wide == 'true'
+        with:
+          name: revision-trials-${{ matrix.lane }}
+          path: |
+            ${{ runner.temp }}/shopping-trials/results/
+            ${{ runner.temp }}/shopping-trials/revision-binaries/*.log
+          retention-days: 7

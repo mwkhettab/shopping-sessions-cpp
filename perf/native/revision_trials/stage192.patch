@@ -1,0 +1,175 @@
+diff --git a/cpp/pipeline/model_types.hpp b/cpp/pipeline/model_types.hpp
+--- a/cpp/pipeline/model_types.hpp
++++ b/cpp/pipeline/model_types.hpp
+@@ -4,6 +4,13 @@
+ #include <utility>
+ 
+ namespace pipeline {
++#ifndef SHOP_PARTITION_STAGE_BYTES
++#define SHOP_PARTITION_STAGE_BYTES 192
++#endif
++namespace parse {
++inline constexpr std::size_t PART_STAGE_BYTES=SHOP_PARTITION_STAGE_BYTES;
++static_assert(PART_STAGE_BYTES==64 || PART_STAGE_BYTES==192);
++}
+ using i32 = std::int32_t;
+ using i16 = std::int16_t;
+ using i8 = std::int8_t;
+diff --git a/cpp/pipeline/parse_part.hpp b/cpp/pipeline/parse_part.hpp
+--- a/cpp/pipeline/parse_part.hpp
++++ b/cpp/pipeline/parse_part.hpp
+@@ -31,14 +31,14 @@
+     return value;
+ }
+ 
+-struct alignas(64) Line { std::array<Rec, 4> rows; };
++struct alignas(64) Line { std::array<Rec, PART_STAGE_BYTES/sizeof(Rec)> rows; };
+ 
+ class Part {
+     struct alignas(64) Page {
+         Rec rows[LINK_OFF / sizeof(Rec)];
+         Page* next;
+     };
+-    static_assert(sizeof(Line) == 64 && sizeof(Page) == CHUNK);
++    static_assert(sizeof(Line) == PART_STAGE_BYTES && LINK_OFF%PART_STAGE_BYTES==0 && sizeof(Page)==CHUNK);
+     static_assert(offsetof(Page, next) == LINK_OFF);
+     std::vector<Line> lines_;
+     std::vector<u8> fill_;
+@@ -56,7 +56,7 @@
+     explicit Part(std::size_t nb)
+         : lines_(nb), fill_(nb + 64), cur_(nb, LINK_OFF),
+           nch_(nb), n_(nb), head_(nb), populate_(popw()),
+-          pend_(72 * sizeof(Line) / sizeof(u64)) {}
++          pend_(72) {}
+ 
+     [[gnu::noinline]] std::uintptr_t new_chunk(std::size_t bucket, std::uintptr_t old) {
+         if (block_ == block_end_) {
+@@ -99,10 +99,13 @@
+     }
+     template<bool Stream> __attribute__((target("avx512f"),always_inline))
+     static inline void line_x86(std::uintptr_t address,const Line& line) {
+-        auto value = _mm512_load_si512(&line);
+-        auto *out = reinterpret_cast<__m512i*>(address);
+-        if constexpr (Stream) _mm512_stream_si512(out,value);
+-        else _mm512_store_si512(out,value);
++        auto* out=reinterpret_cast<__m512i*>(address);
++        const auto* in=reinterpret_cast<const __m512i*>(&line);
++        for(std::size_t i=0;i<PART_STAGE_BYTES/64;++i) {
++            const auto value=_mm512_load_si512(in+i);
++            if constexpr(Stream) _mm512_stream_si512(out+i,value);
++            else _mm512_store_si512(out+i,value);
++        }
+     }
+     template<bool Stream> __attribute__((target("avx512f")))
+     void flush_one_x86(std::size_t b) {line_x86<Stream>(take_line(b),lines_[b]);}
+@@ -161,7 +164,7 @@
+     inline void push(std::size_t bucket, u64 w0, u64 w1) {
+         const auto offset = fill_[bucket];
+         lines_[bucket].rows[offset / sizeof(Rec)] = {w0, w1};
+-        if (offset == 48) {
++        if (offset + sizeof(Rec) == PART_STAGE_BYTES) {
+             if (NT) flush_line<true>(bucket);
+             else flush_line<false>(bucket);
+         } else {
+@@ -192,7 +195,7 @@
+             const auto b = std::size_t(buckets[i]);
+             if constexpr(Indexed) note_ordinal(b,records[i][0]);
+             unsigned offset = fill_[b];
+-            if (offset == 64) {
++            if (offset == PART_STAGE_BYTES) {
+                 flush_full(pending);
+                 pending = 0;
+                 offset = 0;
+@@ -203,7 +206,7 @@
+             const auto next = unsigned(offset + sizeof(Rec));
+             fill_[b] = u8(next);
+             pend_[pending] = b;
+-            pending += next >> 6;
++            pending += next == PART_STAGE_BYTES;
+         };
+         if (mask == (n >= 64 ? UINT64_MAX : (u64{1} << n) - 1)) {
+             for (std::size_t i = 0; i < n; ++i) row(i);
+diff --git a/cpp/pipeline/parse_packets.hpp b/cpp/pipeline/parse_packets.hpp
+--- a/cpp/pipeline/parse_packets.hpp
++++ b/cpp/pipeline/parse_packets.hpp
+@@ -43,7 +43,7 @@
+         const u64 ing_s=(u64(u32(ing))*274877907ull)>>38;
+         out.rec[i]={word0,(event&(BSIZE-1))|(ing_s<<16)|((valid?user:0)<<37)};
+         out.ob[i]=event>>BB;
+-        out.lp[i]=u64(std::uintptr_t(p.lines))+(out.ob[i]<<6);
++        out.lp[i]=u64(std::uintptr_t(p.lines))+out.ob[i]*PART_STAGE_BYTES;
+     }
+     return {regular,~regular&active_mask(n),bad};
+ }
+@@ -60,7 +60,7 @@
+             regular |= u64{1}<<i;
+         out.rec[i]={id|((user&(UBSIZE-1))<<43),(rel<<32)|(camp<<4)|alias};
+         out.ob[i]=user>>UB;
+-        out.lp[i]=u64(std::uintptr_t(p.lines))+(out.ob[i]<<6);
++        out.lp[i]=u64(std::uintptr_t(p.lines))+out.ob[i]*PART_STAGE_BYTES;
+     }
+     return {regular,keep & ~regular};
+ }
+@@ -103,7 +103,7 @@
+         _mm512_store_si512(out.rec.data()+j,_mm512_permutex2var_epi64(word0,even,word1));
+         _mm512_store_si512(out.rec.data()+j+4,_mm512_permutex2var_epi64(word0,odd,word1));
+         _mm512_store_si512(out.ob.data()+j,bucket);
+-        _mm512_store_si512(out.lp.data()+j,_mm512_add_epi64(_mm512_slli_epi64(bucket,6),splat8(std::uintptr_t(p.lines))));
++        _mm512_store_si512(out.lp.data()+j,_mm512_add_epi64(mulu32_8(bucket,splat8(PART_STAGE_BYTES)),splat8(std::uintptr_t(p.lines))));
+         badb |= u64(bad)<<j;
+         purchases |= u64(pm)<<j;
+         regular |= u64(ok)<<j;
+@@ -156,7 +156,7 @@
+         _mm256_store_si256(reinterpret_cast<__m256i*>(out.rec.data()+j),_mm256_permutex2var_epi64(o0,even,o1));
+         _mm256_store_si256(reinterpret_cast<__m256i*>(out.rec.data()+j+2),_mm256_permutex2var_epi64(o0,odd,o1));
+         _mm256_store_si256(reinterpret_cast<__m256i*>(out.ob.data()+j),bucket);
+-        _mm256_store_si256(reinterpret_cast<__m256i*>(out.lp.data()+j),_mm256_add_epi64(_mm256_slli_epi64(bucket,6),splat4(std::uintptr_t(p.lines))));
++        _mm256_store_si256(reinterpret_cast<__m256i*>(out.lp.data()+j),_mm256_add_epi64(_mm256_mul_epu32(bucket,splat4(PART_STAGE_BYTES)),splat4(std::uintptr_t(p.lines))));
+         regular |= u64(ok)<<j;
+         kept |= u64(keep)<<j;
+     }
+diff --git a/cpp/pipeline/parse_links.hpp b/cpp/pipeline/parse_links.hpp
+--- a/cpp/pipeline/parse_links.hpp
++++ b/cpp/pipeline/parse_links.hpp
+@@ -102,7 +102,7 @@
+         auto w0=_mm512_or_si512(splat8(u64{1}<<63),_mm512_or_si512(_mm512_slli_epi64(_mm512_and_si512(ua,splat8(UBSIZE-1)),43),_mm512_or_si512(_mm512_slli_epi64(aa,4),ab)));
+         auto bucket=_mm512_srli_epi64(ua,UB),zero=_mm512_setzero_si512();
+         _mm512_store_si512(c.out.rec.data()+j,_mm512_permutex2var_epi64(w0,even,zero));_mm512_store_si512(c.out.rec.data()+j+4,_mm512_permutex2var_epi64(w0,odd,zero));
+-        _mm512_store_si512(c.out.ob.data()+j,bucket);_mm512_store_si512(c.out.lp.data()+j,_mm512_add_epi64(line,_mm512_slli_epi64(bucket,6)));
++        _mm512_store_si512(c.out.ob.data()+j,bucket);_mm512_store_si512(c.out.lp.data()+j,_mm512_add_epi64(line,mulu32_8(bucket,splat8(PART_STAGE_BYTES))));
+         mask.regular|=u64(ok)<<j;mask.gen|=u64(ne&~ok)<<j;mask.decoded|=u64(ma&mb)<<j;
+     }
+     return mask;
+@@ -132,7 +132,7 @@
+         if(!a || !b || a->first!=b->first) {m.gen|=u64{1}<<i;continue;}
+         const u64 u=a->first,ub=u>>UB;
+         c.out.rec[i]={(u64{1}<<63)|((u&(UBSIZE-1))<<43)|(u64(a->second)<<4)|b->second,0};
+-        c.out.ob[i]=ub;c.out.lp[i]=std::uintptr_t(c.t.us.lines_ptr())+(ub<<6);m.regular|=u64{1}<<i;
++        c.out.ob[i]=ub;c.out.lp[i]=std::uintptr_t(c.t.us.lines_ptr())+ub*PART_STAGE_BYTES;m.regular|=u64{1}<<i;
+     }
+     return m;
+ }
+diff --git a/tests/pipeline/routing_part.cpp b/tests/pipeline/routing_part.cpp
+--- a/tests/pipeline/routing_part.cpp
++++ b/tests/pipeline/routing_part.cpp
+@@ -33,7 +33,7 @@
+             for (unsigned j=0;j<n;++j) {
+                 const auto b = rng()%buckets;
+                 offsets[j] = b;
+-                pointers[j] = reinterpret_cast<std::uintptr_t>(part.lines_ptr()+64*b);
++                pointers[j] = reinterpret_cast<std::uintptr_t>(part.lines_ptr()+parse::PART_STAGE_BYTES*b);
+                 records[j] = {rng(),rng()};
+                 if ((mask >> j) & 1) expected[b].push_back(records[j]);
+             }
+diff --git a/tests/pipeline/routing_sinks.cpp b/tests/pipeline/routing_sinks.cpp
+--- a/tests/pipeline/routing_sinks.cpp
++++ b/tests/pipeline/routing_sinks.cpp
+@@ -13,7 +13,7 @@
+     void push_indexed(u64 b,u64 w0,u64 w1){push(b,w0,w1);}
+     void push_indexed_many(u64 m,std::size_t n,const u64* b,const u64* p,const std::array<u64,2>* r){push_many(m,n,b,p,r);}
+     void push_many(u64 mask,std::size_t,const u64* bs,const u64* ptr,const std::array<u64,2>* rec) {
+-        for(;mask;mask&=mask-1) {auto i=std::countr_zero(mask);assert(ptr[i]==std::uintptr_t(lines_ptr())+bs[i]*64);push(bs[i],rec[i][0],rec[i][1]);}
++        for(;mask;mask&=mask-1) {auto i=std::countr_zero(mask);assert(ptr[i]==std::uintptr_t(lines_ptr())+bs[i]*parse::PART_STAGE_BYTES);push(bs[i],rec[i][0],rec[i][1]);}
+     }
+ };
+ struct State {

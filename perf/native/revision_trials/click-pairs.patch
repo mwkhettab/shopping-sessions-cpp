@@ -1,0 +1,365 @@
+diff --git a/cpp/pipeline/iface.hpp b/cpp/pipeline/iface.hpp
+--- a/cpp/pipeline/iface.hpp
++++ b/cpp/pipeline/iface.hpp
+@@ -61,6 +61,10 @@
+     CkBatch() {
+         scratch.fill(SCRATCH_INIT);
+         scratch[2] = scratch[3] = 0;
++#if defined(__ELF__) && defined(__x86_64__) && defined(SHOP_KERNEL_ABSOLUTE_TABLES)
++        // Keep an uninitialized day-cache entry from matching an all-comma input.
++        scratch[48*4+1] ^= u64{','^'-'}<<8;
++#endif
+     }
+     ClRow row(std::size_t i) const { return {cid[i], uid[i], u32(camp[i]), ts[i]}; }
+ };
+diff --git a/cpp/pipeline/k_free_tables.hpp b/cpp/pipeline/k_free_tables.hpp
+--- a/cpp/pipeline/k_free_tables.hpp
++++ b/cpp/pipeline/k_free_tables.hpp
+@@ -321,6 +321,9 @@
+     }
+     return rows;
+ }();
++#if defined(__ELF__) && defined(__x86_64__) && defined(SHOP_KERNEL_ABSOLUTE_TABLES)
++#include "k_free_click_tables.hpp"
++#endif
+ #undef K_FREE_ASM_NAME
+ static_assert(offsetof(Tables,kid1)==937472 && offsetof(Tables,uid1)-64==941504);
+ static_assert(offsetof(CkBatch,camp)==512 && offsetof(CkBatch,cid)==1024 && offsetof(CkBatch,uid)==1536);
+diff --git a/cpp/pipeline/k_free_clicks.S b/cpp/pipeline/k_free_clicks.S
+--- a/cpp/pipeline/k_free_clicks.S
++++ b/cpp/pipeline/k_free_clicks.S
+@@ -1,6 +1,8 @@
+ // Two staged rows share the decoder registers. The exit reports the first row
+ // needing repair, or the next row after filling the 64-slot output batch.
+-#if defined(__ELF__) && defined(__x86_64__)
++#if defined(__ELF__) && defined(__x86_64__) && defined(SHOP_KERNEL_ABSOLUTE_TABLES)
++#include "k_free_click_pairs.inc"
++#elif defined(__ELF__) && defined(__x86_64__)
+ .intel_syntax noprefix
+ .text
+ .equ KID1,937472
+diff --git a/cpp/pipeline/k_free_click_tables.hpp b/cpp/pipeline/k_free_click_tables.hpp
+new file mode 100644
+--- /dev/null
++++ b/cpp/pipeline/k_free_click_tables.hpp
+@@ -0,0 +1,124 @@
++// Included after the baseline timestamp and ID lookup tables.
++#pragma once
++
++struct alignas(128) ClickIdPair {
++    A<u8,32> ctrl{}, subtract{}, leading_zero{}, padding{};
++};
++
++inline constexpr auto CLICK_ID_PAIRS K_FREE_ASM_NAME("shopping_click_id_pairs") = [] {
++    constexpr auto clicks = id_shapes_raw('k',0,8,false);
++    constexpr auto users = id_shapes_raw('u',0,8,true);
++    ClickIdPair invalid{};
++    invalid.ctrl.fill(0x80);
++    invalid.subtract[8] = invalid.subtract[24] = 1;
++    A<ClickIdPair,34*32> pairs{};
++    pairs.fill(invalid);
++    // The scan returns position 32 when no delimiter is present.
++    for (unsigned first=0; first<32; ++first) {
++        for (unsigned second=first+1; second<32; ++second) {
++            auto &out = pairs[first*32+second];
++            const auto &click = clicks[first];
++            const unsigned width = second-first-1;
++            const auto &user = users[width];
++            for (unsigned i=0; i<16; ++i) {
++                out.ctrl[i] = click.ctrl[i];
++                out.subtract[i] = click.subv[i];
++                out.leading_zero[i] = click.lz[i];
++            }
++            if (user.orv[1] || width>15) continue;
++            for (unsigned i=0; i<16; ++i) {
++                const auto s = user.ctrl[i];
++                out.ctrl[16+i] = s==0x80 ? s : u8(s+width-15);
++                out.subtract[16+i] = user.subv[i];
++                out.leading_zero[16+i] = user.lz[i];
++            }
++        }
++    }
++    return pairs;
++}();
++
++struct alignas(64) ClickCampaign {
++    A<u8,16> ctrl{}, subtract{}, limit{}, padding{};
++};
++
++inline constexpr auto CLICK_CAMPAIGNS K_FREE_ASM_NAME("shopping_click_campaigns") = [] {
++    ClickCampaign invalid{};
++    invalid.ctrl.fill(0x80);
++    invalid.subtract[8] = 1;
++    A<ClickCampaign,320> rows{};
++    rows.fill(invalid);
++    for (unsigned quoted=0; quoted<=1; ++quoted) {
++        for (unsigned digits=1; digits<=4; ++digits) {
++            const unsigned width=2+digits+2*quoted, first=15-width, start=15-quoted-digits;
++            const unsigned lead=quoted ? '"' : 'c';
++            auto &s=rows[lead+64-2*(width+1)];
++            s.ctrl.fill(0x80);
++            s.subtract.fill(0);
++            for (unsigned i=0; i<4; ++i) s.limit[i]=9;
++            for (unsigned i=0; i<digits; ++i) {
++                s.ctrl[4-digits+i]=u8(start+i);
++                s.subtract[4-digits+i]='0';
++            }
++            s.ctrl[8]=u8(first+quoted); s.subtract[8]='c';
++            s.ctrl[9]=u8(first+quoted+1); s.subtract[9]='_';
++            s.ctrl[10]=15; s.subtract[10]=',';
++            if (quoted) {
++                s.ctrl[11]=14; s.subtract[11]='"';
++                s.ctrl[12]=u8(first); s.subtract[12]='"';
++            }
++            s.ctrl[13]=u8(first-1); s.subtract[13]=',';
++            if (digits>1) {
++                s.ctrl[14]=u8(start);
++                s.subtract[14]='1';
++                s.limit[14]=8;
++            }
++        }
++    }
++    return rows;
++}();
++
++inline constexpr auto CLICK_CLOCKS K_FREE_ASM_NAME("shopping_click_clocks") = [] {
++    auto rows=CTS;
++    for (unsigned quoted=0; quoted<=1; ++quoted) {
++        auto &r=rows[26+2*quoted];
++        r.base[15]='-';
++        r.w1[14]=r.w1[15]=1;
++        r.limv[3]=255;
++        r.ksel.fill(0);
++        r.ksel[15]=0x80;
++        r.kmf={0,-60000};
++    }
++    return rows;
++}();
++
++struct alignas(64) ClickConstants {
++    A<u8,32> comma{}, newline{}, letter_bias{}, letter_limit{}, digit_limit{}, digit_bias{};
++    A<u16,16> radix_pair{};
++    A<u32,8> radix_four{};
++    A<u64,4> radix_eight{};
++    A<u8,16> decimal_pair{};
++    A<u32,4> decimal_four{};
++    A<u64,2> offset_sign{};
++};
++
++inline constexpr auto CLICK_CONSTANTS K_FREE_ASM_NAME("shopping_click_constants") = [] {
++    ClickConstants c{};
++    c.comma.fill(','); c.newline.fill('\n'); c.digit_bias.fill(217);
++    for (unsigned lane: {0u,16u}) {
++        for (unsigned i=0; i<8; ++i) {
++            c.letter_bias[lane+i]=207;
++            c.letter_limit[lane+i]=25;
++            c.digit_limit[lane+i]=9;
++        }
++    }
++    c.radix_pair.fill(0x0124);
++    c.radix_four.fill(0x00010510);
++    c.radix_eight.fill(1679616);
++    c.decimal_pair={10,1,10,1};
++    c.decimal_four={0x00010064};
++    c.offset_sign={0,u64{0x80}<<56};
++    return c;
++}();
++
++static_assert(sizeof(ClickIdPair)==128 && sizeof(ClickCampaign)==64);
++static_assert(offsetof(ClickConstants,radix_pair)==192 && offsetof(ClickConstants,offset_sign)==320);
+diff --git a/cpp/pipeline/k_free_click_pairs.inc b/cpp/pipeline/k_free_click_pairs.inc
+new file mode 100644
+--- /dev/null
++++ b/cpp/pipeline/k_free_click_pairs.inc
+@@ -0,0 +1,191 @@
++// Decode click pairs and retry the first row that fails validation.
++.intel_syntax noprefix
++.text
++.hidden shopping_click_campaigns
++.hidden shopping_click_id_pairs
++.hidden shopping_click_clocks
++.hidden shopping_click_constants
++
++.macro click_pair_prepare a, b, cin, nlin, cout, nlout, row, x, days, bad, badx, camp, ids
++    lea \a, [\b + \nlin + 33]
++    vpcmpeqb ymm0, ymm13, ymmword ptr [\a]
++    vpmovmskb \cout, ymm0
++    vpcmpeqb ymm1, ymm12, ymmword ptr [\a + 32]
++    vpmovmskb \nlout, ymm1
++    tzcnt \nlout, \nlout
++    prefetcht0 byte ptr [\a + 1024]
++    tzcnt r8d, \cin
++    blsr \cin, \cin
++    tzcnt r9d, \cin
++    blsr \cin, \cin
++    tzcnt r10d, \cin
++    vmovdqu ymm3, ymmword ptr [\b + r8 - 16]
++    movzx edx, byte ptr [\b + r9 + 1]
++    vmovdqu xmm0, xmmword ptr [\b + r10 - 15]
++    shl r8d, 12
++    imul edi, r9d, 128
++    add edi, r8d
++    sub r9, r10
++    lea rdx, [rdx + r9*2]
++    shl rdx, 6
++    vpshufb xmm0, xmm0, xmmword ptr [shopping_click_campaigns + rdx + 4096]
++    vpsubb xmm0, xmm0, xmmword ptr [shopping_click_campaigns + rdx + 4096 + 16]
++    vpsubusb xmm2, xmm0, xmmword ptr [shopping_click_campaigns + rdx + 4096 + 32]
++    vpmaddubsw xmm0, xmm0, xmm25
++    vpmaddwd \camp, xmm0, xmm26
++    vpshufb ymm3, ymm3, ymmword ptr [shopping_click_id_pairs + rdi]
++    vpsubb ymm5, ymm3, ymmword ptr [shopping_click_id_pairs + rdi + 32]
++    vpaddb ymm4, ymm5, ymm16
++    vpsubusb ymm4, ymm4, ymm17
++    vpsubusb ymm6, ymm5, ymm18
++    vpminub ymm4, ymm4, ymm6
++    vpaddb ymm6, ymm5, ymm19
++    vpminub ymm5, ymm5, ymm6
++    vmovdqa ymm6, ymmword ptr [shopping_click_id_pairs + rdi + 64]
++    vpsubusb ymm6, ymm6, ymm5
++    vpternlogq ymm4, ymm6, ymm2, 0xfe
++    vpmaddubsw ymm5, ymm5, ymm20
++    vpmaddwd ymm5, ymm5, ymm21
++    vpmuludq ymm1, ymm5, ymm22
++    vpsrlq ymm5, ymm5, 32
++    vpaddq \ids, ymm1, ymm5
++    lea rdx, [\b + r10]
++    sub r10, \nlin
++    imul \row, r10, -256
++    add rdx, qword ptr [shopping_click_clocks + \row + 8192 + 176]
++    movzx r9d, word ptr [rdx + 9]
++    pext r9, r9, qword ptr [shopping_click_clocks + \row + 8192 + 184]
++    shl r9d, 5
++    vmovdqu64 \badx, xmmword ptr [r15 + r9 + 1536]
++    vpxorq \badx, \badx, xmmword ptr [rdx]
++    vpternlogq \bad, ymm4, ymmword ptr [shopping_click_clocks + \row + 8192 + 112], 0xec
++    vmovdqu64 \days, xmmword ptr [r15 + r9 + 1536 + 16]
++    vmovdqu64 \x, xmmword ptr [\a - 17]
++.endm
++
++.macro click_pair_finish o, lim, limx, row, x, days, bad, camp, idsx, extract, source
++    vpshufb xmm0, \x, xmmword ptr [shopping_click_clocks + \row + 8192]
++    vpsubb xmm0, xmm0, xmmword ptr [shopping_click_clocks + \row + 8192 + 16]
++    vpmaddubsw xmm1, xmm0, xmmword ptr [shopping_click_clocks + \row + 8192 + 48]
++    vpmaddwd xmm1, xmm1, xmmword ptr [shopping_click_clocks + \row + 8192 + 64]
++    vpackusdw xmm2, xmm1, xmm1
++    vpmaddwd xmm2, xmm2, xmmword ptr [shopping_click_clocks + \row + 8192 + 80]
++    vpsubusb \limx, xmm0, xmmword ptr [shopping_click_clocks + \row + 8192 + 32]
++    vpcmpgtd xmm1, xmm1, xmmword ptr [shopping_click_clocks + \row + 8192 + 96]
++    vptestnmq k1, xmm0, xmm24
++    vpmuludq xmm4, xmm2, xmmword ptr [shopping_click_clocks + \row + 8192 + 128]
++    vpsrlq xmm2, xmm2, 32
++    vpmuldq xmm2, xmm2, xmmword ptr [shopping_click_clocks + \row + 8192 + 144]
++    vpsubq xmm2{k1}, xmm23, xmm2
++    vpaddq xmm4, xmm4, \days
++    vpaddq xmm4, xmm4, xmm2
++    \extract xmm5, \source, 1
++    vmovhps qword ptr [r15 + rbx + \o], xmm4
++    vmovq qword ptr [r15 + rbx + \o + 512], \camp
++    vmovq qword ptr [r15 + rbx + \o + 1024], \idsx
++    vmovq qword ptr [r15 + rbx + \o + 1536], xmm5
++    vpternlogq \lim, ymm1, \bad, 0xfe
++.endm
++
++.globl shopping_kernel_click_loop
++.hidden shopping_kernel_click_loop
++.type shopping_kernel_click_loop,@function
++.p2align 5
++shopping_kernel_click_loop:
++    push r12
++    push r13
++    push r14
++    push r15
++    push rcx
++    push rbx
++    push rbp
++    sub rsp, 24
++    mov r15, rdx
++    mov rbx, rsi
++    sub rbx, r15
++    vmovdqa ymm13, ymmword ptr [shopping_click_constants]
++    vmovdqa ymm12, ymmword ptr [shopping_click_constants + 32]
++    vmovdqa64 ymm16, ymmword ptr [shopping_click_constants + 64]
++    vmovdqa64 ymm17, ymmword ptr [shopping_click_constants + 96]
++    vmovdqa64 ymm18, ymmword ptr [shopping_click_constants + 128]
++    vmovdqa64 ymm19, ymmword ptr [shopping_click_constants + 160]
++    vmovdqa64 ymm20, ymmword ptr [shopping_click_constants + 192]
++    vmovdqa64 ymm21, ymmword ptr [shopping_click_constants + 224]
++    vmovdqa64 ymm22, ymmword ptr [shopping_click_constants + 256]
++    vmovdqa64 xmm25, xmmword ptr [shopping_click_constants + 288]
++    vmovdqa64 xmm26, xmmword ptr [shopping_click_constants + 304]
++    vmovdqa64 xmm24, xmmword ptr [shopping_click_constants + 320]
++    vpxord xmm23, xmm23, xmm23
++    vpxor xmm14, xmm14, xmm14
++    test bl, 8
++    jnz 70f
++    mov rbp, rdi
++    mov qword ptr [rsp + 16], rbp
++    mov qword ptr [rsp + 8], 1
++    vpcmpeqb ymm0, ymm13, ymmword ptr [rbp]
++    vpmovmskb eax, ymm0
++    vpcmpeqb ymm1, ymm12, ymmword ptr [rbp + 32]
++    vpmovmskb ecx, ymm1
++    tzcnt ecx, ecx
++    click_pair_prepare r12, rbp, eax, rcx, r11d, r13d, rsi, xmm8, xmm9, ymm10, xmm10, xmm11, ymm27
++    jmp 2f
++70:
++    mov r12, rdi
++    mov qword ptr [rsp + 16], r12
++    sub rbx, 8
++    mov qword ptr [rsp + 8], rbx
++    vpcmpeqb ymm0, ymm13, ymmword ptr [r12]
++    vpmovmskb r11d, ymm0
++    vpcmpeqb ymm1, ymm12, ymmword ptr [r12 + 32]
++    vpmovmskb r13d, ymm1
++    tzcnt r13d, r13d
++    click_pair_prepare rbp, r12, r11d, r13, eax, ecx, r14, xmm28, xmm29, ymm30, xmm30, xmm31, ymm7
++    jmp 3f
++    .p2align 5
++2:
++    click_pair_prepare rbp, r12, r11d, r13, eax, ecx, r14, xmm28, xmm29, ymm30, xmm30, xmm31, ymm7
++    click_pair_finish 0, ymm14, xmm14, rsi, xmm8, xmm9, ymm10, xmm11, xmm27, vextracti32x4, ymm27
++3:
++    click_pair_prepare r12, rbp, eax, rcx, r11d, r13d, rsi, xmm8, xmm9, ymm10, xmm10, xmm11, ymm27
++    click_pair_finish 8, ymm3, xmm3, r14, xmm28, xmm29, ymm30, xmm31, xmm7, vextracti128, ymm7
++    vpor ymm3, ymm3, ymm14
++    vptest ymm3, ymm3
++    jnz 90f
++    mov qword ptr [rsp + 16], rbp
++    add rbx, 16
++    jnz 2b
++    mov rdi, rbp
++    mov eax, 2
++    lea rsi, [r15 + rbx]
++    jmp 6f
++90:
++    mov rdi, qword ptr [rsp + 16]
++    mov eax, 1
++    vptest ymm14, ymm14
++    jnz 91f
++    lea rsi, [r15 + rbx + 8]
++    cmp rbx, qword ptr [rsp + 8]
++    je 6f
++    vpcmpeqb ymm1, ymm12, ymmword ptr [rdi + 32]
++    vpmovmskb ecx, ymm1
++    tzcnt ecx, ecx
++    lea rdi, [rdi + rcx + 33]
++    jmp 6f
++91:
++    lea rsi, [r15 + rbx]
++6:
++    add rsp, 24
++    pop rbp
++    pop rbx
++    pop rcx
++    mov [rcx], rax
++    mov [rcx+8], rdi
++    mov [rcx+16], rsi
++    pop r15
++    pop r14
++    pop r13
++    pop r12
++    vzeroupper
++    ret
++.size shopping_kernel_click_loop, .-shopping_kernel_click_loop
++.section .note.GNU-stack,"",@progbits

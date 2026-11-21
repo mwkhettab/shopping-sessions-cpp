@@ -42,6 +42,8 @@ on:
       - perf/native/clock_shapes/**
       - .github/workflows/native-ordinal-clock-oracles.yml
       - perf/native/ordinal_clock_oracles/**
+      - .github/workflows/native-revision-trials.yml
+      - perf/native/revision_trials/**
       - perf/native/finalist.json
       - perf/native/holdout_shipping.py
       - perf/native/port_input_settings.py
