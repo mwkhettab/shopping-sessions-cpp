@@ -1,21 +1,15 @@
 #!/bin/sh
 set -eu
 mkdir -p build
-compiler="${CXX:-c++}"
-set -- -std=c++20 -O3 -DNDEBUG -pthread -Wall -Wextra
-if [ "${DIAGNOSTICS:-0}" = 1 ]; then
-  "$compiler" "$@" -DSHOPPING_DIAGNOSTICS cpp/main.cpp -o build/shopping-profile
-elif [ "${PGO:-0}" = 1 ]; then
-  work=$(mktemp -d)
-  trap 'rm -rf "$work"' EXIT
-  idx="$work/counters"
-  "$compiler" "$@" "-fprofile-generate=$idx" -fprofile-update=atomic cpp/main.cpp -o build/shopping
-  "${PYTHON:-python3}" perf/train.py "$work/input"
-  NCPU=4 build/shopping "$work/input/short" "$work/output-short"
-  NCPU=4 build/shopping "$work/input/wide" "$work/output-wide"
-  SHOP_TRAIN_BASE_READER=1 NCPU=4 build/shopping "$work/input/short" "$work/output-avx2-short"
-  SHOP_TRAIN_BASE_READER=1 NCPU=4 build/shopping "$work/input/wide" "$work/output-avx2-wide"
-  "$compiler" "$@" "-fprofile-use=$idx" -fprofile-partial-training -fprofile-correction -Werror=missing-profile cpp/main.cpp -o build/shopping
-else
-  "$compiler" "$@" cpp/main.cpp -o build/shopping
+compiler=${CXX:-c++}
+set -- -std=c++20 -O3 -DNDEBUG -pthread
+if [ "${STATIC:-0}" = 1 ]; then
+    set -- "$@" -static
 fi
+case "$(uname -s)-$(uname -m)" in
+    Linux-x86_64)
+        set -- "$@" -fno-pie -no-pie -DSHOP_KERNEL_ABSOLUTE_TABLES cpp/pipeline/k_free_clicks.S
+        ;;
+esac
+"$compiler" "$@" cpp/pipeline/main.cpp cpp/pipeline/k_free.cpp cpp/pipeline/k_free_x86.cpp \
+    cpp/pipeline/sys_global_alloc.cpp -o build/shopping
