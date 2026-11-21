@@ -9,35 +9,48 @@ permissions:
   contents: read
 jobs:
   compare:
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [first, second, third]
     runs-on: ubuntu-24.04
     timeout-minutes: 95
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: Identify a compatible native Intel runner
+        id: cpu
+        run: python3 perf/native/intel-wide-runner.py
       - name: Check out the scored event parser
+        if: steps.cpu.outputs.wide == 'true'
         uses: actions/checkout@v4
         with:
           ref: faf1047c6cb00cc8099572f5e067d18076375571
           path: .acceptance/candidate
           persist-credentials: false
       - name: Check out the independent table control
+        if: steps.cpu.outputs.wide == 'true'
         uses: actions/checkout@v4
         with:
           ref: 4db76beed31640ddf4b414ed19deba5ebc660b81
           path: .acceptance/baseline
           persist-credentials: false
       - uses: actions/setup-python@v5
+        if: steps.cpu.outputs.wide == 'true'
         with:
           python-version: '3.12'
       - name: Prepare generator, fixtures and independent tables
+        if: steps.cpu.outputs.wide == 'true'
         run: bash perf/native/prepare-port-runner.sh
       - name: Build the scanner and check arbitrary rows against the portable kernel
+        if: steps.cpu.outputs.wide == 'true'
         run: |
           out="$RUNNER_TEMP/shopping-trials/parser-binaries"
           bash perf/native/parser_trials/build_scanner.sh .acceptance/candidate "$out"
           sh perf/native/parser_trials/build_parse_sampling.sh .acceptance/candidate "$out/sampling"
       - name: Verify both scales, time the scanner and profile parser work
+        if: steps.cpu.outputs.wide == 'true'
         env:
           CXX: g++-12
         run: |
@@ -53,6 +66,7 @@ jobs:
           from pathlib import Path
           folder = Path(os.environ["RUNNER_TEMP"]) / "shopping-trials/results/port-acceptance"
           report = json.loads((folder / "status.json").read_text())
+          assert report["verified"]["kernel"] == "wide SIMD"
           for scale in ("20M", "60M"):
               for variant in ("blocks", "blocks-shift"):
                   assert scale + "/" + variant in report["verified"]
@@ -60,12 +74,12 @@ jobs:
               assert (folder / (scale + "-parser") / "summary.json").is_file()
           PY
       - name: Publish paired process and stage measurements
-        if: always()
+        if: always() && steps.cpu.outputs.wide == 'true'
         run: |
           results="$RUNNER_TEMP/shopping-trials/results"
           if test -f "$results/port-acceptance/status.json"; then python3 perf/native/publish_profile.py "$results"; fi
       - name: Publish measured parser costs and sample coverage
-        if: always()
+        if: always() && steps.cpu.outputs.wide == 'true'
         run: |
           results="$RUNNER_TEMP/shopping-trials/results/port-acceptance"
           for size in 20M 60M; do
@@ -73,9 +87,9 @@ jobs:
             if test -f "$sample"; then python3 perf/native/parser_trials/publish_sampling.py "$sample" --scale "$size"; fi
           done
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: always() && steps.cpu.outputs.wide == 'true'
         with:
-          name: native-parser-measurements
+          name: native-parser-measurements-${{ matrix.lane }}
           path: |
             ${{ runner.temp }}/shopping-trials/results/
             ${{ runner.temp }}/shopping-trials/parser-binaries/*.log
