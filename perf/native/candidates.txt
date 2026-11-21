@@ -1,1 +1,1 @@
-base fin-slabkey-pgo shipresident-pgo ordrichlane-pgo shiprichwide-pgo shiprichdual-pgo shiprichbw-pgo caprichdual-pgo caprichbw-pgo
+base fin-slabkey-pgo shipresident-pgo portablerich-pgo residentpart-pgo richpart-pgo richtrainauto-pgo richmixpart-pgo richlowpart-pgo richmixbw-pgo rankonecap-pgo ranktwocap-pgo rankdwordcap-pgo strprefix-pgo strcounts-pgo strbits-pgo strbits2-pgo strbitsbw-pgo strbitsdw-pgo strbitsavx-pgo shapeauto-pgo shapemix-pgo shapeavx-pgo shapebw-pgo vectarrival-pgo vectfull-pgo vectdaybw-pgo
