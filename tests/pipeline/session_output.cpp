@@ -1,5 +1,6 @@
 #include "../../cpp/pipeline/model.hpp"
 #include "../../cpp/pipeline/out.hpp"
+#include <cassert>
 #include <charconv>
 #include <iostream>
 using namespace pipeline;
@@ -11,6 +12,10 @@ int main(int argc,char** argv) {
     std::array<u16,100> users{};g.utab=users.data();
     std::array<u32,101> offsets{};g.csr_off=offsets.data();std::array<std::atomic<u64>,2> claims{};g.claim=claims.data();
     std::array<std::array<u64,2>,20> csr{};g.csr=csr.data();g.csr_cap=csr.size();
+    constexpr std::size_t input_bytes=65536;
+    auto* input=::mmap(nullptr,input_bytes,PROT_READ|PROT_WRITE,sys::anonymous_flags,-1,0);
+    assert(input!=MAP_FAILED);
+    g.files.push_back({Kind::Ev,0,input_bytes,0});g.region=static_cast<const u8*>(input);
     g.channels={{'p','a','i','d'},{'e','a','r','n','e','d'}};
     g.cats={{'x'},{'y'},{'z'}};g.camp={0,1,0};
     for(std::size_t i=0;i<g.nt;++i) {
@@ -40,6 +45,6 @@ int main(int argc,char** argv) {
         for(unsigned i=0;i<3;++i) events::slab_full(g.t(i).core);
     }
     core::COLS_PINNED.store(true);
-    if(mode=="combined") out::stage45(g,argv[3]);
-    else {complex::stage4(g);out::stage5(g,argv[3]);}
+    if(mode=="combined") {out::stage45(g,argv[3]);assert(!g.region);}
+    else {complex::stage4(g);out::stage5(g,argv[3]);assert(::munmap(input,input_bytes)==0);}
 }

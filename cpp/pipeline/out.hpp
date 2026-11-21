@@ -174,7 +174,8 @@ template<class G> void stage45(G& g,const std::string& dir) {
     std::atomic<std::size_t> ca_done{},sh_next{},sh_done{},pq{},fq{};
     std::vector<Totals> csum(nt);
     const auto rg_len=g.files.empty()?0:g.files.back().off+g.files.back().len;
-    std::atomic_bool rg_todo{REGION_UNMAP.load(relaxed) && rg_len && g.region};
+    const auto* mapped_input=g.region;
+    std::atomic_bool rg_todo{REGION_UNMAP.load(relaxed) && rg_len && mapped_input};
     sys::run_par(nt,[&](std::size_t tid){
         complex::clicks_a(g,tid);ca_done.fetch_add(1,acqrel);
         complex::PScratch sc;
@@ -186,7 +187,10 @@ template<class G> void stage45(G& g,const std::string& dir) {
             const bool done=ca_done.load(acquire)==nt && sh_done.load(acquire)==ns;
             if (!done || fq.load(relaxed)>=nf) {
                 if (rg_todo.load(relaxed) && rg_todo.exchange(false,acqrel)) {
-                    ::munmap(const_cast<u8*>(g.region),rg_len);continue;
+                    // Clear the ownership pointer once. A later release pass must not
+                    // advise a stale address that the OS may already have reused.
+                    if (!::munmap(const_cast<u8*>(mapped_input),rg_len)) g.region=nullptr;
+                    continue;
                 }
                 if (pq.load(relaxed)<np) {
                     const auto i=pq.fetch_add(1,relaxed);

@@ -15,6 +15,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('simde', type=Path, help='checkout containing simde/x86/avx512.h')
     ap.add_argument('--sanitize', action='store_true')
+    ap.add_argument('--limits', action='store_true', help='exercise full buckets and recycled storage')
     opts = ap.parse_args()
     simde = opts.simde.resolve()
     if not (simde / 'simde/x86/avx512.h').is_file():
@@ -37,14 +38,14 @@ def main():
         for intrinsic in re.findall(r'\bsession(_mm\w+)\(', (HERE / 'session_simde.hpp').read_text()):
             header = re.sub(r'\b'+intrinsic+r'\b', 'session'+intrinsic, header)
         (path / 'events_fast.hpp').write_text(header)
-        source = (HERE / 'session_runs.cpp').read_text().replace('../../cpp/pipeline/', '')
+        source = (HERE / ('session_dense_limits.cpp' if opts.limits else 'session_runs.cpp')).read_text().replace('../../cpp/pipeline/', '')
         (path / 'run.cpp').write_text(source)
         sanitizer = 'undefined' if platform.system() == 'Darwin' else 'address,undefined'
         flags = ['-O1', '-g', '-fsanitize='+sanitizer, '-fno-sanitize-recover=all', '-fno-omit-frame-pointer'] if opts.sanitize else ['-O2']
         subprocess.run([os.getenv('CXX', 'c++'), '-std=c++20', *flags, '-Wno-psabi', '-Wno-pass-failed',
                         '-DSESSION_TEST_FAST', '-I', str(path), '-I', str(PIPE), '-I', str(HERE), '-I', str(simde),
                         str(path/'run.cpp'), '-o', str(path/'run')], check=True)
-        for pattern in range(5):
+        for pattern in range(1 if opts.limits else 5):
             subprocess.run([str(path/'run'), str(pattern)], check=True, timeout=45)
 
 

@@ -154,12 +154,12 @@ inline void scatter_chunk(const Rec* p,std::size_t n,Rec* slots,u64 gen,const i8
     };
     constexpr std::size_t link_off=4032;
     __builtin_prefetch(reinterpret_cast<const void*>(reinterpret_cast<std::uintptr_t>(nextc)+link_off));
-    std::size_t i=0;
-    for (;i+4<=n;i+=4) {
+    const auto bulk=n&~std::size_t{3};
+    for (std::size_t i=0;i!=bulk;i+=4) {
         __builtin_prefetch(reinterpret_cast<const void*>(reinterpret_cast<std::uintptr_t>(nextc)+i*16));
         put(p[i]);put(p[i+1]);put(p[i+2]);put(p[i+3]);
     }
-    for (;i<n;++i) put(p[i]);
+    for (std::size_t tail=0;tail<(n&3);++tail) put(p[bulk+tail]);
 }
 inline std::size_t kept_block(const u16* blkk,std::size_t a) {
     std::size_t lo=0,hi=BSIZE/8;
