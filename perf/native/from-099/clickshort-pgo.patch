@@ -1,0 +1,264 @@
+--- /dev/null
++++ b/cpp/click_fields.hpp
+@@ -0,0 +1,72 @@
++#pragma once
++#ifdef SHOPPING_X86_CSV
++// Each physical click line is sufficient to prove the normalized four fields.
++// PEXT aligns quotes at field starts with quotes immediately before each end.
++template<class F>
++__attribute__((target("avx2,bmi,bmi2,popcnt"),always_inline)) inline void
++short_click(const char *p,unsigned len,uint64_t delimiters,uint64_t quotes,F &fn){
++  uint64_t line=mask_to(len),marks=delimiters&line,q=quotes&line;
++  if(std::popcount(marks)!=3)return;
++  unsigned wraps=0;
++  if(q){
++    uint64_t start=(marks<<1)|1,cut=marks|(uint64_t{1}<<len),last=cut>>1;
++    // A one-byte field containing a quote is neither an opening nor a closing pair.
++    if(q&~(start^last))return;
++    wraps=unsigned(_pext_u64(q,start));
++    if(wraps!=_pext_u64(q<<1,cut))return;
++  }
++  unsigned a=std::countr_zero(marks),b=std::countr_zero(marks&(marks-1)),c=63u-std::countl_zero(marks);
++  unsigned q0=wraps&1,q1=(wraps>>1)&1,q2=(wraps>>2)&1,q3=wraps>>3;
++  std::array<Str,4> r{Str(p+q0,a-2*q0),Str(p+a+1+q1,b-a-1-2*q1),
++                      Str(p+b+1+q2,c-b-1-2*q2),Str(p+c+1+q3,len-c-1-2*q3)};
++  fn(r);
++}
++
++template<class F>
++__attribute__((target("avx2,bmi,bmi2,popcnt"))) void click_rows_one(Str data,F &fn){
++  while(data.size()>=64){
++    auto p=data.data();auto a=row_mask32(p),b=row_mask32(p+32);
++    auto join=[](unsigned x,unsigned y){return uint64_t(x)|(uint64_t(y)<<32);};
++    uint64_t lf=join(a.lf,b.lf);
++    if(!lf){
++      auto nl=data.find('\n',64),size=nl==Str::npos?data.size():nl+1;
++      scalar_rows<4>(data.substr(0,size),fn);data.remove_prefix(size);continue;
++    }
++    unsigned len=std::countr_zero(lf);
++    short_click(p,len,join(a.comma,b.comma),join(a.quotes,b.quotes),fn);
++    data.remove_prefix(len+1);
++  }
++  line_csv_rows<4>(data,fn);
++}
++
++template<class F>
++__attribute__((target("avx2,bmi,bmi2,popcnt"))) void click_rows_tile(Str data,F &fn){
++  std::array<size_t,16> ends;
++  unsigned n=0;size_t from=0;
++  auto flush=[&]() __attribute__((target("avx2,bmi,bmi2,popcnt"),always_inline)){
++    for(unsigned k=0;k<n;++k){
++      auto p=data.data()+from;auto len=ends[k]-from;
++      if(len<64 && data.size()-from>=64){
++        auto a=_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
++        auto b=_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p+32));
++        auto mask=[&](char value) __attribute__((target("avx2"),always_inline)){
++          auto v=_mm256_set1_epi8(value);
++          return uint64_t(unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a,v))))|
++                 (uint64_t(unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b,v))))<<32);
++        };
++        short_click(p,unsigned(len),mask(','),mask('"'),fn);
++      }else scalar_rows<4>(Str(p,len),fn);
++      from=ends[k]+1;
++    }
++    n=0;
++  };
++  auto lf=_mm256_set1_epi8('\n');
++  for(size_t at=0;at+32<=data.size();at+=32){
++    auto bytes=_mm256_loadu_si256(reinterpret_cast<const __m256i*>(data.data()+at));
++    unsigned mask=unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes,lf)));
++    while(mask){ends[n++]=at+std::countr_zero(mask);mask&=mask-1;if(n==ends.size())flush();}
++  }
++  if(n)flush();
++  if(from<data.size())line_csv_rows<4>(data.substr(from),fn);
++}
++#endif
+--- a/cpp/input.hpp
++++ b/cpp/input.hpp
+@@ -147,8 +147,15 @@
+ #endif
+ #include "csv_x86.hpp"
+ #include "line_csv.hpp"
++#include "line_tile.hpp"
++#include "click_fields.hpp"
+ template <size_t N, class F> void parse_rows(Str data, F &&callback) {
+ #ifdef SHOPPING_X86_CSV
++  if constexpr(N==4)if(wide_csv_supported() && __builtin_cpu_supports("bmi2")){click_rows_one(data,callback);return;}
++  if (N == 7 && wide_csv_supported()) {
++    tiled_lines<N, 16>(data, callback);
++    return;
++  }
+   if (wide_csv_supported()) { line_csv_rows<N>(data,callback); return; }
+   if (wide_csv_supported()) {
+     wide_csv_rows<N>(data, callback);
+--- /dev/null
++++ b/cpp/line_tile.hpp
+@@ -0,0 +1,89 @@
++#pragma once
++// Find line endings in small groups; both the delimiter count and all
++// surrounding quotes are checked before a field reaches the event validator.
++#ifdef SHOPPING_X86_CSV
++inline uint64_t mask_to(unsigned n) {
++  return n >= 64 ? ~uint64_t{} : (uint64_t{1} << n) - 1;
++}
++template <size_t N, class F>
++__attribute__((target("avx2,bmi,popcnt"), always_inline)) inline void
++split_known_line(const char *p, size_t len, const char *end, F &fn) {
++  if (len >= 128 || end - p < 128) {
++    scalar_rows<N>(Str(p, len), fn);
++    return;
++  }
++  uint64_t lo, hi = 0, ql, qh = 0;
++  auto get = [&](unsigned at, uint64_t &commas,
++                 uint64_t &quotes) __attribute__((target("avx2,bmi,popcnt"),
++                                                  always_inline)) {
++    auto a = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(p + at));
++    auto b = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(p + at + 32));
++    auto comma = _mm256_set1_epi8(','), quote = _mm256_set1_epi8('"');
++    uint64_t c0 = unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, comma)));
++    uint64_t q0 = unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, quote)));
++    uint64_t c1 = unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, comma)));
++    uint64_t q1 = unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, quote)));
++    auto mask = mask_to(unsigned(len) - at);
++    commas = (c0 | (c1 << 32)) & mask;
++    quotes = (q0 | (q1 << 32)) & mask;
++  };
++  get(0, lo, ql);
++  if (len > 64)
++    get(64, hi, qh);
++  if (size_t(std::popcount(lo) + std::popcount(hi)) != N - 1)
++    return;
++  std::array<Str, N> fields;
++  unsigned start = 0, wrapped = 0;
++  for (unsigned i = 0; i < N; ++i) {
++    unsigned cut = unsigned(len);
++    if (i + 1 < N) {
++      if (lo) {
++        cut = std::countr_zero(lo);
++        lo &= lo - 1;
++      } else {
++        cut = 64 + std::countr_zero(hi);
++        hi &= hi - 1;
++      }
++    }
++    unsigned width = cut - start;
++    bool quotes = width >= 2 && ((p[start] == '"') & (p[cut - 1] == '"'));
++    wrapped += 2 * quotes;
++    fields[i] = {p + start + quotes, width - 2 * quotes};
++    start = cut + 1;
++  }
++  if (wrapped == unsigned(std::popcount(ql) + std::popcount(qh)))
++    fn(fields);
++}
++
++template <size_t N, unsigned Batch, class F>
++__attribute__((target("avx2,bmi,popcnt"))) void tiled_lines(Str data, F &fn) {
++  size_t from = 0, scan = 0;
++  std::array<size_t, Batch> ends;
++  unsigned n = 0;
++  auto flush = [&]() __attribute__((target("avx2,bmi,popcnt"), always_inline)) {
++    for (unsigned i = 0; i < n; ++i) {
++      auto to = ends[i];
++      split_known_line<N>(data.data() + from, to - from,
++                          data.data() + data.size(), fn);
++      from = to + 1;
++    }
++    n = 0;
++  };
++  auto lf = _mm256_set1_epi8('\n');
++  for (; scan + 32 <= data.size(); scan += 32) {
++    auto v = _mm256_loadu_si256(
++        reinterpret_cast<const __m256i *>(data.data() + scan));
++    auto mask = unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, lf)));
++    while (mask) {
++      ends[n++] = scan + std::countr_zero(mask);
++      mask &= mask - 1;
++      if (n == Batch)
++        flush();
++    }
++  }
++  if (n)
++    flush();
++  if (from < data.size())
++    line_csv_rows<N>(data.substr(from), fn);
++}
++#endif
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -233,7 +233,7 @@
+       auto &v = result.spend[k];
+       if (v > best || (v == best && cat.categories[k] < *daily.category)) {
+         best = v;
+-        daily.category = cat.categories[k];
++        daily.category = &cat.categories[k];
+       }
+       v = 0;
+     }
+@@ -769,8 +769,13 @@
+   resolve_revisions(workers, threads, anchor);
+   timer.mark("global event dedup and loser removal");
+   std::vector<Result> results(threads);
+-  for (auto &result : results)
++  size_t rows_hint =
++      std::min<size_t>(event_count / 8, (size_t(512) << 20) / sizeof(UserDay)) /
++      threads;
++  for (auto &result : results) {
++    result.users.reserve(rows_hint);
+     result.configure(window, cat, threads);
++  }
+   process_people(workers, results, cat, threads, timer, layout);
+   fs::create_directories(output / "user_daily");
+   fs::create_directories(output / "campaign_daily");
+@@ -779,13 +784,35 @@
+                     ("part-" + std::to_string(i) + ".parquet"),
+                 results[i].users);
+   });
+-  Totals merged;
+-  for (auto &r : results)
+-    r.merge_into(merged);
+   std::vector<CampaignDay> campaigns;
+-  for (auto &[key, c] : merged)
+-    campaigns.push_back(
+-        {cat.campaigns[key.first], cat.channels[key.first], key.second, c});
++  auto append = [&](size_t id, int32_t day, const Counts &c) {
++    campaigns.push_back({cat.campaigns[id], cat.channels[id], day, c});
++  };
++  const auto &first = results.front();
++  if (!first.table.empty()) {
++    for (size_t start = 0; start < first.table.size();
++         start += first.campaigns) {
++      int32_t day = first.first_day + int32_t(start / first.campaigns);
++      for (size_t id = 0; id < first.campaigns; ++id) {
++        Counts c{};
++        for (const auto &r : results) {
++          const auto &part = r.table[start + id];
++          c.sessions += part.sessions;
++          c.purchases += part.purchases;
++          c.revenue += part.revenue;
++          c.assists += part.assists;
++        }
++        if (c.sessions || c.assists)
++          append(id, day, c);
++      }
++    }
++  } else {
++    Totals merged;
++    for (auto &r : results)
++      r.merge_into(merged);
++    for (auto &[key, c] : merged)
++      append(key.first, key.second, c);
++  }
+   write_campaigns(output / "campaign_daily" / "part-0.parquet", campaigns);
+   timer.mark("merge and Parquet output");
+ #ifdef SHOPPING_DIAGNOSTICS
+--- a/cpp/output.hpp
++++ b/cpp/output.hpp
+@@ -3,7 +3,7 @@
+   Key user;
+   int32_t day;
+   int64_t sessions, events, revenue;
+-  std::optional<Str> category;
++  const Str *category{};
+ };
+ struct Counts {
+   int64_t sessions{}, purchases{}, revenue{}, assists{};

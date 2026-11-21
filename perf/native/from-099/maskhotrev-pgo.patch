@@ -413,7 +413,13 @@
      auto seconds = [&](const Candidate &r, unsigned owner) {
        return r.ingest & 0x80000000u
                   ? workers[owner].extended[r.location].seconds
-@@ -365,31 +358,22 @@
+@@ -360,36 +353,27 @@
+       }
+     };
+     for (unsigned owner = 0; owner < workers.size(); ++owner) {
+-      auto &refs = workers[owner].candidates[b];
++      auto refs = workers[owner].candidates[b];
+       // Reserve zero for an empty slot. Six low bits identify one of at most
        // 64 input workers, and the remaining bits locate its immutable revision.
        for (size_t i = 0; i < refs.size(); ++i) {
          auto &r = refs[i];

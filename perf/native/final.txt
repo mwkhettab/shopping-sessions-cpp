@@ -1,1 +1,1 @@
-base fin-slabkey-pgo shipreader-pgo maskemit-pgo maskrev32-pgo varprefix-pgo @best
+base fin-slabkey-pgo shipreader-pgo colfuse-pgo colfusetags-pgo colfuseclick-pgo revlearn-pgo revguard-pgo @best

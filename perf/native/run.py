@@ -3,6 +3,7 @@ import json
 import os
 import platform
 import pwd
+import re
 import shutil
 import statistics
 import subprocess
@@ -92,7 +93,7 @@ def main():
             run(python,root/'perf/native/interval_oracle.py',binary)
             run(python,root/'perf/native/page_oracle.py',binary)
             run(python,root/'perf/native/prefix_oracle.py',binary)
-            if name.startswith(('click','claim','filter','clock','maskrev','varrev','ctrlrev','maskhotrev')) or name=='shipreader-pgo':
+            if name.startswith(('click','claim','filter','clock','maskrev','varrev','ctrlrev','maskhotrev','colfuse','rev','alias')) or name=='shipreader-pgo':
                 run(python,root/'perf/native/ordered_ids_oracle.py',binary)
             if name.startswith('clock') and 'avx2' in flags and (src/'cpp/row_clocks.hpp').is_file():
                 run(compiler,'-std=c++20','-O2','-fsanitize=undefined','-fno-sanitize-recover=all','-I',src/'cpp',root/'perf/native/clock_lanes.cpp','-o',unit)
@@ -103,6 +104,13 @@ def main():
             if (src/'cpp/ordinal_csv.hpp').is_file() and 'avx2' in flags and 'bmi2' in flags and 'pclmulqdq' in flags:
                 run(compiler,'-std=c++20','-O2','-fsanitize=undefined','-fno-sanitize-recover=all','-I',src/'cpp',root/'perf/native/ordinal_test.cpp','-o',unit)
                 run(unit)
+            if (src/'cpp/click_fields.hpp').is_file() or name.startswith('clicksimple'):
+                run(compiler,'-std=c++20','-O2','-fsanitize=undefined','-fno-sanitize-recover=all','-I',src/'cpp',root/'perf/native/click_field_test.cpp','-o',unit)
+                run(unit)
+            if (src/'cpp/alias_quotient.hpp').is_file():
+                run(compiler,'-std=c++20','-O2','-fsanitize=undefined','-fno-sanitize-recover=all','-I',src/'cpp',root/'perf/native/alias_quotient_test.cpp','-o',unit)
+                run(unit)
+            if (src/'cpp/mixed_revision_reader.hpp').is_file():run(python,root/'perf/native/layout_oracle.py',binary)
             binaries.append(binary)
         except (subprocess.CalledProcessError,OSError) as exc:
             if name=='base': raise
@@ -153,7 +161,12 @@ def main():
         for b in binaries:
             if b==binary0: continue
             with tempfile.TemporaryDirectory(dir=area) as d:
-                run(b,data,d)
+                if (area/b.name/'cpp/mixed_revision_reader.hpp').is_file():
+                    mixed=subprocess.run([b,data,d],check=True,env=env|{'SHOP_LAYOUT_TRACE':'1'},capture_output=True,text=True)
+                    layout=re.search(r'SHOP_REVISION_LAYOUT (\d+) (\d+)',mixed.stderr)
+                    if not layout:raise ValueError('missing storage calibration counters')
+                    note('Revision storage '+b.name+' '+scale,f'{layout[1]} row revisions, {layout[2]} column revisions.')
+                else:run(b,data,d)
                 run(python,root/'perf/native/compare_large.py',d,ref)
         import pyarrow.parquet as pq
         row_counts = {table:sum(pq.ParquetFile(file).metadata.num_rows for file in (ref/table).glob('*.parquet')) for table in ('user_daily','campaign_daily')}
@@ -254,6 +267,10 @@ def main():
         if (area/'bin'/label).is_file():phase_counters(root,area,label,note,run,env)
     from extra_checks import scaling, race
     scaling(root,area,practice_winner,note,run,env)
+    from long_location_oracle import verify as verify_long_locations
+    locgen=area/'generate-skewed-alias'
+    run('g++-12','-std=c++20','-O2',root/'perf/native/long_location_input.cpp','-o',locgen)
+    verify_long_locations(area,locgen,list(dict.fromkeys([area/'bin/shipreader-pgo',area/'bin'/practice_winner])),note)
     for name in dict.fromkeys([practice_winner, *[b for b in candidates if b.startswith("pipe")]]):
         if (area / "bin" / name).is_file():
             race(root,area,name,note,run,env)
