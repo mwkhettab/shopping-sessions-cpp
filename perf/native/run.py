@@ -78,8 +78,11 @@ def main():
             if i: times.append(time.monotonic()-start)
         note('Floor '+mode,str([round(x,4) for x in times]))
     final_list=(root/'perf/native/final.txt').read_text().split()
+    performance={}
     for scale in (['practice','final'] if final_list else ['practice']):
         if scale=='final':
+            ranked=sorted((n for n in performance if n!='base'),key=performance.get)
+            if '@best' in final_list: final_list+=ranked[:2]
             binaries=[b for b in binaries if b.name in final_list]
             # Retain the public generator's RNG order and shuffle. Bound peak
             # memory by materializing disjoint output files in separate passes.
@@ -108,6 +111,7 @@ def main():
         for b in binaries:
             rows=[r for r in map(json.loads,path.read_text().splitlines()) if r['round']>=0 and r['binary']==str(b)]
             times=[round(r['wall_s'],4) for r in rows]
+            performance[b.name]=statistics.median(times)
             phases={}
             for r in rows:
                 for line in r['profile'].splitlines():
