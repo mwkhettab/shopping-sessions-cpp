@@ -80,32 +80,59 @@ class Part {
         return reinterpret_cast<std::uintptr_t>(page);
     }
 
-    template<bool Stream>
-    static inline void line_out(std::uintptr_t destination, const Line& line) {
+    inline std::uintptr_t take_line(std::size_t bucket) {
+        auto address = cur_[bucket];
+        if ((address & (CHUNK - 1)) == LINK_OFF) address = new_chunk(bucket, address);
+        cur_[bucket] = address + sizeof(Line);
+        fill_[bucket] = 0;
+        return address;
+    }
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+    static inline bool wide_stores() {
 #if defined(__AVX512F__)
-        auto* out = reinterpret_cast<__m512i*>(destination);
-        auto value = _mm512_load_si512(&line);
-        if constexpr (Stream) _mm512_stream_si512(out, value);
-        else _mm512_storeu_si512(out, value);
+        return true;
 #else
-        std::memcpy(reinterpret_cast<void*>(destination), &line, sizeof(Line));
+        static const bool available = __builtin_cpu_supports("avx512f");
+        return available;
 #endif
     }
-
-    template<bool Stream>
-    inline void flush_line(std::size_t bucket) {
-        auto dest = cur_[bucket];
-        if ((dest & (CHUNK - 1)) == LINK_OFF) dest = new_chunk(bucket, dest);
-        line_out<Stream>(dest, lines_[bucket]);
-        cur_[bucket] = dest + sizeof(Line);
-        fill_[bucket] = 0;
+    template<bool Stream> __attribute__((target("avx512f"),always_inline))
+    static inline void line_x86(std::uintptr_t address,const Line& line) {
+        auto value = _mm512_load_si512(&line);
+        auto *out = reinterpret_cast<__m512i*>(address);
+        if constexpr (Stream) _mm512_stream_si512(out,value);
+        else _mm512_store_si512(out,value);
     }
-
+    template<bool Stream> __attribute__((target("avx512f")))
+    void flush_one_x86(std::size_t b) {line_x86<Stream>(take_line(b),lines_[b]);}
+    template<bool Stream> __attribute__((target("avx512f")))
+    void flush_many_x86(std::size_t k) {
+        for (std::size_t i=0;i<k;++i) {
+            auto b=std::size_t(pend_[i]);
+            line_x86<Stream>(take_line(b),lines_[b]);
+        }
+    }
+#endif
+    template<bool Stream> inline void flush_line(std::size_t b) {
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+        if (wide_stores()) {flush_one_x86<Stream>(b);return;}
+#endif
+        const auto address=take_line(b);
+        std::memcpy(reinterpret_cast<void*>(address),&lines_[b],sizeof(Line));
+    }
     inline void flush_lines(std::size_t k) {
-        if (NT) {
-            for (std::size_t i = 0; i < k; ++i) flush_line<true>(pend_[i]);
-        } else {
-            for (std::size_t i = 0; i < k; ++i) flush_line<false>(pend_[i]);
+        if (!k) return;
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+        if (wide_stores()) {
+            if (NT) flush_many_x86<true>(k);
+            else flush_many_x86<false>(k);
+            return;
+        }
+#endif
+        for (std::size_t i=0;i<k;++i) {
+            auto b=std::size_t(pend_[i]);
+            const auto address=take_line(b);
+            std::memcpy(reinterpret_cast<void*>(address),&lines_[b],sizeof(Line));
         }
     }
 
