@@ -1,9 +1,10 @@
-FROM debian:bookworm-slim AS build
-RUN apt-get update && apt-get install -y --no-install-recommends g++ python3-minimal && rm -rf /var/lib/apt/lists/*
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS build
+RUN apt-get update && apt-get install -y --no-install-recommends g++ clang-16 lld-16 \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY cpp/pipeline cpp/pipeline
 COPY build.sh .
-RUN STATIC=1 sh build.sh
+RUN CXX=clang++-16 STATIC=1 sh build.sh
 
 FROM scratch
 COPY --from=build /src/build/shopping /app/shopping

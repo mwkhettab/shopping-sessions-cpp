@@ -65,7 +65,7 @@ inline std::size_t read_at(int fd,u8* dst,std::size_t bytes,std::size_t pos,std:
     std::size_t got=0;while(got<bytes){auto r=::pread(fd,dst+got,bytes-got,off_t(pos+got));if(r>0){got+=std::size_t(r);continue;}if(r<0 && errno==EINTR)continue;if(r<0||pos+got<flen)sys::fallback("pread");break;}return got;
 }
 template<class G,class T> inline void parse_buf(G& g,T& t,EvBatch& eb,CkBatch& cb,Out& out,const Tabs& tb,std::size_t tid,const FileInfo& f,std::string_view buf,std::size_t s){
-    Ctx c{g,t,eb,cb,out,tb,u64(tid),u64(f.off+s),u64(f.off+f.len)};
+    Ctx<G,T> c{g,t,eb,cb,out,tb,u64(tid),u64(f.off+s),u64(f.off+f.len)};
     switch(f.kind){case Kind::Ev:k_free::Free::events(buf,c);c.ev_flush();break;case Kind::Ck:k_free::Free::clicks(buf,c);c.ck_flush();break;case Kind::Lk:links_chunk(c,buf);break;}
 }
 template<class G,class T> void chunk_rd(G& g,T& t,EvBatch& eb,CkBatch& cb,Out& out,const Tabs& tb,std::size_t tid,const FileInfo& f,const Chunk& c,int fd,u8* rb,std::size_t rd){
