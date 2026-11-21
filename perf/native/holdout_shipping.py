@@ -41,13 +41,13 @@ def run_image(item, target, source, area, log, hw, env):
             "major_faults": int(major), "minor_faults": int(minor)}
 
 
-def qualify(area, tag, commit, *, counts=(EVENTS, CLICKS)):
+def qualify(area, tag, commit, *, counts=(EVENTS, CLICKS), baseline_commit=BASELINE):
     prior = area/"results/port-acceptance"
     state = json.loads((prior/"status.json").read_text())
     hw = json.loads((prior/"hardware.json").read_text())
     if state["status"] != "passed" or not hw["affinity"]:
         raise ValueError("a completed native qualification with CPU affinity is required")
-    builds = {"baseline": qualified_image(state, "baseline", BASELINE), "shipping": qualified_image(state, tag, commit)}
+    builds = {"baseline": qualified_image(state, "baseline", baseline_commit), "shipping": qualified_image(state, tag, commit)}
     generator = area/"generator/target/release/generate"
     digest = sha(generator)
     if digest != state.get("checked_generator_sha256"):
@@ -97,7 +97,8 @@ if __name__ == "__main__":
     p.add_argument("--area", type=Path, default=Path(os.environ.get("RUNNER_TEMP", "/tmp"))/"shopping-trials")
     p.add_argument("--shipping-tag", default="candidate")
     p.add_argument("--shipping-commit", required=True)
+    p.add_argument("--baseline-commit", default=BASELINE)
     args = p.parse_args()
     if not re.fullmatch("[0-9a-f]{40}", args.shipping_commit) or args.shipping_tag == "baseline":
         p.error("supply the exact shipping source SHA and its qualified candidate tag")
-    qualify(args.area.resolve(), args.shipping_tag, args.shipping_commit)
+    qualify(args.area.resolve(), args.shipping_tag, args.shipping_commit, baseline_commit=args.baseline_commit)
