@@ -6,6 +6,9 @@
 struct alignas(64) Digest { uint64_t bytes{}, keys{}, semantics{}, rows{}; KeyPool ids; };
 template<int mode> void probe(const fs::path &dir,unsigned threads) {
   Input input;Window w(input.map(dir/"manifest.json"));Catalog c(input,dir);
+#if __has_include("second_domain.hpp")
+  const SecondWindow seconds_window(w.start,w.end);
+#endif
   auto ev=input.parts(dir/"events"), cl=input.parts(dir/"clicks"), links=input.parts(dir/"links");
   std::vector<Digest> dig(threads);
   parallel(links.size()+ev.size()+cl.size(),threads,[&](size_t i,unsigned owner){
@@ -26,7 +29,14 @@ template<int mode> void probe(const fs::path &dir,unsigned threads) {
         if constexpr(mode==0) lengths.template operator()<7>(r);
         else if(!r[0].empty()){
           Time ingest=ingest_time(r[3]);
-          auto e=validate(r,ingest,c,w);
+          auto e=[&]{
+#if __has_include("second_domain.hpp")
+            if constexpr(requires{validate(r,ingest,c,w);})return validate(r,ingest,c,w);
+            else return validate(r,seconds_arrival(r[3]),c,seconds_window);
+#else
+            return validate(r,ingest,c,w);
+#endif
+          }();
           d.semantics+=static_cast<uint64_t>(ingest)+static_cast<uint64_t>(e.ts)+e.price+e.category;
           ++d.rows;
           if constexpr(mode>=2) {

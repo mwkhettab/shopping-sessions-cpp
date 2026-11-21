@@ -1,1 +1,1 @@
-base fin-slabkey-pgo shipresident-pgo resordinal-pgo resordlearn-pgo arenadense-pgo arenastripe-pgo trimunmap-pgo sieve8-pgo sievepre8-pgo bands32-pgo bands32sieve-pgo bands32sparse-pgo @best
+base fin-slabkey-pgo shipresident-pgo resordinal-pgo ordmarklane-pgo ordrichlane-pgo ordmodtags-pgo ordtagwords-pgo ordctrlavx2-pgo ordmodavx2-pgo rawalias64-pgo rawindex16-pgo seciso-pgo secfullord-pgo @best

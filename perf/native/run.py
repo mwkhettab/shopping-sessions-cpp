@@ -163,6 +163,18 @@ def main():
                     run(unit)
             if name in ('sieve8-pgo','sievepre8-pgo','bands32sparse-pgo'):
                 run(python,root/'perf/native/packed_id_oracle.py',binary)
+            isa_ok='avx2' in flags and 'bmi2' in flags and 'pclmulqdq' in flags
+            if isa_ok and name in ('ordmark-pgo','ordmarklane-pgo','ordedge-pgo','ordedgelane-pgo','ordrichlane-pgo','ordmarkclick-pgo','ordmod-pgo','ordmodlut-pgo','ordmodtags-pgo','ordmodtaglut-pgo','ordtagwords-pgo'):
+                suite='modulo_ordinal_test.cpp' if (src/'cpp/byte_ordinal_tiles.hpp').exists() else 'trimmed_ordinal_test.cpp'
+                for check in (suite,'ordinal16_test.cpp'):
+                    run(compiler,'-std=c++20','-O2','-fsanitize=undefined','-fno-sanitize-recover=all','-I',src/'cpp',root/'perf/native'/check,'-o',unit)
+                    run(unit)
+            if name in ('rawindex16-pgo','seciso-pgo'):
+                suite='coarse_events_test.cpp' if name=='rawindex16-pgo' else 'second_domain_test.cpp'
+                run(compiler,'-std=c++20','-O2','-pthread','-fsanitize=undefined','-fno-sanitize-recover=all','-I',src/'cpp',root/'perf/native'/suite,'-o',unit)
+                run(unit)
+            if name in ('rawcopy16-pgo','rawindex16-pgo','rawalias64-pgo'):
+                run(python,root/'perf/native/dest_oracle.py',binary)
             binaries.append(binary)
         except (subprocess.CalledProcessError,OSError) as exc:
             if name in ('base',release_control): raise
@@ -339,7 +351,7 @@ def main():
     locgen=area/'generate-skewed-alias'
     run('g++-12','-std=c++20','-O2',root/'perf/native/long_location_input.cpp','-o',locgen)
     verify_long_locations(area,locgen,list(dict.fromkeys([area/'bin'/release_control,area/'bin'/practice_winner])),note)
-    for name in dict.fromkeys([practice_winner, *[b for b in candidates if (b.startswith("pipe") or b in ("destslab-pgo","destpages-pgo","resdest-pgo","flatgroup-pgo","trimunmap-pgo","bands32sparse-pgo"))]]):
+    for name in dict.fromkeys([practice_winner, *[b for b in candidates if (b.startswith("pipe") or b in ("destslab-pgo","destpages-pgo","resdest-pgo","flatgroup-pgo","trimunmap-pgo","bands32sparse-pgo","rawindex16-pgo"))]]):
         if (area / "bin" / name).is_file():
             race(root,area,name,note,run,env)
 
