@@ -38,6 +38,8 @@ on:
       - perf/native/clock_training/**
       - .github/workflows/native-event-winners.yml
       - perf/native/winner_trials/**
+      - .github/workflows/native-clock-shapes.yml
+      - perf/native/clock_shapes/**
       - perf/native/finalist.json
       - perf/native/holdout_shipping.py
       - perf/native/port_input_settings.py

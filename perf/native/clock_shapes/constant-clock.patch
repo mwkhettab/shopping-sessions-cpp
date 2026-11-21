@@ -1,0 +1,67 @@
+--- a/build.sh
++++ b/build.sh
+@@ -4,6 +4,9 @@
+ compiler=${CXX:-c++}
+ platform=$(uname -s)-$(uname -m)
+ set -- -std=c++20 -O3 -DNDEBUG -pthread
++if [ "${CONSTANT_EVENT_CLOCK:-0}" = 1 ]; then
++    set -- "$@" -DSHOP_CONSTANT_EVENT_CLOCK
++fi
+ 
+ if [ "$platform" = Linux-x86_64 ] && [ "${compiler##*/}" = clang++-16 ]; then
+     set -- "$@" -fno-pic -fno-pie -march=x86-64 -mtune=cascadelake \
+--- a/cpp/pipeline/k_free_x86.cpp
++++ b/cpp/pipeline/k_free_x86.cpp
+@@ -344,8 +344,37 @@
+     return true;
+ }
+ 
+-struct Step {P next;bool boundary;};
+-inline Step ev_d(Cx<EvBatch> &cx,P p,const EvSt &st,P next,std::size_t &w) {
++struct ClockResult { W time, bad_bytes, bad_fields; };
++
++#if defined(SHOP_CONSTANT_EVENT_CLOCK)
++template<unsigned Shape>
++[[gnu::always_inline]] inline ClockResult fixed_event_clock(const EvSt &st) {
++    static_assert(Shape==2*20 || Shape==2*13);
++    constexpr auto &j=tj_table[Shape];
++    static_assert(j.f.ksel==A<u8,32>{} && j.e.kmf==A<i64,4>{0,Shape==2*13?-1:0,0,0});
++    auto digits=_mm256_sub_epi8(_mm256_shuffle_epi8(st.x,ld2(j.a.ctrl.data())),ld2(j.a.base.data()));
++    auto pairs=_mm256_maddubs_epi16(digits,ld2(j.b.w1.data()));
++    auto fields=_mm256_madd_epi16(pairs,ld2(j.c.w2.data()));
++    auto packed=_mm256_madd_epi16(_mm256_packus_epi32(fields,fields),ld2(j.c.w3.data()));
++    auto bad_bytes=_mm256_subs_epu8(digits,ld2(j.b.lim.data()));
++    auto bad_fields=_mm256_cmpgt_epi32(fields,ld2(j.d.limv.data()));
++    auto time=_mm256_mul_epu32(packed,ld2(j.e.kme.data()));
++    if constexpr(Shape==2*13) {
++        // The original mask selects subtraction in every lane, with a -1
++        // coefficient only in the event lane. Preserve signed intermediate bits.
++        auto low_digits=_mm256_and_si256(_mm256_srai_epi64(packed,32),_mm256_set_epi64x(0,0,-1,0));
++        time=_mm256_add_epi64(time,low_digits);
++    }
++    return {_mm256_add_epi64(time,st.days),bad_bytes,bad_fields};
++}
++#endif
++
++[[gnu::always_inline]] inline ClockResult event_clock(const EvSt &st) {
++#if defined(SHOP_CONSTANT_EVENT_CLOCK)
++    // ev_s derives the table address from the two actual raw field widths.
++    if (st.tj==&T.tj[2*20]) return fixed_event_clock<2*20>(st);
++    if (st.tj==&T.tj[2*13]) return fixed_event_clock<2*13>(st);
++#endif
+     auto &j=*st.tj;
+     auto d=_mm256_sub_epi8(_mm256_shuffle_epi8(st.x,ld2(j.a.ctrl.data())),ld2(j.a.base.data()));
+     auto m1=_mm256_maddubs_epi16(d,ld2(j.b.w1.data()));
+@@ -355,6 +384,12 @@
+     auto t=_mm256_mul_epu32(m3,ld2(j.e.kme.data())),f=_mm256_mul_epi32(_mm256_srli_epi64(m3,32),ld2(j.e.kmf.data()));
+     auto ksub=_mm256_testn_epi64_mask(d,ld2(j.f.ksel.data()));
+     auto r=_mm256_add_epi64(_mm256_mask_sub_epi64(_mm256_add_epi64(t,f),ksub,t,f),st.days);
++    return {r,ba,bb};
++}
++
++struct Step {P next;bool boundary;};
++inline Step ev_d(Cx<EvBatch> &cx,P p,const EvSt &st,P next,std::size_t &w) {
++    auto [r,ba,bb]=event_clock(st);
+     cx.b->ts[w]=_mm_extract_epi64(_mm256_castsi256_si128(r),1);
+     auto dst=reinterpret_cast<u8 *>(cx.b)+offsetof(EvBatch,ing)+8*w;
+     _mm_storeu_si128(reinterpret_cast<V *>(dst),_mm256_extracti128_si256(r,1));
