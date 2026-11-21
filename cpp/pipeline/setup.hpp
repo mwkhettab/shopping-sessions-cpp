@@ -55,6 +55,7 @@ inline std::unique_ptr<G> make_model(std::size_t nt,bool check,i64 ws,i64 we,Key
     // Establish atomic object lifetimes explicitly in the zero-filled claim bitmap.
     std::uninitialized_value_construct_n(g->claim,g->ucap/64+8);
     g->csr_off=reinterpret_cast<u32*>(sys::anon((g->ucap+nub+8)*4));g->csr=reinterpret_cast<links::Click*>(sys::anon(g->csr_cap*sizeof(links::Click)));
+    g->word_bucket=sys::anon(nub+1);
     g->edges=reinterpret_cast<EdgeInfo*>(sys::anon(nb*sizeof(EdgeInfo)));
     if(check)std::fprintf(stderr,"[pipeline] user key %llx, event key %llx, click key %llx, click capacity %llu\n",(unsigned long long)keys.user,(unsigned long long)keys.event,(unsigned long long)keys.click,(unsigned long long)keys.ccap);
     return g;

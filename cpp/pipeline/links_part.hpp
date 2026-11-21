@@ -57,10 +57,11 @@ template<class T,class Fn> inline void process_links(T& t,std::span<u16> tab,std
     t.pend.clear();visit([&](u64 w){link_rec(t,tab,w);});
     if(links_done(t,tab,u0))visit([&](u64 w){const auto u=local_user(w);if(tab[u]&COMPLEX)cx.emplace_back(u32(u0+u),u8((w>>4)&15),u8(w&15));});
 }
-inline void count_chunk(std::span<const Rec> recs,std::vector<u32>& cnt,ScratchVec<u64>& lk) {
+inline u64 count_chunk(std::span<const Rec> recs,std::vector<u32>& cnt,ScratchVec<u64>& lk) {
     const auto n=lk.size();lk.resize(n+recs.size()+1);auto j=n;
-    for(const auto r:recs){const auto link=r.w0>>63;++cnt[local_user(r.w0)|(link<<UB)];lk[j]=r.w0;j+=std::size_t(link);}
-    lk.resize(j);
+    u64 fields=0;
+    for(const auto r:recs){const auto link=r.w0>>63;++cnt[local_user(r.w0)|(link<<UB)];lk[j]=r.w0;j+=std::size_t(link);fields|=r.w0;}
+    lk.resize(j);return fields;
 }
 inline void scatter_chunk(std::span<const Rec> recs,std::vector<u32>& pos,Click* csr) {
     for(auto r:recs){const auto flag=r.w0>>63;auto& pp=pos[local_user(r.w0)|(flag<<UB)];const auto at=pp;pp+=1-u32(flag);csr[at]={r.w1,r.w0&((RAW<<1)-1)};}
@@ -77,22 +78,54 @@ template<class G> inline void prelude_part(const G& g) {
         } else p.normal.push_back(u32(ub));
     }
 }
+// Input offsets index temporary pairs. Output offsets index 64-bit words.
+// Ordinary clicks already have their final lexical order. Linked users also
+// need the original ID when their clicks are merged with another alias.
+inline void store_click_words(std::span<const u16> users,std::span<u32> off,
+                              std::span<const Click> records,u64* words,u32 base) {
+    u32 out=base;
+    for(std::size_t u=0;u<users.size();++u) {
+        const auto a=off[u],b=off[u+1];
+        off[u]=out;
+        if(users[u]&COMPLEX) {
+            if(b>a) std::memcpy(words+out,records.data()+a,(b-a)*sizeof(Click));
+            out+=2*(b-a);
+        } else {
+            for(auto i=a;i<b;++i) words[out++]=records[i][0];
+        }
+    }
+    off[users.size()]=out;
+}
 template<class G,class T> inline void bucket(const G& g,T& t,Scratch& sc,std::size_t ub) {
     const auto start=sys::Instant::now();
     auto& p=*plan;auto& cnt=t.cnt;auto& lk=sc.lk;
     cnt.assign(2*UBSIZE,0);lk.clear();std::size_t seen=0;
-    for(std::size_t th=0;th<g.nt;++th)g.t(th).us.for_each(ub,[&](auto rows){seen+=rows.size();count_chunk(rows,cnt,lk);});
+    u64 fields=0;
+    for(std::size_t th=0;th<g.nt;++th)g.t(th).us.for_each(ub,[&](auto rows){seen+=rows.size();fields|=count_chunk(rows,cnt,lk);});
     const auto total=p.base[ub+1]-p.base[ub];if(seen!=total)sys::fallback("click partition count");
     u64 d1=0;bool first=true;
     process_links(t,utab_of(g,ub),ub<<UB,[&](auto f){for(u64 w:lk)f(w);if(first){d1=elapsed_ns(start);first=false;}},t.cx_edges);
     auto d2=d1;
     if(total){
-        auto off=off_of(g,ub);u32 at=u32(p.base[ub]);
+        // Opaque IDs may need a deferred lexical sort after parsing. Keep those
+        // buckets in the persistent pair array until their tie groups are fixed.
+        bool compact=false;
+        if constexpr(requires{g.word_bucket;})
+            compact=g.word_bucket && !(fields&RAW) && p.base[ub+1]<=UINT32_MAX/2;
+        auto off=off_of(g,ub);const u32 base=compact?0:u32(p.base[ub]);u32 at=base;
         for(std::size_t ul=0;ul<UBSIZE;++ul){off[ul]=at;at+=cnt[ul];cnt[ul]=off[ul];}
-        off[UBSIZE]=at;if(at-p.base[ub]+lk.size()!=total)sys::fallback("click partition count");
+        off[UBSIZE]=at;if(at-base+lk.size()!=total)sys::fallback("click partition count");
         std::fill(cnt.begin()+UBSIZE,cnt.end(),at);
-        for(std::size_t th=0;th<g.nt;++th)g.t(th).us.for_each(ub,[&](auto rows){scatter_chunk(rows,cnt,g.csr);});
-        d2=elapsed_ns(start);sort_users(g,off.data(),0,UBSIZE,sc);
+        auto* records=g.csr;
+        if(compact) {sc.records.resize(at+1);records=sc.records.data();}
+        for(std::size_t th=0;th<g.nt;++th)g.t(th).us.for_each(ub,[&](auto rows){scatter_chunk(rows,cnt,records);});
+        d2=elapsed_ns(start);sort_users(g,off.data(),0,UBSIZE,sc,records);
+        if constexpr(requires{g.word_bucket;}) {
+            if(compact) {
+                store_click_words(utab_of(g,ub),off,{records,at},reinterpret_cast<u64*>(g.csr),u32(2*p.base[ub]));
+                g.word_bucket[ub]=1;
+            }
+        }
     }
     const auto el=elapsed_ns(start);t.prof[5]+=d1;t.prof[6]+=d2;t.prof[3]+=el;t.prof[4]=std::max(t.prof[4],el);
 }

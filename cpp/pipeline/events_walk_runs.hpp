@@ -49,9 +49,15 @@ template<class G> [[gnu::noinline]] std::size_t walk_runs(Fast& fx,const G& g,Wa
     for(std::size_t j=0;j<listed;++j) {
         const auto r=fx.click_run[j],s0=fx.run_s0[r],nsr=fx.run_s0[r+1]-s0,klass=fx.walk_class[r];
         std::span<const std::array<u64,2>> cks;
-        if constexpr(requires{g.csr_off;g.csr_cap;}) cks={g.csr+fx.click_start[j],fx.click_size[j]};
+        std::span<const u64> keys;
+        if constexpr(requires{g.simple_words(fx.walk_user[r]);}) {
+            if(g.simple_words(fx.walk_user[r])) keys={reinterpret_cast<const u64*>(g.csr)+fx.click_start[j],fx.click_size[j]};
+        }
+        if constexpr(requires{g.csr_off;g.csr_cap;}) {
+            if(keys.empty()) cks={g.csr+fx.click_start[j],fx.click_size[j]};
+        }
         else cks=g.csr_range(fx.walk_user[r]);
-        const auto n=cks.size();
+        const auto n=keys.empty()?cks.size():keys.size();
         bool light=false;
         if (n<=16 && nsr<=WL_RUN) {
             if (nrc==RC_N || nw+nsr>WL_CAP) {light_flush(fx,nw,org);nw=0;nrc=0;}
@@ -61,10 +67,12 @@ template<class G> [[gnu::noinline]] std::size_t walk_runs(Fast& fx,const G& g,Wa
             if constexpr(requires{g.csr_cap;g.ncsr;}) {
                 // Published CSR buffers include sixteen guard records. Small stand-alone ranges
                 // use a masked boundary load when they do not share that padded storage.
-                const auto off=std::size_t(p-g.csr);
-                padded=off<=g.csr_cap && g.csr_cap-off>=16;
+                if(p) {const auto off=std::size_t(p-g.csr);padded=off<=g.csr_cap && g.csr_cap-off>=16;}
             }
-            if (padded) {
+            if(!keys.empty()) {
+                // The partition arena has at least sixteen guard words at its end.
+                ka=get512(keys.data());kb=get512(keys.data()+8);
+            } else if (padded) {
                 ka=_mm512_permutex2var_epi64(get512(p),even64(),get512(p+4));
                 kb=_mm512_permutex2var_epi64(get512(p+8),even64(),get512(p+12));
             } else {
@@ -92,7 +100,10 @@ template<class G> [[gnu::noinline]] std::size_t walk_runs(Fast& fx,const G& g,Wa
                 ++nrc;nw+=nsr;
             }
         }
-        if (!light) run_clicks(fx,cks,klass,s0,nsr,org);
+        if (!light) {
+            if(keys.empty()) run_clicks(fx,cks,klass,s0,nsr,org);
+            else run_clicks_k<false>(fx,keys,klass,s0,nsr,org);
+        }
     }
     wk.nw=nw;wk.nrc=nrc;return stop;
 }

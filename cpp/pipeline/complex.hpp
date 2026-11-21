@@ -5,6 +5,7 @@
 
 namespace pipeline::complex {
 using Click = std::array<u64,3>;
+inline constexpr u64 CLICK_RANK=u64{1}<<61;
 template<class G,class T> void resolve_all(const G& g,T& t) {
     auto raw=std::move(t.cx_raw);t.cx_raw.clear();
     u64 last=UINT64_MAX;
@@ -32,11 +33,19 @@ template<class G> void clicks_a(const G& g,std::size_t tid) {
         for (auto i=i0;i<std::min(i0+64,g.cxu.size());++i) {
             auto u=g.cxu[i];
             std::array<u64,16> cache;cache.fill(UINT64_MAX);
-            for (auto c:g.csr_range(u)) {
-                u32 a=c[0]&15;
+            auto add=[&](u64 key,u64 order) {
+                u32 a=key&15;
                 if (cache[a]==UINT64_MAX) cache[a]=links::resolve_normal(g,u,a);
-                t.cx_ck[shard(cache[a])].push_back({cache[a],c[0],c[1]});
+                t.cx_ck[shard(cache[a])].push_back({cache[a],key,order});
+            };
+            if constexpr(requires{g.simple_words(u);g.click_words(u);}) {
+                if(g.simple_words(u)) {
+                    u64 rank=CLICK_RANK|(u64(u)<<32);
+                    for(auto key:g.click_words(u)) add(key,rank++);
+                    continue;
+                }
             }
+            for(auto c:g.csr_range(u)) add(c[0],c[1]);
         }
     }
     auto odd=std::move(t.odd_clicks);
@@ -71,17 +80,27 @@ template<class G> void person_shard(const G& g,std::size_t tid,std::size_t s,PSc
     }
     if (evs.empty()) return;
     std::sort(evs.begin(),evs.end(),[](const Rec& a,const Rec& b){return std::tie(a.w1,a.w0)<std::tie(b.w1,b.w0);});
-    if (std::all_of(cks.begin(),cks.end(),[](auto c){return !(c[2]&RAW);})) {
+    if (std::all_of(cks.begin(),cks.end(),[](auto c){return (c[2]&(RAW|CLICK_RANK))!=RAW;})) {
         dec.clear();dec.reserve(cks.size());
         for (auto c:cks)
-            dec.push_back({(static_cast<unsigned __int128>(c[0])<<64)|(c[1]>>32),~enc36(c[2]).first,c});
+            dec.push_back({(static_cast<unsigned __int128>(c[0])<<64)|(c[1]>>32),
+                (c[2]&CLICK_RANK)?c[2]:~enc36(c[2]).first,c});
         std::sort(dec.begin(),dec.end(),[](const auto& a,const auto& b){return std::tie(a.rank,a.id)<std::tie(b.rank,b.id);});
         for (std::size_t i=0;i<dec.size();++i) cks[i]=dec[i].row;
     } else {
         std::sort(cks.begin(),cks.end(),[&](const Click& a,const Click& b){
             const auto ac=std::pair{a[0],a[1]>>32},bc=std::pair{b[0],b[1]>>32};
-            return ac!=bc ? ac<bc : events::cid_cmp(g,b[2],a[2])<0;
+            if(ac!=bc) return ac<bc;
+            if((a[2]|b[2])&CLICK_RANK) return a[2]<b[2];
+            return events::cid_cmp(g,b[2],a[2])<0;
         });
+    }
+    // A rank only orders IDs from its original user. Retry the general parser
+    // when one person would require comparing ranks from different sources.
+    for(std::size_t k=1;k<cks.size();++k) {
+        const auto& a=cks[k-1];const auto& b=cks[k];
+        if(a[0]==b[0] && ((a[2]|b[2])&CLICK_RANK) && (a[2]>>32)!=(b[2]>>32))
+            sys::fallback("incomparable click ranks");
     }
     std::size_t i=0,j=0;
     while (i<evs.size()) {
