@@ -57,6 +57,19 @@ The public annotation cuts off before the last practice cell. A separately train
 
 The 0.88 s source measured 0.9537, 2.9853 and 2.9302 s in the same rotation. Compressing the stream markers and validating them in one pass measured 0.9671 and 3.0258 s at 20M and seed 47 for the best practice variant. Its AVX2-only counterpart measured 1.0436 and 3.2462 s. Vectorizing both timestamp conversions took 0.9300 and 2.9232 s on the full instruction set. The mixed-training eight-row decoder was faster on all three datasets. [Full portfolio and held-out measurements](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44920978277/job/136896725235)
 
+### Clean eight-row Linux images
+
+These release builds use a single automatic compiler training pass per input layout. Each native runner selected its fastest clean build using seed 23 and seed 47 before generating seed 733. Each cell compares the official 0.87 s source with that build. RAM is peak process RSS with eight workers on the held-out input. Each runner provided four pinned vCPUs.
+
+| Intel CPU | Selected build | 20M seed 23 | 60M seed 47 | 60M seed 733 | Eight-worker RAM |
+| --- | --- | ---: | ---: | ---: | ---: |
+| [6973P-C](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44922707304/job/136901997278) | `ship8bw-pgo` | 1.088 → 0.995 s (5/5) | 3.469 → 3.141 s (3/3) | 3.413 → 3.216 s (3/3) | 8.29 GiB |
+| [Platinum 8370C](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44922707304/job/136901997630) | `ship8lean-pgo` | 1.389 → 1.274 s (5/5) | 4.254 → 3.985 s (3/3) | 4.278 → 4.005 s (3/3) | 8.31 GiB |
+
+All clean decoders passed 36 fixtures and both published reference tables. Each selected Docker image passed five independent comparison suites, full output comparisons on all three populations, the 8,388,673-event single-alias stress case, and eight-worker ThreadSanitizer. On the 6973P-C the input and partitioning phase fell from 0.607 to 0.522 s. Deduplication took 0.093 s, grouping with singleton sessions 0.190 s, graph resolution 0.027 s, linked sessions 0.158 s, and the final merge and output close 0.007 s. User Parquet writes also occur during session processing. One-pass CSV markers, immutable scatter ordinals and segmented linked-session bins all finished behind the release selected on that runner. [Full timings and profiles](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44922707304/job/136901997278)
+
+Two additional experiments were isolated on the eight-worker Apple host. Storing most clicks in eight bytes using a lossless CSV position, campaign and whole seconds with a fractional-time escape changed the seven-run 20M median from 0.562 to 0.550 s, with overlapping ranges. A 12-byte variant took 0.571 s. The scalar ID and time oracle checked 800,000 comparisons, including cross-page fields and embedded null bytes. Five builds passed all fixtures and reference tables, four full 60M comparisons passed, and independent complete tables matched on adversarial click ties. Caching the first four digits of epoch-millisecond strings changed five-run 20M medians from 0.524 to 0.513 s. A five-digit cache took 0.525 s. All 503,329 generated timestamp spellings matched the scalar result. These figures describe development hardware.
+
 ## Marked event fields on x86-64
 
 The release checks a 1 KiB CSV tile before exposing its seven fields per event. Each delimiter records whether the preceding field was quoted. Eight 16-bit lanes turn adjacent delimiters into exact lengths and starting positions for a complete row. The event callback can use those spans for views, carts and purchases, including invalid earliest revisions that suppress later copies. The optional reader requires AVX2, BMI, BMI2, POPCNT, PCLMUL and AVX-512F/BW/VBMI2. The scored reader handles older processors. Long rows, malformed tiles and IDs that cannot be encoded inline go through the existing general paths.

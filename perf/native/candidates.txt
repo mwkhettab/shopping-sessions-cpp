@@ -1,1 +1,1 @@
-base fin-slabkey-pgo shipresident-pgo portablerich-pgo shapemix-pgo release2rich-pgo release2lean-pgo release3rich-pgo release3lean-pgo
+base fin-slabkey-pgo shipresident-pgo portablerich-pgo release2lean-pgo release3rich-pgo release3lean-pgo perm8g-pgo perm8s-pgo pair8direct-pgo pair8reuse-pgo perm8pair-pgo trainedclick8-pgo trainedclick12-pgo trainedepoch4-pgo trainedepoch5-pgo

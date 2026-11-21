@@ -1,1 +1,1 @@
-base shipresident-pgo portablerich-pgo shapemix-pgo @best
+base shipresident-pgo @best
