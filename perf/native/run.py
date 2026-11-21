@@ -195,6 +195,8 @@ def main():
     from extra_checks import scaling, race
     scaling(root,area,practice_winner,note,run,env)
     race(root,area,practice_winner,note,run,env)
+    from line_profile import collect as measure_lines
+    measure_lines(root,area,note,run,env)
 
 published=0
 def publish():

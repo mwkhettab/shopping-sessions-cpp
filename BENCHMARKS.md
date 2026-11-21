@@ -7,10 +7,126 @@
 | `61e9ba65eafa2dc9a002c03aa2bbf4135931d448` | **1.80 s** | Original scored release |
 | `1bcbf0cd1a2754fb8812fd91e2ef5f4237dc928e` | **1.82 s** | Only `.gitignore` changed |
 | `8b2f568600d0fb5cc9bc066dc13ce609ed5d0e7b` | **1.83 s** | First 512-shard release |
+| `6129109af768205fc66e05bd2d89711fa5d03b46` | **1.68 s** | SIMD CSV decoding, dense linked-person routing and delta Parquet |
+| `8430241e49a4147b9b42dffce4cf21a4088eb5ff` | **1.13 s** | Concurrent input, compact revision and timeline storage, fused alias graph, partition slabs and direct Parquet |
+| `33fb788bf962900617e8c0455d366f7f0a5d7eeb` | **0.99 s** | Reversible ID hashes and synthetic, build-time profile-guided compilation |
 
-The entrant supplied all three scores. Entries `BB-065C223B` and `BB-E8D93ABE` listed 41 ms and 105 ms of queue wait separately. Relative to `61e9ba6`, the 512-shard release decodes each field as its delimiter is encountered, raises the event and person shard count from 128 to 512, reserves identity storage from input size, and compares inline canonical IDs bytewise without a separate display-name vector. It also reserves Arrow builder capacity and uses unchecked numeric appends within that reservation. Its compiler flags, Dockerfile, global deduplication rules, session boundaries and attribution algorithm match the official baseline. Its official run was 0.03 s slower. Two submissions of the identical baseline pipeline differed by 0.02 s.
+The entrant supplied these scores. The 0.99 s run reduced the previous best by 12.4%. The scorer marked the earlier `BB-BE7C95B8` as entered in the final with 3 ms queue wait. Its 1.13 s runtime was 32.7% lower than the previous 1.68 s best. Entries `BB-065C223B` and `BB-E8D93ABE` listed 41 ms and 105 ms of queue wait separately. Relative to `61e9ba6`, the 512-shard release decodes each field as its delimiter is encountered, raises the event and person shard count from 128 to 512, reserves identity storage from input size, and compares inline canonical IDs bytewise without a separate display-name vector. It also reserves Arrow builder capacity and uses unchecked numeric appends within that reservation. Its compiler flags, Dockerfile, global deduplication rules, session boundaries and attribution algorithm match the official baseline. Its official run was 0.03 s slower. Two submissions of the identical baseline pipeline differed by 0.02 s.
 
-## Submission candidate
+## Experiments against the 0.99 s release
+
+The four-vCPU Intel Xeon 6975P-C spent 36.8% of sampled process CPU time in the seven-field event decoder and its inlined callback. Resolving duplicate revisions accounted for 7.9%. Separate warm input probes checksummed every decoded field length in 0.3626 s, then took 0.4850 s with semantic validation and 0.5831 s with validation and key encoding. Each figure is the median of five fresh processes. The probes measure cumulative workloads and omit timeline construction and output. The complete release took 3.341, 1.736 and 1.237 s at one, two and four workers. Consuming 1.918 GB in 0.50 s would require 3.84 GB/s while performing the rest of the pipeline. [Intel sampling, probe results and worker scaling](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44877968380/job/136766779170)
+
+| Intel four-vCPU warm full-process medians | 20M, seed 23 | 60M, seed 47 |
+| --- | ---: | ---: |
+| Scored source, row-decoder series | 1.1873 s | 3.6091 s |
+| Lazy field boundaries | 1.1815 s | 3.6160 s |
+| Cache complete row layouts in 1,024 / 4,096 / 16,384 entries | 1.2193 / 1.2054 / 1.2404 s | — |
+| Group aliases while parsing into blocks of 8 / 64 records | 3.9057 / 3.7324 s | — |
+| Scored source, timeline-storage series | 1.1865 s | 3.6188 s |
+| Second independent compiler profile from the same source | 1.1917 s | 3.6365 s |
+| Consume linked spans directly in session bins | 1.1959 s | 3.6728 s |
+| Replace contiguous scatter with per-alias chains, compact before processing | 1.6587 s | — |
+| Replace contiguous scatter with per-alias chains, process bins directly | 1.6468 s | 5.3472 s |
+
+Each pair used the same runner and files. Each build passed 36 supplied fixtures and both published reference tables before timing. The table reports five rotated 20M runs and three 60M runs for finalists. Removing the scatter pass increased traversal costs. The 4,096-entry layout cache recognized over 80% of event layouts in a separate input sample, but checking those layouts increased the Intel median. The release kept its original decoder and contiguous timeline storage. An eight-worker ThreadSanitizer run passed the extended graph and attribution regressions on native x86-64. An independent scalar interpreter also matched both complete tables on 24 generated edge-case datasets. [Row-decoder and fused grouping trials](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44877076608/job/136764023147) · [Contiguous and chained timelines](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44877968380/job/136766779170)
+
+A separate AMD test varied the allocation order of the partition slabs. Interleaving only the raw-event and click partitions in tiles of 256 reduced the medians from 1.1712 to 1.1540 s at 20M and from 3.6514 to 3.5975 s at 60M on an EPYC 9V74. Both binaries in that comparison used interval attribution. Interleaving both revisions and raw records took 3.6981 s at 60M. [Full slab comparisons](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44876273411/job/136761546768)
+
+## Reversible IDs and profile-guided compilation
+
+The Intel runner measured the exact source of the 1.13 s release against a lossless ID representation and a GCC profile-guided build. The ID permutation computes the hash at ingestion. Repeated shard and table lookups reuse it. Recovering the original bytes preserves lexicographic ordering for linked names and click ties. Indirect strings retain their full bytes and cache their hash. Two small synthetic build-time workloads exercise short and wide windows, ordinary and arbitrary IDs, and conflicting revisions. The container includes only the resulting executable and the Debian runtime.
+
+| Four pinned vCPUs on Intel Xeon 6975P-C | 20M warm median | 60M warm median | Peak RSS at 60M |
+| --- | ---: | ---: | ---: |
+| Official 1.68 s release | 2.1143 s | 7.0492 s | 9,334 MiB |
+| Official 1.13 s release | 1.3270 s | 4.1328 s | 8,287 MiB |
+| Reversible IDs | 1.2927 s | — | — |
+| Reversible IDs and build-time profiling | **1.2198 s** | **3.6877 s** | **8,285 MiB** |
+| Same build with session-index interval attribution from 32 clicks | 1.2233 s | 3.7378 s | 8,284 MiB |
+| Same interval build with chunk prefetch / sequential mapping advice | 1.2239 / 1.2224 s | 3.7511 / 3.7361 s | 8,284 / 8,283 MiB |
+
+The candidate finished ahead of the 1.13 s source in every one of five rotated practice rounds and all three final-scale rounds. Its medians fell 8.1% at 20M and 10.8% at 60M. At 20M the individual times were 1.2024, 1.2053, 1.2198, 1.2246 and 1.2201 s. Tests with forced eviction confirmed 0% input residency at startup. The candidate took 3.782–3.801 s at 20M and 12.928–12.979 s at 60M. Chunk prefetch and Linux sequential advice failed to improve the 60M cold median. Separate trials with vectors found profile-guided compilation faster than link-time optimization on both Intel and AMD. [Paired Intel timings](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44874938746/job/136757467569) · [Compiler and attribution comparisons](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44874463331)
+
+The 20M Intel phase medians were 0.627 s for concurrent input, validation and partitioning, 0.090 s for deduplication, 0.202 s for raw-user grouping and singleton processing, 0.026 s for the identity union, 0.187 s for linked sessions and attribution, and 0.045 s for merge and Parquet. At 60M those figures were 1.841, 0.354, 0.665, 0.089, 0.535 and 0.108 s. The 60M/20M full-process ratio was 3.02. A separate design that grouped aliases while scanning and stored records in per-alias blocks eliminated the later counting and scatter pass. In five warm arm64 rounds its two block sizes took 1.456 and 1.444 s, versus 0.499 s for the official 1.13 s source. The changes increased CPU time and peak memory. Its fixtures, published references and both 20M tables matched.
+
+On the same native Intel runner, the actual linux/amd64 release image ran five 20M processes in 1.251, 1.250, 1.252, 1.279 and 1.262 s. Its 60M times were 3.820, 3.717 and 3.838 s. Peak process RSS was 2,811 MiB at 20M and 8,282 MiB at 60M. Including the `docker run` command increased the medians to 1.357 and 3.931 s. The old 1.68 s release image measured 2.156 and 7.130 s inside its container. The release binary in this Intel run had SHA-256 `76de9abe1b09be6f3a303eff41b78905629c544106d5260fec8393dd74da5617`. [Native Docker measurements](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44874938746/job/136757467569)
+
+The local linux/amd64 image passed the 36 fixtures, extended regressions, both published 1M reference tables and full comparisons at 20M and 60M. Both tables had unique keys. The counts were 2,226,509 and 28,014 rows at 20M, then 6,684,549 and 28,014 at 60M. With Mac-host-mounted input, translated amd64 execution and a 7 GiB cgroup, the process took 4.788 and 43.560 s. The latter reached 7,140 MiB process RSS and the 7,168 MiB cgroup limit. The local executable had SHA-256 `1a1468538c686c3e099061e1da76865d12efd7f9bbc7a1be5cc87c40625a6a11`. Each Docker build collects a new multithreaded compiler profile.
+
+## November 21 compact-partition release
+
+The standalone linux/amd64 image passed all 36 fixtures, the extended regression cases, both published 1M tables, and row-for-row comparisons with the validated 20M and 60M tables. The regression cases cover long identifiers and rows, wide catalog and timestamp representations, competing invalid revisions, a 6,400-vertex cyclic identity graph, click ties and assist intervals, and signed 64-bit Parquet values. The pre-AVX2 image path matched the published answers. The decoder and timestamp checks passed with Linux UBSan in both CPU modes. The tested `/app/shopping` has SHA-256 `ccbe72b3b874b43ed44c7b9146c7237332222b83e31d213b92d550850faed249`.
+
+| Input | Exact user-day rows | Exact campaign-day rows | Full process, Mac-hosted amd64 Docker | Peak RSS | Peak cgroup |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1M | 117,038 | 27,400 | — | — | — |
+| 20M | 2,226,509 | 28,014 | 4.098 s | 2,707 MiB | 2,718 MiB |
+| 60M | 6,684,549 | 28,014 | 31.461 s | 7,140 MiB | 7,168 MiB |
+
+Both large tables had zero duplicate keys at both scales. The Mac Docker VM used eight pinned virtual CPUs, a 7 GiB cgroup with swap disabled, host-mounted input and translated amd64 execution. The 60M process incurred 13,024 major faults. On native four-vCPU Intel Linux the partition-slab implementation tested before source cleanup took 1.298 s at 20M and 4.062 s at 60M, with 2,813 and 8,287 MiB peak RSS. Its scored control took 2.076 and 6.467 s in the same experiment. [Native Intel timings and comparison](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44873434144/job/136752825580)
+
+## Native x86-64 architecture comparisons
+
+The official 1.68-second revision is the control in every series below. GitHub's free public runners supplied four Linux vCPUs. The scorer supplies eight hyperthreads on a GCP N2 Intel Xeon. Each warm comparison used the same generated files, GCC 12, one warm-up per executable, rotated order and fresh output directories. The parent measured startup, all reads and writes, and process exit. Inputs were preloaded before each timed process. The public benchmark branch contains the sources and commands for each experiment.
+
+| 20M full-process median in seconds | Intel Xeon 6975P-C | AMD EPYC 9V45, run 2 | AMD EPYC 9V45, run 3 |
+| --- | ---: | ---: | ---: |
+| Official 1.68-second release | 2.150 | 1.956 | 2.015 |
+| Half-hour bins for timelines with at least 32 events | 2.107 | | |
+| Reduce hot timelines during scatter | 2.119 | | |
+| Per-worker whole-input duplicate fingerprint bitmaps | 2.929 | | |
+| Row-oriented AVX2, unchanged event layout | 2.123 | | |
+| Whole-batch quote grammar / lazy field offsets | 2.171 / 2.135 | | |
+| Lossless compact event and click timelines with half-hour bins | | 1.712 | |
+| Same compact layout with an eight-record shard write buffer | | 1.718 | |
+| Simpler key mixer and short-key load | | 1.694 | |
+| Compact layout with row AVX2 / batch AVX-512 | | 1.629 / 1.648 | |
+| Compact layout with direct delta / plain Parquet | | 1.682 / 1.619 | |
+| Group by raw user and route one span per linked alias | | 1.454 | 1.522 |
+| Separate revision index and fuse event/click ingestion | | | 1.512 |
+| Raw-user spans, row AVX2 and direct delta / plain Parquet | | | 1.371 / 1.338 |
+| Fused ingestion, row AVX2 and direct delta Parquet | | | 1.356 |
+| Defer ingest-clock conversion and compare F1 bytes for duplicates | | | 1.419 |
+| Two radix passes over fingerprints and exact-key resolution | | | 1.309 |
+
+Each nonempty cell is the median of five timed processes. Compare changes within a column. Building the entire original binary for Haswell or Skylake AVX-512 produced 1.951 and 1.999 s against 1.956 s on the second runner. The portable builds keep CPU feature dispatch. A bounded atomic global winner table also lost to the official release on both arm64 (1.126 versus 0.787 s) and translated amd64 (4.361 versus 3.756 s). The whole-input bitmap cut the exact duplicate phase substantially, but collecting and consulting its fingerprints increased total time. [Intel screening](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44870757469) · [AMD compact-layout comparisons](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44871621885) · [AMD architecture comparisons](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44872341514)
+
+On the first Intel runner, four workers summed every byte of the resident 1.918 GB input in 0.066 s, about 29 GB/s. Structural CSV decoding alone took 0.324 s. On that runner the control spent 0.843 s on events, 0.434 s on event deduplication and routing, 0.228 s on click input, 0.438 s on per-person processing, and 0.119 s on output. The concurrent identity build took about 0.34 s inside the event phase. A 0.65 s full run would need to consume the input at 2.95 GB/s while also performing validation, joins, deduplication, session attribution and output. The scanning probes use warm pages and exclude those other operations.
+
+### Native final-scale control
+
+| Four-vCPU AMD EPYC, seed 47 | 20M seed-23 median | Three 60M runs (s) | 60M median | Max 60M process RSS |
+| --- | ---: | --- | ---: | ---: |
+| Official 1.68-second release | 2.015 s | 6.520, 6.249, 6.439 | 6.439 s | 9,372 MiB |
+| Raw-user grouping and compact timelines | 1.522 s | 4.340, 4.489, 4.343 | 4.343 s | 8,953 MiB |
+| Raw-user grouping, row SIMD and direct delta Parquet | 1.371 s | 4.183, 3.927, 4.006 | 4.006 s | 8,622 MiB |
+| Fused revision index, row SIMD and direct delta Parquet | 1.356 s | 3.978, 4.033, 3.922 | 3.978 s | 8,752 MiB |
+
+The fused pipeline's 60M/20M time ratio was 2.93, against 3.20 for the control. At 60M the control's graph construction occupied 1.49 s of the event phase, while global event deduplication and person routing took 1.50 s. The fused pipeline spent 2.38 s on concurrent input and indexing, 0.24 s resolving losing revisions, 0.58 s grouping raw aliases, 0.37 s on linked-person timelines and 0.06 s writing Parquet. Both large datasets were checked by schema and sorted daily keys, including nulls and every value. Each table had zero duplicate keys. The optional memory-bounded benchmark generator produced byte-identical seed-1 files to the original published generator before generating seed 47. All competition executions read the supplied files directly. [Native large-scale comparison](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44872341514)
+
+### Native Intel graph and memory trials
+
+Each pair used identical inputs and CPU affinity. The Intel machine had AVX-512BW. The AMD EPYC 7763 used the portable AVX2 path. Each 20M cell is the median of five full processes and each 60M cell is the median of three. The graph trial interned link endpoints with the raw event and click aliases. Union operations then worked on resolved vertices, and only the aliases of a linked component had to combine their timeline spans. The slab allocator reserved a bounded address range per worker and shard, with growable overflow for skewed partitions.
+
+| Change | Intel 20M | AMD 20M | Intel 60M | AMD 60M |
+| --- | ---: | ---: | ---: | ---: |
+| Scored release | 2.076 s | 2.910 s | 6.467 s | 8.981 s |
+| Radix fingerprints and raw alias spans | 1.527 s | 2.012 s | — | — |
+| Per-shard duplicate bitmap and exact verification | 1.433 s | 2.025 s | — | — |
+| Compact revision index | 1.458 s | 2.071 s | — | — |
+| Link endpoints interned with raw aliases, serial union | 1.439 s | 2.029 s | — | — |
+| Parallel monotone union with path splitting | 1.434 s | 2.022 s | — | — |
+| Sampled capacities with a separate graph | 1.426 s | 2.014 s | 4.508 s | 6.201 s |
+| Sampled capacities with fused graph | 1.375 s | 1.984 s | 4.172 s | 5.928 s |
+| Fused graph and per-worker partition slabs | 1.298 s | 1.767 s | 4.062 s | 5.440 s |
+| Same slabs with PCLMUL/BMI2 quote validation | 1.319 s | 1.758 s | 4.098 s | 5.443 s |
+
+On Intel, the simple row-oriented AVX2 parser with partition slabs took 1.293–1.299 s across five 20M runs, against 2.067–2.083 s for the scored release. Peak RSS was 2,813 MiB at 20M and 8,287 MiB at 60M. The scored release peaked at 3,281 and 9,321 MiB. The 20M candidate spent 0.680 s on concurrent input and initial partitioning, 0.115 s resolving losing revisions, 0.226 s grouping raw users and processing singletons, and 0.019 s on the identity union. The largest timeline contained 387,486 events and 72,005 clicks. Reducing the fused vector implementation from 512 to 128 shards or increasing it to 1,024 gave 1.397 and 1.395 s, against 1.375 s at 512. The alternate quote parser improved the AMD median by 0.009 s and increased the Intel median by 0.022 s.
+
+The separate eviction probe requested eviction of this job's input files and verified 0% starting residency with `mincore`. The Intel 20M control and slab candidate took 3.240 and 3.660 s in single observations. At 60M they took 13.766 and 13.071 s. The AMD 60M observations were 17.710 and 16.397 s. Storage and page faults can dominate when the input starts cold. These individual observations motivated repeated cold trials with bounded readahead. [Intel measurements](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44873434144/job/136752825580) · [AMD measurements](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44873434144/job/136752825792)
+
+## November 20 scored release
 
 The candidate adds a runtime-dispatched AVX2/BMI/POPCNT CSV scanner, locates complete rows on the worker reading each chunk, and decodes common timestamp formats with fixed-width integer operations. Non-AVX2 processors retain the existing parser. The union-find pass assigns each linked person a permanent position in its shard. Each worker caches exact raw-ID routes, and catalog lookups use direct slots for canonical decimal identifiers with a full byte-string fallback. Parquet uses delta binary packing for dates and integers and omits optional column statistics. The executable reads the mounted inputs directly and writes only the two required output tables.
 
@@ -48,7 +164,7 @@ Built with `docker buildx build --platform linux/amd64 --load`. The tested `/app
 | 20M events, 5M clicks | Previously validated output | 2,226,509 | 28,014 | 10.654 s | 3,361.1 MiB | 3,366.4 MiB |
 | 60M events, 15M clicks | Previously validated output | 6,684,549 | 28,014 | 40.537 s | 7,134.6 MiB | 7,168.0 MiB |
 
-Both larger comparisons checked schema, every value and duplicate keys for both tables. All keys were unique. The image read the Mac-host-mounted CSVs with eight pinned virtual CPUs, a read-only root, UID 1000, networking disabled and a 7 GiB cgroup with swap disabled. At 60M the cgroup reached that limit and the executable still completed. Event input took 24.59 s in that run and 7.48 s at 20M. The two host-bind runs incurred 13,089 and 4,230 major faults respectively. The five paired tmpfs runs above had two major faults each. The official scorer has 24 GB and runs natively on Intel. Its result for this candidate is pending.
+Both larger comparisons checked schema, every value and duplicate keys for both tables. All keys were unique. The image read the Mac-host-mounted CSVs with eight pinned virtual CPUs, a read-only root, UID 1000, networking disabled and a 7 GiB cgroup with swap disabled. At 60M the cgroup reached that limit and the executable still completed. Event input took 24.59 s in that run and 7.48 s at 20M. The two host-bind runs incurred 13,089 and 4,230 major faults respectively. The five paired tmpfs runs above had two major faults each. The official scorer has 24 GB and runs natively on Intel. Its recorded time for this release is 1.68 s.
 
 ## Benchmark conditions
 
@@ -113,7 +229,7 @@ At comparable input byte counts, the seed-47 subset spent 0.583 s building linke
 
 ## Reproducing the datasets and checks
 
-The commands below use the original generator and checker from the challenge distribution. In this workspace they are under `generator/` and `starter-pyspark/scripts/`, with the seed-1 answers under `dev-answer/`. The release executable loads Arrow and Parquet C++ libraries. Python is used for building and checking.
+The commands below use the original generator and checker from the challenge distribution. In this workspace they are under `generator/` and `starter-pyspark/scripts/`, with the seed-1 answers under `dev-answer/`. Releases through `6129109` loaded the Arrow and Parquet C++ libraries. The compact-partition release writes Parquet directly. The independent reference checkers use Python.
 
 ```sh
 python3 -m venv .bench/env
