@@ -1,0 +1,88 @@
+name: Native event decoding and GCC profile feedback
+on:
+  push:
+    branches: [bench/native-x64-trials]
+    paths:
+      - .github/workflows/native-decode-costs.yml
+      - perf/native/decoder_trials/**
+permissions:
+  contents: read
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 110
+    env:
+      RELEASE_REVISION: 5230d4835e1b2f9f6b48d1dc53319a3e2b658077
+      CXX: g++-12
+      BUILDKIT_PROGRESS: plain
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check out the corrected link reader
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_REVISION }}
+          path: .acceptance/candidate
+          persist-credentials: false
+      - name: Check out the independent table control
+        uses: actions/checkout@v4
+        with:
+          ref: 4db76beed31640ddf4b414ed19deba5ebc660b81
+          path: .acceptance/baseline
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Prepare generator and independent reference tables
+        run: bash perf/native/prepare-port-runner.sh
+      - name: Build three field decoders and check row boundaries
+        run: |
+          set -o pipefail
+          out="$RUNNER_TEMP/shopping-trials/decoder-binaries"
+          mkdir -p "$out"
+          bash perf/native/decoder_trials/build_fields.sh .acceptance/candidate "$out" 2>&1 | tee "$out/fields.log"
+      - name: Train GCC on independent synthetic compact and generic inputs
+        id: pgo
+        continue-on-error: true
+        run: |
+          out="$RUNNER_TEMP/shopping-trials/decoder-binaries"
+          if ! sh perf/native/decoder_trials/build_pgo.sh .acceptance/candidate "$out/pgo" "$RELEASE_REVISION" > "$out/pgo.log" 2>&1; then
+            tail -40 "$out/pgo.log"
+            python3 - "$out/pgo.log" <<'PY'
+          import sys
+          from pathlib import Path
+          log = Path(sys.argv[1]).read_text(errors="replace")[-2500:]
+          print("::warning title=Profile build excluded::" + log.replace("%","%25").replace("\r","%0D").replace("\n","%0A"))
+          PY
+            exit 1
+          fi
+          test "$(cat "$out/pgo/proof/source_revision")" = "$RELEASE_REVISION"
+          cat "$out/pgo/proof/steps.jsonl"
+      - name: Check public, long-ID, and large tables, then compare whole processes
+        env:
+          PGO_STATUS: ${{ steps.pgo.outcome }}
+        run: |
+          out="$RUNNER_TEMP/shopping-trials/decoder-binaries"
+          options=()
+          for variant in reverse-tail compact-ids row-ahead; do
+            options+=(--comparison-binary "$variant=$out/$variant/app/shopping")
+          done
+          if test "$PGO_STATUS" = success; then options+=(--comparison-binary "gcc-pgo=$out/pgo/release/app/shopping"); fi
+          "$RUNNER_TEMP/shopping-python/bin/python" perf/native/port_acceptance.py \
+            --candidate-source "$GITHUB_WORKSPACE/.acceptance/candidate" "${options[@]}" \
+            --release-generated-practice --warm-20 9 --warm-60 5 --cold-runs 2
+      - name: Publish full-process and stage results
+        if: always()
+        run: |
+          results="$RUNNER_TEMP/shopping-trials/results"
+          if test -f "$results/port-acceptance/status.json"; then python3 perf/native/publish_profile.py "$results"; fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-decoder-measurements
+          path: |
+            ${{ runner.temp }}/shopping-trials/results/
+            ${{ runner.temp }}/shopping-trials/decoder-binaries/*.log
+            ${{ runner.temp }}/shopping-trials/decoder-binaries/pgo/proof/
+          retention-days: 7

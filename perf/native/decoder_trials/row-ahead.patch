@@ -1,0 +1,157 @@
+--- a/build.sh
++++ b/build.sh
+@@ -8,6 +8,10 @@
+ fi
+ case "$(uname -s)-$(uname -m)" in
+     Linux-x86_64)
++        if [ "${EVENT_ROW_AHEAD:-0}" = 1 ]; then
++            set -- "$@" -DSHOP_EVENT_ROW_AHEAD
++            EVENT_BLOCK_MASKS=1
++        fi
+         if [ "${EVENT_BLOCK_MASKS:-0}" = 1 ]; then
+             set -- "$@" -DSHOP_EVENT_BLOCK_MASKS
+         fi
+--- a/cpp/pipeline/k_free_event_blocks.hpp
++++ b/cpp/pipeline/k_free_event_blocks.hpp
+@@ -3,6 +3,7 @@
+ #include <bit>
+ #include <cstdint>
+ #include <cstring>
++#include <type_traits>
+ #include <utility>
+ 
+ namespace pipeline::k_free::detail {
+@@ -68,9 +69,9 @@
+ 
+ // Fast consumes one source row. Slow owns the original parser's restart cursor,
+ // which can jump past several physical newlines. Discard stale ends after it.
+-template<class Classify,class Fast,class Slow>
++template<class Classify,class Fast,class Slow,class Pair=std::nullptr_t>
+ inline EventBlockTile::P walk_event_blocks(EventBlockTile::P input,EventBlockTile::P p,EventBlockTile::P limit,
+-                                          Classify classify,Fast fast,Slow slow) {
++                                          Classify classify,Fast fast,Slow slow,Pair pair=nullptr) {
+     using Tile=EventBlockTile;
+     auto floor=[](Tile::P s) {return reinterpret_cast<Tile::P>(reinterpret_cast<std::uintptr_t>(s)&~std::uintptr_t{63});};
+     while (p<=limit && ((reinterpret_cast<std::uintptr_t>(p)&63)>std::size_t(p-input))) p=slow(p);
+@@ -89,6 +90,18 @@
+             const auto span=std::size_t(next-p);
+             if (span-33>63) {p=slow(p);continue;}
+             const auto [head,tail]=tile.windows(p);
++            if constexpr (!std::is_same_v<Pair,std::nullptr_t>) {
++                if (j+1<count && next<stop) {
++                    auto after=base+ends[j+1];
++                    const auto second=std::size_t(after-next);
++                    if (second-33<=63) {
++                        const auto [head2,tail2]=tile.windows(next);
++                        p=pair(p,next,head,tail,span-33,after,head2,tail2,second-33);
++                        if (p>=after) ++j;
++                        continue;
++                    }
++                }
++            }
+             p=fast(p,next,head,tail,span-33);
+         }
+         // A physical line may span multiple tiles. Let the original parser
+--- a/cpp/pipeline/k_free_x86.cpp
++++ b/cpp/pipeline/k_free_x86.cpp
+@@ -1,5 +1,8 @@
+ #include "k_free.hpp"
+ #if defined(__x86_64__)
++#if defined(SHOP_EVENT_ROW_AHEAD) && !defined(SHOP_EVENT_BLOCK_MASKS)
++#define SHOP_EVENT_BLOCK_MASKS 1
++#endif
+ #include "k_free_tables.hpp"
+ #include <bit>
+ #include <cstring>
+@@ -301,6 +304,54 @@
+             _mm512_cmpeq_epi8_mask(tail,_mm512_set1_epi8('\n'))};
+ }
+ struct EvSt {const TjRow *tj; W x,days,bad2,bad;};
++#ifdef SHOP_EVENT_ROW_AHEAD
++// A prepared row holds only immutable input/table data. Batch position and
++// timestamp-cache contents are observed when this row is committed in order.
++struct EvInput {W x,bad;const TjRow *tj;P kp2,kp3;u64 pp,eid,uid;};
++inline bool ev_prepare(P p,EvMasks k,u64 m,EvInput &in) {
++    auto c0=tz(k.head),c1=tz(blsr(k.head)),c2=tz(blsr(blsr(k.head)));
++    auto tb=bzhi(k.tail,m), z=lz(tb);
++    auto r6=m+z-64;
++    auto bits=shl(tb,z)<<1,r5=lz(bits);
++    auto r4=lz(shl(bits,r5)<<1),i4=(z+r5+r4+1)^63;
++    auto u3=i4+10-c2;
++    if (m>63 || c2>62 || (u3&~u64{2})) return false;
++    // A valid ingest position implies three tail separators and a table-sized suffix.
++    const auto &tr=T.tail[r5*TAIL_K+r6];
++    auto pb=p+32;
++    auto quotes=u32(hi32(lu2(pb+m-32),'"')>>32)&tr.m;
++    auto qi=_pext_u32(quotes,tr.sel);
++    if (quotes!=tr.pat[qi]) return false;
++    auto rs4=pb+i4;
++    const auto &kr=T.kind2[2*r4+(rs4[3]&1)];
++    auto bad_kind=_mm_and_si128(_mm_xor_si128(ld(rs4),ld(kr.cand.data())),ld(kr.maskv.data()));
++    const auto &j=T.jid[c0][c1-c0];
++    auto [ids,id_bad]=ids2j(ld(p+c0-16),ld(p+c1-16),j);
++    auto q3=u3>>1;
++    auto &tj=T.tj[2*(c2-c1-1)+q3];auto &f=tj.f;
++    auto kp2=p+c1+f.koff1,kp3=p+c2+q3;
++    in={join(ld(p+c2-16),ld(rs4-17)),_mm256_or_si256(id_bad,_mm256_zextsi128_si256(bad_kind)),
++        &tj,kp2,kp3,tr.pp[qi]|kr.pp,u64(_mm_cvtsi128_si64(_mm256_castsi256_si128(ids))),
++        u64(_mm_cvtsi128_si64(_mm256_extracti128_si256(ids,1)))};
++    return true;
++}
++inline void ev_commit_input(Cx<EvBatch> &cx,const EvInput &in,std::size_t w,EvSt &st) {
++    cx.b->pp[w]=in.pp;cx.b->eid[w]=in.eid;cx.b->uid[w]=in.uid;
++    auto &tj=*in.tj;auto &f=tj.f;auto kp2=in.kp2,kp3=in.kp3;
++    auto date2=ld2(date_entry(cx.cache,kp2,f.pmask)),date3=ld2(date_entry(cx.cache,kp3,f.pmask3));
++    auto k2=_mm_and_si128(_mm_xor_si128(ld(kp2),_mm256_castsi256_si128(date2)),ld(tj.d.kmask2.data()));
++    auto k3=_mm_and_si128(_mm_xor_si128(ld(kp3),_mm256_castsi256_si128(date3)),ld(tj.d.kmask3.data()));
++    auto bad=_mm256_or_si256(in.bad,_mm256_zextsi128_si256(k3));
++    st={&tj,in.x,_mm256_permute2x128_si256(date2,date3,0x31),
++        _mm256_or_si256(bad,_mm256_zextsi128_si256(k2)),bad};
++}
++inline bool ev_s_known(Cx<EvBatch> &cx,P p,EvMasks k,std::size_t w,EvSt &st,u64 m) {
++    EvInput in;
++    if (!ev_prepare(p,k,m,in)) return false;
++    ev_commit_input(cx,in,w,st);
++    return true;
++}
++#else
+ #ifdef SHOP_EVENT_BLOCK_MASKS
+ inline bool ev_s_known(Cx<EvBatch> &cx,P p,EvMasks k,std::size_t w,EvSt &st,u64 m) {
+     auto c0=tz(k.head),c1=tz(blsr(k.head)),c2=tz(blsr(blsr(k.head)));
+@@ -340,6 +391,7 @@
+         _mm256_or_si256(bad,_mm256_zextsi128_si256(k2)),bad};
+     return true;
+ }
++#endif
+ #ifdef SHOP_EVENT_BLOCK_MASKS
+ inline bool ev_s(Cx<EvBatch> &cx,P p,EvMasks k,std::size_t w,EvSt &st) {
+     return ev_s_known(cx,p,k,w,st,tz(k.newline));
+@@ -474,7 +526,27 @@
+             if (!ev_s_known(cx,row,{head,tail,0},w,st,m)) return ev_cold(cx,row,w);
+             return ev_d(cx,row,st,next,w).next;
+         };
+-        p=walk_event_blocks(cx.base,p,limit,classify,fast,[&](P q){return ev_fast(cx,q,ev_masks(q),w);});
++        auto slow=[&](P q){return ev_fast(cx,q,ev_masks(q),w);};
++#ifdef SHOP_EVENT_ROW_AHEAD
++        auto pair=[&](P a,P b,u64 head0,u64 tail0,u64 m0,P after,u64 head1,u64 tail1,u64 m1) {
++            EvInput current,following;
++            prefetch(a);
++            const bool ready=ev_prepare(a,{head0,tail0,0},m0,current);
++            prefetch(b);
++            const bool ahead=ev_prepare(b,{head1,tail1,0},m1,following);
++            auto commit=[&](P row,P next,bool ok,const EvInput &in) {
++                if (!ok) return ev_cold(cx,row,w);
++                EvSt st;
++                ev_commit_input(cx,in,w,st);
++                return ev_d(cx,row,st,next,w).next;
++            };
++            auto restart=commit(a,b,ready,current);
++            return restart==b?commit(b,after,ahead,following):restart;
++        };
++        p=walk_event_blocks(cx.base,p,limit,classify,fast,slow,pair);
++#else
++        p=walk_event_blocks(cx.base,p,limit,classify,fast,slow);
++#endif
+ #else
+         while (p<=limit) {
+             auto k=ev_masks(p);auto p1=k.next(p);

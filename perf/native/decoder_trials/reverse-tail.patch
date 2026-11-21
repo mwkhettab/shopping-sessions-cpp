@@ -1,0 +1,56 @@
+--- a/cpp/pipeline/k_free_x86.cpp
++++ b/cpp/pipeline/k_free_x86.cpp
+@@ -285,30 +285,43 @@
+     u64 head,tail,newline;
+     P next(P p) const { return p+33+tz(newline); }
+     EvMasks here() const {
+-        auto h=head,t=tail,n=newline;
+-        asm("" : "+k"(h),"+k"(t),"+k"(n));
+-        return {h,t,n};
++        auto h=head,n=newline;
++        asm("" : "+k"(h),"+k"(n));
++        return {h,0,n};
+     }
+ };
+ inline EvMasks ev_masks(P p) {
+     auto head=_mm512_loadu_si512(p), tail=_mm512_loadu_si512(p+32);
+     auto comma=_mm512_set1_epi8(',');
+-    return {_mm512_cmpeq_epi8_mask(head,comma),_mm512_cmpeq_epi8_mask(tail,comma),
++    return {_mm512_cmpeq_epi8_mask(head,comma),0,
+             _mm512_cmpeq_epi8_mask(tail,_mm512_set1_epi8('\n'))};
+ }
+ struct EvSt {const TjRow *tj; W x,days,bad2,bad;};
+ inline bool ev_s(Cx<EvBatch> &cx,P p,EvMasks k,std::size_t w,EvSt &st) {
+     auto m=tz(k.newline),c0=tz(k.head),c1=tz(blsr(k.head)),c2=tz(blsr(blsr(k.head)));
+-    auto tb=bzhi(k.tail,m), z=lz(tb);
+-    auto r6=m+z-64;
+-    auto bits=shl(tb,z)<<1,r5=lz(bits);
+-    auto r4=lz(shl(bits,r5)<<1),i4=(z+r5+r4+1)^63;
++    if (m>63 || c2>62) return false;
++    // This is the same 32-byte load used below to validate quoting.
++    const auto last=lu2(p+m);
++    const auto reverse=_mm256_setr_epi8(15,14,13,12,11,10,9,8,7,6,5,4,3,2,1,0,
++                                        15,14,13,12,11,10,9,8,7,6,5,4,3,2,1,0);
++    const auto reverse_commas=_mm256_shuffle_epi8(_mm256_cmpeq_epi8(last,_mm256_set1_epi8(',')),reverse);
++    const u32 commas_before_lf=u32(bzhi(std::rotl(u32(_mm256_movemask_epi8(reverse_commas)),16),m));
++    const u32 second=commas_before_lf&(commas_before_lf-1), third=second&(second-1);
++    u64 r6,r5,r4,i4;
++    if (third) {
++        const unsigned a=std::countr_zero(commas_before_lf),b=std::countr_zero(second),c=std::countr_zero(third);
++        r6=a; r5=b-a-1; r4=c-b-1; i4=m-c;
++    } else {
++        const auto mask=_mm512_cmpeq_epi8_mask(_mm512_loadu_si512(p+32),_mm512_set1_epi8(','));
++        const auto tb=bzhi(mask,m),z=lz(tb),bits=shl(tb,z)<<1;
++        r6=m+z-64; r5=lz(bits); r4=lz(shl(bits,r5)<<1); i4=(z+r5+r4+1)^63;
++    }
+     auto u3=i4+10-c2;
+-    if (m>63 || c2>62 || (u3&~u64{2})) return false;
++    if (u3&~u64{2}) return false;
+     // A valid ingest position implies three tail separators and a table-sized suffix.
+     const auto &tr=T.tail[r5*TAIL_K+r6];
+     auto pb=p+32;
+-    auto quotes=u32(hi32(lu2(pb+m-32),'"')>>32)&tr.m;
++    auto quotes=u32(hi32(last,'"')>>32)&tr.m;
+     auto qi=_pext_u32(quotes,tr.sel);
+     if (quotes!=tr.pat[qi]) return false;
+     auto rs4=pb+i4;

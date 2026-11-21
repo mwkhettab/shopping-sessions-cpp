@@ -29,6 +29,8 @@ on:
       - .github/workflows/native-compiler-comparison.yml
       - .github/workflows/native-field-scanner.yml
       - perf/native/parser_trials/**
+      - .github/workflows/native-decode-costs.yml
+      - perf/native/decoder_trials/**
       - perf/native/finalist.json
       - perf/native/holdout_shipping.py
       - perf/native/port_input_settings.py

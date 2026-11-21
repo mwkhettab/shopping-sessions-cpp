@@ -1,0 +1,34 @@
+--- a/cpp/pipeline/k_free_x86.cpp
++++ b/cpp/pipeline/k_free_x86.cpp
+@@ -96,6 +96,22 @@
+     auto ids=_mm_add_epi64(_mm_mul_epu32(m2,_mm_set1_epi64x(1679616)),_mm_srli_epi64(m2,32));
+     return {_mm_or_si128(ids,ld(b.orv.data())),bad};
+ }
++// Widths exceeding the canonical digit encodings all produce the same rejection
++// masks. A non-power-of-two row pitch spreads common width pairs across L1 sets.
++inline constexpr unsigned joint_event_limit = 12, joint_user_limit = 13, joint_pitch = 19;
++inline constexpr auto small_joint_ids = [] {
++    A<A<JidRow, joint_pitch>, joint_event_limit + 1> rows{};
++    for (unsigned a = 0; a <= joint_event_limit; ++a)
++        for (unsigned d = 0; d <= joint_user_limit; ++d)
++            rows[a][d] = T.jid[a][d];
++    return rows;
++}();
++
++inline const JidRow& joint_ids(unsigned event_width, unsigned user_span) {
++    return small_joint_ids[std::min(event_width, joint_event_limit)]
++                          [std::min(user_span, joint_user_limit)];
++}
++
+ inline std::pair<W,W> ids2j(V xa,V xb,const JidRow &r) {
+     auto x=join(xa,xb);
+     auto v=_mm256_sub_epi8(_mm256_shuffle_epi8(x,ld2(r.ctrl.data())),ld2(r.subv.data()));
+@@ -316,7 +332,7 @@
+     auto bad_kind=_mm_and_si128(_mm_xor_si128(ld(rs4),ld(kr.cand.data())),ld(kr.maskv.data()));
+     cx.b->pp[w]=tr.pp[qi]|kr.pp;
+ 
+-    const auto &j=T.jid[c0][c1-c0];
++    const auto &j=joint_ids(c0,c1-c0);
+     auto [ids,id_bad]=ids2j(ld(p+c0-16),ld(p+c1-16),j);
+     cx.b->eid[w]=_mm_cvtsi128_si64(_mm256_castsi256_si128(ids));
+     cx.b->uid[w]=_mm_cvtsi128_si64(_mm256_extracti128_si256(ids,1));
