@@ -1,1 +1,1 @@
-base fin-slabkey-pgo reader4-pgo reader12-pgo readerperiod-pgo readerintel-pgo readercol-pgo shipreader-pgo reservelines-pgo densereserve-pgo colpage-pgo earlybits-pgo coldpaths-pgo inlinecheck-pgo dualv3-pgo dualv4-pgo serialtrain-pgo eighttrain-pgo
+base fin-slabkey-pgo shipreader-pgo colpagelines-pgo releasehot-pgo grid16x32-pgo grid32x64-pgo grid32x32tiles-pgo fusedviews-pgo fusedbounds-pgo boundsreader-pgo fusedallids-pgo indexcuts-pgo indexvbmi-pgo indexoverlap-pgo indexfused-pgo coalescebins-pgo coalescelast-pgo assistday64-pgo assistruns32-pgo

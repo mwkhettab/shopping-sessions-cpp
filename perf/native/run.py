@@ -83,6 +83,10 @@ def main():
             shutil.copytree(root/'tests',localtests,dirs_exist_ok=True)
             run(compiler,'-std=c++20','-O2',str(localtests/'input.cpp'),'-o',unit)
             run(unit)
+            if name.startswith(('index','boundsreader','fused','shipreader')):
+                run(compiler,'-std=c++20','-O2','-fsanitize=undefined','-fno-sanitize-recover=all',
+                    '-I',src/'cpp',root/'perf/native/mutated_rows.cpp','-o',unit)
+                run(unit)
             run(python,root/'verify.py',binary,area/'dev','--starter',area/'starter-pyspark','--answer',area/'dev-answer')
             run(python,root/'perf/native/random_rules.py',binary)
             run(python,root/'perf/native/interval_oracle.py',binary)
@@ -167,6 +171,20 @@ def main():
         publish()
         # Request eviction only for this job's generated CSVs and record the
         # actual residency before the executable starts.
+        released=area/'bin/shipreader-pgo'
+        new=[b for b in binaries if b.name not in ('base','fin-slabkey-pgo','shipreader-pgo')]
+        if released in binaries and new:
+            challenger=min(new,key=lambda b:performance[b.name])
+            log=outcomes/(scale+'-shipreader-challenger.jsonl')
+            run(python,root/'perf/measure.py',data,released,challenger,'--runs','7' if scale=='practice' else '5',
+                '--warmup','1','--preload','--profile','--output-parent',area,'--log',log)
+            pairs={}
+            for obs in map(json.loads,log.read_text().splitlines()):
+                if obs['round']>=0:pairs.setdefault(obs['round'],{})[Path(obs['binary']).name]=obs['wall_s']
+            values=list(pairs.values())
+            medians={b.name:round(statistics.median(v[b.name] for v in values),4) for b in (released,challenger)}
+            changes=[v[challenger.name]/v[released.name]-1 for v in values]
+            note('Release pairs '+scale,f'{medians}, {sum(x<0 for x in changes)}/{len(changes)} faster for challenger, median paired change {statistics.median(changes):.2%}.')
         selected=[b for b in binaries if b.name in ('base','fin-slabkey-pgo')]
         if best not in selected: selected.append(best)
         observations={b:[] for b in selected}

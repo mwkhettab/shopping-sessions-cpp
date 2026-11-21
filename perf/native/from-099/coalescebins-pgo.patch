@@ -1,0 +1,363 @@
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -20,6 +20,10 @@
+ };
+ template <class T> using Bins = std::array<std::vector<T>, shards>;
+ #include "partition_slab.hpp"
++struct KeptPurchase { int category,price; const KeptPurchase *next; };
++struct ReducedBin {
++  uint32_t first,last; uint64_t count; const KeptPurchase *purchases;
++};
+ template <class Layout> struct ScanWorker {
+   using EventData = typename Layout::E;
+   using ClickData = typename Layout::C;
+@@ -34,6 +38,7 @@
+     size_t weight;
+     std::span<EventData> events;
+     std::span<ClickData> clicks;
++    std::span<ReducedBin> reduced{};
+   };
+   std::vector<std::array<Vertex *, 2>> edges;
+   Bins<std::pair<Key, size_t>> endpoints;
+@@ -204,12 +209,13 @@
+ template <class Layout>
+ void summarize(Key user, std::span<typename Layout::E> events,
+                std::span<typename Layout::C> clicks, const Catalog &cat,
+-               Result &result, Layout layout) {
+-  if (events.empty())
++               Result &result, Layout layout,std::span<ReducedBin> reduced={}) {
++  if (events.empty() && reduced.empty())
+     return;
+ #ifdef SHOPPING_DIAGNOSTICS
+   ++result.people;
+   result.events_seen += events.size();
++  for(const auto &r:reduced)result.events_seen+=r.count;
+   result.clicks_seen += clicks.size();
+   result.max_events = std::max(result.max_events, events.size());
+   result.max_clicks = std::max(result.max_clicks, clicks.size());
+@@ -289,7 +295,10 @@
+     for (int campaign : result.active)
+       ++result.at(campaign, day).assists;
+   };
+-  if (use_bins) {
++  if(!reduced.empty()) {
++    MEASURE(session);
++    result.bins.scan_ranges<12>(reduced,begin_session,spend,end_session);
++  } else if (use_bins) {
+     MEASURE(session);
+     result.bins.scan(events, begin_session, spend, end_session, layout);
+   } else {
+@@ -630,6 +639,263 @@
+           cl = click_buffer;
+       }
+       summarize(head.name, ev, cl, cat, results[t], layout);
++    }
++  });
++  timer.mark("linked-person sessions, attribution and aggregation");
++}
++
++template <class Layout>
++void process_coalesced(std::vector<ScanWorker<Layout>> &workers,
++                    std::vector<Result> &results, const Catalog &cat,
++                    unsigned threads, Timer &timer, Layout layout) {
++  using Worker = ScanWorker<Layout>;
++  using Vertex = typename Worker::Vertex;
++  using E = ReducedBin;
++  using C = typename Layout::C;
++  struct Store {
++    std::deque<KeptPurchase> buys;
++    std::vector<E> events;
++    std::vector<C> clicks;
++  };
++  std::array<Store, shards> storage;
++  std::array<std::vector<Vertex>, shards> vertices;
++  parallel(shards, threads, [&](size_t b, unsigned t) {
++    MEASURE(grouping);
++    struct Group {
++      Key key;
++      size_t event_end{}, click_end{};
++      size_t vertex{};
++    };
++    struct Slot {
++      Key key;
++      size_t group;
++    };
++    std::vector<Group> groups;
++    size_t n = 0;
++    for (auto &w : workers)
++      n += w.events[b].size() + w.clicks[b].size();
++    size_t initial = std::bit_ceil(std::clamp<size_t>(n / 12, 128, 65536));
++    std::vector<Slot> slots(initial);
++    auto locate = [&](Key k) {
++      size_t at = (k.hash() / shards) & (slots.size() - 1);
++      while (slots[at].key.bits && !(slots[at].key == k))
++        at = (at + 1) & (slots.size() - 1);
++      return at;
++    };
++    auto intern = [&](Key k) {
++      if (groups.size() * 10 >= slots.size() * 7) {
++        auto old = std::move(slots);
++        slots.clear();
++        slots.resize(old.size() * 2);
++        for (auto &x : old)
++          if (x.key.bits)
++            slots[locate(x.key)] = x;
++      }
++      auto &x = slots[locate(k)];
++      if (!x.key.bits) {
++        x = {k, groups.size()};
++        groups.push_back({k});
++      }
++      return x.group;
++    };
++    // First count each alias, then scatter into disjoint contiguous spans.
++    // A linked person may own spans in several of these raw-user shards.
++    auto &store = storage[b];
++    size_t event_count = 0, click_count = 0;
++    struct Entry {size_t group;unsigned slice;ReducedBin bin;};
++    std::vector<Entry> pieces;
++    const size_t initial_bins=std::bit_ceil(std::clamp<size_t>(n/3,32,131072));
++    std::vector<size_t> lookup(initial_bins);
++    pieces.reserve(initial_bins/2);
++    auto locate_bin=[&](size_t g,unsigned slice){
++      size_t h=(uint64_t(g)*0x9e3779b97f4a7c15ULL)^(uint64_t(slice)*0xbf58476d1ce4e5b9ULL);
++      size_t i=(h^(h>>31))&(lookup.size()-1);
++      while(lookup[i]){auto &p=pieces[lookup[i]-1];if(p.group==g && p.slice==slice)break;i=(i+1)&(lookup.size()-1);}
++      return i;
++    };
++    auto slot_for=[&](size_t g,unsigned slice,unsigned offset){
++      if(pieces.size()*10>=lookup.size()*7){
++        lookup.assign(lookup.size()*2,0);
++        for(size_t i=0;i<pieces.size();++i)lookup[locate_bin(pieces[i].group,pieces[i].slice)]=i+1;
++      }
++      size_t &slot=lookup[locate_bin(g,slice)];
++      if(!slot){
++        slot=pieces.size()+1;pieces.push_back({g,slice,{offset,offset,0,nullptr}});
++        ++groups[g].event_end;++event_count;
++      }
++      return slot-1;
++    };
++    for(auto &w:workers){
++      for(auto part:w.events[b].spans())for(auto &[user,word]:part){
++        if(!user.bits)continue;
++        size_t g=intern(user);
++        unsigned offset=unsigned(word>>32),slice=offset/session_gap;
++        auto &bin=pieces[slot_for(g,slice,offset)].bin;
++        ++bin.count;bin.first=std::min(bin.first,offset);bin.last=std::max(bin.last,offset);
++        int price=int(uint32_t(word)>>8);
++        if(price)bin.purchases=&store.buys.emplace_back(KeptPurchase{int(word&255),price,bin.purchases});
++      }
++      for (auto part : w.clicks[b].spans())
++        for (auto &[u, c] : part) {
++          u.bits = intern(Key{u.bits});
++          ++groups[u.bits].click_end;
++        }
++      click_count += w.clicks[b].size();
++    }
++    auto &nodes = vertices[b];
++    size_t nv = 0;
++    for (auto &w : workers)
++      for (auto &[key, loc] : w.endpoints[b]) {
++        auto &g = groups[intern(key)];
++        if (!g.vertex)
++          g.vertex = ++nv;
++        key.bits = g.vertex - 1;
++      }
++    nodes.resize(nv);
++    for (auto &w : workers) {
++      for (auto &[key, loc] : w.endpoints[b])
++        w.edges[loc / 2][loc % 2] = &nodes[key.bits];
++      typename std::remove_reference_t<decltype(w.endpoints)>::value_type()
++          .swap(w.endpoints[b]);
++    }
++    store.events.resize(event_count);
++    store.clicks.resize(click_count);
++    size_t event_offset = 0, click_offset = 0;
++    for (auto &g : groups) {
++      auto events_in_group = g.event_end, clicks_in_group = g.click_end;
++      g.event_end = event_offset;
++      g.click_end = click_offset;
++      event_offset += events_in_group;
++      click_offset += clicks_in_group;
++    }
++    for(auto &piece:pieces)store.events[groups[piece.group].event_end++]=piece.bin;
++    for(auto &w:workers){
++      for (auto part : w.clicks[b].spans())
++        for (auto &[u, c] : part)
++          store.clicks[groups[u.bits].click_end++] = c;
++      w.events[b].release();
++      w.clicks[b].release();
++    }
++    event_offset = click_offset = 0;
++    for (auto &g : groups) {
++      auto ev = std::span(store.events)
++                    .subspan(event_offset, g.event_end - event_offset);
++      auto cl = std::span(store.clicks)
++                    .subspan(click_offset, g.click_end - click_offset);
++      if (g.vertex) {
++        auto &v = nodes[g.vertex - 1];
++        v = {g.key, &v, &v, 1, {}, cl,ev};
++      } else
++        summarize(g.key,{},cl,cat,results[t],layout,ev);
++      event_offset = g.event_end;
++      click_offset = g.click_end;
++    }
++  });
++  for (auto &w : workers) {
++    w.events.release();
++    w.clicks.release();
++  }
++  timer.mark("raw user grouping, link endpoints and singleton sessions");
++  // Roots move strictly downward in bytewise order. Path splitting keeps long
++  // chains short even while other edge workers are linking components.
++  auto root = [](Vertex *v) {
++    for (;;) {
++      std::atomic_ref<Vertex *> ref(v->parent);
++      auto *p = ref.load(std::memory_order_relaxed);
++      if (v == p)
++        return v;
++      auto *g =
++          std::atomic_ref<Vertex *>(p->parent).load(std::memory_order_relaxed);
++      ref.compare_exchange_weak(p, g, std::memory_order_relaxed);
++      v = p;
++    }
++  };
++  using Edge = std::array<Vertex *, 2>;
++  std::vector<std::span<Edge>> tasks;
++  for (auto &w : workers) {
++    std::span<Edge> edges(w.edges);
++    while (!edges.empty()) {
++      auto n = std::min<size_t>(edges.size(), 4096);
++      tasks.push_back(edges.first(n));
++      edges = edges.subspan(n);
++    }
++  }
++  parallel(tasks.size(), threads, [&](size_t i, unsigned) {
++    for (auto edge : tasks[i]) {
++      auto *x = edge[0], *y = edge[1];
++      for (;;) {
++        x = root(x);
++        y = root(y);
++        if (x == y)
++          break;
++        if (x->name.user_less(y->name))
++          std::swap(x, y);
++        auto *expected = x;
++        if (std::atomic_ref<Vertex *>(x->parent).compare_exchange_weak(
++                expected, y, std::memory_order_relaxed))
++          break;
++      }
++    }
++  });
++  // After the union barrier append every other alias to the root's list.
++  parallel(shards, threads, [&](size_t b, unsigned) {
++    for (auto &v : vertices[b]) {
++      auto *r = root(&v);
++      if (r == &v)
++        continue;
++      auto &head = r->next;
++      v.next = std::atomic_ref<Vertex *>(head).exchange(
++          &v, std::memory_order_relaxed);
++    }
++  });
++  timer.mark("linked components");
++  parallel(shards, threads, [&](size_t b, unsigned t) {
++    std::vector<E> events_buffer;
++    std::vector<C> click_buffer;
++    for (auto &head : vertices[b]) {
++      if (head.parent != &head)
++        continue;
++      std::span<E> ev;
++      std::span<C> cl;
++      size_t event_count = 0, click_count = 0;
++      Vertex *v = &head;
++      do {
++        if (!v->reduced.empty()) {
++          ev = v->reduced;
++          event_count += ev.size();
++        }
++        if (!v->clicks.empty()) {
++          cl = v->clicks;
++          click_count += cl.size();
++        }
++        v = v->next;
++      } while (v != &head);
++      if (!event_count)
++        continue;
++      if (event_count > ev.size() || click_count > cl.size()) {
++        bool merge_e = event_count > ev.size(),
++             merge_c = click_count > cl.size();
++        events_buffer.clear();
++        click_buffer.clear();
++        if (merge_e)
++          events_buffer.reserve(event_count);
++        if (merge_c)
++          click_buffer.reserve(click_count);
++        do {
++          if (merge_e)
++            events_buffer.insert(events_buffer.end(), v->reduced.begin(),
++                                 v->reduced.end());
++          if (merge_c)
++            click_buffer.insert(click_buffer.end(), v->clicks.begin(),
++                                v->clicks.end());
++          v = v->next;
++        } while (v != &head);
++        if (merge_e)
++          ev = events_buffer;
++        if (merge_c)
++          cl = click_buffer;
++      }
++      summarize(head.name,{},cl,cat,results[t],layout,ev);
+     }
+   });
+   timer.mark("linked-person sessions, attribution and aggregation");
+@@ -771,7 +1037,10 @@
+   std::vector<Result> results(threads);
+   for (auto &result : results)
+     result.configure(window, cat, threads);
+-  process_people(workers, results, cat, threads, timer, layout);
++  if constexpr(std::is_same_v<Layout,WordLayout>){
++    if(!results.front().bins.cells.empty())process_coalesced(workers,results,cat,threads,timer,layout);
++    else process_people(workers,results,cat,threads,timer,layout);
++  } else process_people(workers,results,cat,threads,timer,layout);
+   fs::create_directories(output / "user_daily");
+   fs::create_directories(output / "campaign_daily");
+   parallel(results.size(), threads, [&](size_t i, unsigned) {
+--- a/cpp/session_bins.hpp
++++ b/cpp/session_bins.hpp
+@@ -50,6 +50,35 @@
+         cell.purchases = purchases.size();
+       }
+     }
++    finish(begin,spend,end);
++  }
++  template<int SortAt,class Begin,class Spend,class End>
++  void scan_ranges(std::span<ReducedBin> ranges,Begin begin,Spend spend,End end){
++    if(ranges.size()<=SortAt){
++      std::sort(ranges.begin(),ranges.end(),[](auto &a,auto &b){return a.first<b.first;});
++      Time first=0;uint32_t last=0;int64_t n=0,revenue=0;
++      for(auto &r:ranges){
++        if(!n || uint64_t(r.first)>uint64_t(last)+session_gap){
++          if(n)end(first,n,revenue);
++          first=origin+r.first;begin(first);last=r.last;n=revenue=0;
++        }
++        last=std::max(last,r.last);n+=r.count;
++        for(auto *p=r.purchases;p;p=p->next){revenue+=p->price;spend(p->category,p->price);}
++      }
++      end(first,n,revenue);
++      return;
++    }
++    for(auto &r:ranges){
++      size_t i=r.first/session_gap;auto &c=cells[i];
++      Time lo=origin+r.first,hi=origin+r.last;
++      if(!c.count){occupied[i/64]|=uint64_t{1}<<(i%64);c.first=lo;c.last=hi;c.revenue=0;c.purchases=0;}
++      else {c.first=std::min(c.first,lo);c.last=std::max(c.last,hi);}
++      c.count+=r.count;
++      for(auto *p=r.purchases;p;p=p->next){c.revenue+=p->price;purchases.push_back({p->category,p->price,c.purchases});c.purchases=purchases.size();}
++    }
++    finish(begin,spend,end);
++  }
++  template<class Begin,class Spend,class End> void finish(Begin begin,Spend spend,End end){
+     Time start{}, last{};
+     int64_t count = 0, revenue = 0;
+     for (size_t word = 0; word < occupied.size(); ++word) {

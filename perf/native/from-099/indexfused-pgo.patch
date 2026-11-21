@@ -1,0 +1,347 @@
+--- /dev/null
++++ b/cpp/delimiter_index.hpp
+@@ -0,0 +1,96 @@
++#pragma once
++#ifdef SHOPPING_X86_CSV
++struct IndexedLine { uint16_t after, quotes; };
++struct CsvBlockIndex {
++  static constexpr size_t extent=4096;
++  // Vector stores may extend 32 elements past the last active position.
++  std::array<uint16_t,extent+32> cuts;
++  std::array<IndexedLine,extent> lines;
++  unsigned nc=0,nl=0,nq=0;
++  void lines_in(uint64_t marks,uint64_t lfs,uint64_t quotes) {
++    auto end=lfs;
++    while(end) {
++      auto first=end & (0-end);
++      auto before=first-1;
++      lines[nl++]={uint16_t(nc+std::popcount(marks&before)+1),
++                   uint16_t(nq+std::popcount(quotes&before))};
++      end&=end-1;
++    }
++    nq+=std::popcount(quotes);
++  }
++};
++__attribute__((target("avx2,bmi,popcnt")))
++inline void index_avx2(Str data,CsvBlockIndex &out) {
++  for(size_t i=0;i<data.size();i+=32) {
++    alignas(32) char tail[32]{};
++    auto p=data.data()+i;
++    if(data.size()-i<32){std::memcpy(tail,p,data.size()-i);p=tail;}
++    auto m=row_mask32(p);unsigned marks=m.comma|m.lf;
++    out.lines_in(marks,m.lf,m.quotes);
++    while(marks){out.cuts[out.nc++]=uint16_t(i+std::countr_zero(marks));marks&=marks-1;}
++  }
++}
++__attribute__((target("avx512f,avx512bw,avx512vbmi2,popcnt,bmi")))
++inline void index_vbmi(Str data,CsvBlockIndex &out) {
++  alignas(64) static constexpr auto seq=[]{
++    std::array<int16_t,32> s{};for(unsigned i=0;i<32;++i)s[i]=int16_t(i);return s;
++  }();
++  auto pos=_mm512_load_si512(seq.data());
++  for(size_t i=0;i<data.size();i+=64) {
++    auto p=data.data()+i;
++    auto v=data.size()-i>=64?_mm512_loadu_si512(p):
++        _mm512_maskz_loadu_epi8((uint64_t{1}<<(data.size()-i))-1,p);
++    auto lf=_mm512_cmpeq_epi8_mask(v,_mm512_set1_epi8('\n'));
++    auto q=_mm512_cmpeq_epi8_mask(v,_mm512_set1_epi8('"'));
++    uint64_t marks=lf|_mm512_cmpeq_epi8_mask(v,_mm512_set1_epi8(','));
++    out.lines_in(marks,lf,q);
++    unsigned lo=uint32_t(marks),hi=uint32_t(marks>>32);
++    auto p1=_mm512_add_epi16(pos,_mm512_set1_epi16(32));
++#ifdef SHOPPING_OVERLAP_CUTS
++    _mm512_storeu_si512(out.cuts.data()+out.nc,_mm512_maskz_compress_epi16(lo,pos));
++    out.nc+=std::popcount(lo);
++    _mm512_storeu_si512(out.cuts.data()+out.nc,_mm512_maskz_compress_epi16(hi,p1));
++#else
++    _mm512_mask_compressstoreu_epi16(out.cuts.data()+out.nc,lo,pos);
++    out.nc+=std::popcount(lo);
++    _mm512_mask_compressstoreu_epi16(out.cuts.data()+out.nc,hi,p1);
++#endif
++    out.nc+=std::popcount(hi);
++    pos=_mm512_add_epi16(pos,_mm512_set1_epi16(64));
++  }
++}
++template<size_t N,bool wide,class F>
++__attribute__((target("avx2,bmi,popcnt"))) void indexed_lines(Str data,F &fn) {
++  CsvBlockIndex index;
++  while(data.size()>=128) {
++    auto n=std::min(data.size(),index.extent);
++    auto end=data.substr(0,n).rfind('\n');
++    if(end==Str::npos) {
++      auto lf=data.find('\n',n),length=lf==Str::npos?data.size():lf+1;
++      line_csv_rows<N>(data.substr(0,length),fn);data.remove_prefix(length);continue;
++    }
++    auto block=data.substr(0,end+1);
++    const char *p=block.data();
++    index.nc=index.nl=index.nq=0;
++    if constexpr(wide)index_vbmi(block,index);else index_avx2(block,index);
++    unsigned from=0,oldq=0,cut=0;
++    for(unsigned i=0;i<index.nl;++i) {
++      auto line=index.lines[i];unsigned last=index.cuts[line.after-1];
++      if(line.after==cut+N) {
++        std::array<Str,N> fields;
++        unsigned first=from,pairs=0;
++        for(unsigned f=0;f<N;++f) {
++          unsigned finish=index.cuts[cut+f],len=finish-first;
++          unsigned wrap=len>=2 && ((p[first]=='"') & (p[finish-1]=='"'));
++          fields[f]={p+first+wrap,len-2*wrap};
++          pairs+=2*wrap;first=finish+1;
++        }
++        if(oldq+pairs==line.quotes)fn(fields);
++      }
++      from=last+1;cut=line.after;oldq=line.quotes;
++    }
++    data.remove_prefix(end+1);
++  }
++  line_csv_rows<N>(data,fn);
++}
++#endif
+--- a/cpp/input.hpp
++++ b/cpp/input.hpp
+@@ -147,8 +147,15 @@
+ #endif
+ #include "csv_x86.hpp"
+ #include "line_csv.hpp"
++#include "line_tile.hpp"
++#include "delimiter_index.hpp"
+ template <size_t N, class F> void parse_rows(Str data, F &&callback) {
+ #ifdef SHOPPING_X86_CSV
++  if (N==7 && wide_csv_supported() && __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("avx512vbmi2")) {indexed_lines<N,true>(data,callback);return;}
++  if (N == 7 && wide_csv_supported()) {
++    tiled_lines<N, 16>(data, callback);
++    return;
++  }
+   if (wide_csv_supported()) { line_csv_rows<N>(data,callback); return; }
+   if (wide_csv_supported()) {
+     wide_csv_rows<N>(data, callback);
+--- /dev/null
++++ b/cpp/line_tile.hpp
+@@ -0,0 +1,89 @@
++#pragma once
++// Find line endings in small groups; both the delimiter count and all
++// surrounding quotes are checked before a field reaches the event validator.
++#ifdef SHOPPING_X86_CSV
++inline uint64_t mask_to(unsigned n) {
++  return n >= 64 ? ~uint64_t{} : (uint64_t{1} << n) - 1;
++}
++template <size_t N, class F>
++__attribute__((target("avx2,bmi,popcnt"), always_inline)) inline void
++split_known_line(const char *p, size_t len, const char *end, F &fn) {
++  if (len >= 128 || end - p < 128) {
++    scalar_rows<N>(Str(p, len), fn);
++    return;
++  }
++  uint64_t lo, hi = 0, ql, qh = 0;
++  auto get = [&](unsigned at, uint64_t &commas,
++                 uint64_t &quotes) __attribute__((target("avx2,bmi,popcnt"),
++                                                  always_inline)) {
++    auto a = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(p + at));
++    auto b = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(p + at + 32));
++    auto comma = _mm256_set1_epi8(','), quote = _mm256_set1_epi8('"');
++    uint64_t c0 = unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, comma)));
++    uint64_t q0 = unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, quote)));
++    uint64_t c1 = unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, comma)));
++    uint64_t q1 = unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, quote)));
++    auto mask = mask_to(unsigned(len) - at);
++    commas = (c0 | (c1 << 32)) & mask;
++    quotes = (q0 | (q1 << 32)) & mask;
++  };
++  get(0, lo, ql);
++  if (len > 64)
++    get(64, hi, qh);
++  if (size_t(std::popcount(lo) + std::popcount(hi)) != N - 1)
++    return;
++  std::array<Str, N> fields;
++  unsigned start = 0, wrapped = 0;
++  for (unsigned i = 0; i < N; ++i) {
++    unsigned cut = unsigned(len);
++    if (i + 1 < N) {
++      if (lo) {
++        cut = std::countr_zero(lo);
++        lo &= lo - 1;
++      } else {
++        cut = 64 + std::countr_zero(hi);
++        hi &= hi - 1;
++      }
++    }
++    unsigned width = cut - start;
++    bool quotes = width >= 2 && ((p[start] == '"') & (p[cut - 1] == '"'));
++    wrapped += 2 * quotes;
++    fields[i] = {p + start + quotes, width - 2 * quotes};
++    start = cut + 1;
++  }
++  if (wrapped == unsigned(std::popcount(ql) + std::popcount(qh)))
++    fn(fields);
++}
++
++template <size_t N, unsigned Batch, class F>
++__attribute__((target("avx2,bmi,popcnt"))) void tiled_lines(Str data, F &fn) {
++  size_t from = 0, scan = 0;
++  std::array<size_t, Batch> ends;
++  unsigned n = 0;
++  auto flush = [&]() __attribute__((target("avx2,bmi,popcnt"), always_inline)) {
++    for (unsigned i = 0; i < n; ++i) {
++      auto to = ends[i];
++      split_known_line<N>(data.data() + from, to - from,
++                          data.data() + data.size(), fn);
++      from = to + 1;
++    }
++    n = 0;
++  };
++  auto lf = _mm256_set1_epi8('\n');
++  for (; scan + 32 <= data.size(); scan += 32) {
++    auto v = _mm256_loadu_si256(
++        reinterpret_cast<const __m256i *>(data.data() + scan));
++    auto mask = unsigned(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, lf)));
++    while (mask) {
++      ends[n++] = scan + std::countr_zero(mask);
++      mask &= mask - 1;
++      if (n == Batch)
++        flush();
++    }
++  }
++  if (n)
++    flush();
++  if (from < data.size())
++    line_csv_rows<N>(data.substr(from), fn);
++}
++#endif
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -233,7 +233,7 @@
+       auto &v = result.spend[k];
+       if (v > best || (v == best && cat.categories[k] < *daily.category)) {
+         best = v;
+-        daily.category = cat.categories[k];
++        daily.category = &cat.categories[k];
+       }
+       v = 0;
+     }
+@@ -715,18 +715,7 @@
+           });
+           return;
+         }
+-        rows<7>(events[job].body(), [&](auto &r) {
+-          if (r[0].empty())
+-            return;
+-          Time ingest = ingest_time(r[3]);
+-          // Invalid revisions still take part in earliest-ingest selection.
+-          Key id = workers[t].pool.encode(r[0], 'e');
+-          Event e = validate(r, ingest, cat, window);
+-#ifdef SHOPPING_DIAGNOSTICS
+-          ++workers[t].revisions;
+-          workers[t].valid_events += e.ts != bad;
+-#endif
+-          Key user = e.ts == bad ? Key{} : workers[t].pool.encode(r[1], 'u');
++        auto put=[&](Key id, Key user, Event e, Time ingest) {
+           auto &w = workers[t];
+           uint64_t location = 0;
+           if (user.bits) {
+@@ -752,6 +741,38 @@
+             w.extended.push_back({seconds, location});
+           }
+           w.candidates[bucket(id)].push_back(ref);
++        };
++        auto generic_event=[&](auto const &r) __attribute__((noinline)) {
++          if(r[0].empty())return;
++          auto &w=workers[t];
++          Time ingest=ingest_time(r[3]);
++          Key id=w.pool.encode(r[0],'e');
++          Event e=validate(r,ingest,cat,window);
++#ifdef SHOPPING_DIAGNOSTICS
++          ++w.revisions;
++          w.valid_events+=e.ts!=bad;
++#endif
++          Key user=e.ts==bad?Key{}:w.pool.encode(r[1],'u');
++          put(id,user,e,ingest);
++        };
++        rows<7>(events[job].body(),[&](const auto &r){
++          auto type=r[4],id=r[0],user=r[1];
++          if((type=="view" || type=="cart") && !r[5].empty() && id.size()==9 && user.size()==9 &&
++             id[0]=='e' && user[0]=='u' && sizeof(uintptr_t)==8 && std::endian::native==std::endian::little) {
++            auto event_word=little_word(id.data()+1),user_word=little_word(user.data()+1);
++            if(uint8_t(event_word>>56)-1u<127u && uint8_t(user_word>>56)-1u<127u) {
++              Time ingest=ingest_time(r[3]), ts=timestamp(r[2]);
++              bool good=ts>=window.start && ts<window.end && ingest-ts<=day_ms;
++#ifdef SHOPPING_DIAGNOSTICS
++              ++workers[t].revisions;
++              workers[t].valid_events+=good;
++#endif
++              put(Key{uintptr_t(permute_key(event_word)<<1)},good?Key{uintptr_t(permute_key(user_word)<<1)}:Key{},
++                  Event{good?ts:bad,0,0},ingest);
++              return;
++            }
++          }
++          generic_event(r);
+         });
+       });
+   timer.mark("concurrent input, raw user partition and revision index");
+@@ -769,8 +790,13 @@
+   resolve_revisions(workers, threads, anchor);
+   timer.mark("global event dedup and loser removal");
+   std::vector<Result> results(threads);
+-  for (auto &result : results)
++  size_t rows_hint =
++      std::min<size_t>(event_count / 8, (size_t(512) << 20) / sizeof(UserDay)) /
++      threads;
++  for (auto &result : results) {
++    result.users.reserve(rows_hint);
+     result.configure(window, cat, threads);
++  }
+   process_people(workers, results, cat, threads, timer, layout);
+   fs::create_directories(output / "user_daily");
+   fs::create_directories(output / "campaign_daily");
+@@ -779,13 +805,35 @@
+                     ("part-" + std::to_string(i) + ".parquet"),
+                 results[i].users);
+   });
+-  Totals merged;
+-  for (auto &r : results)
+-    r.merge_into(merged);
+   std::vector<CampaignDay> campaigns;
+-  for (auto &[key, c] : merged)
+-    campaigns.push_back(
+-        {cat.campaigns[key.first], cat.channels[key.first], key.second, c});
++  auto append = [&](size_t id, int32_t day, const Counts &c) {
++    campaigns.push_back({cat.campaigns[id], cat.channels[id], day, c});
++  };
++  const auto &first = results.front();
++  if (!first.table.empty()) {
++    for (size_t start = 0; start < first.table.size();
++         start += first.campaigns) {
++      int32_t day = first.first_day + int32_t(start / first.campaigns);
++      for (size_t id = 0; id < first.campaigns; ++id) {
++        Counts c{};
++        for (const auto &r : results) {
++          const auto &part = r.table[start + id];
++          c.sessions += part.sessions;
++          c.purchases += part.purchases;
++          c.revenue += part.revenue;
++          c.assists += part.assists;
++        }
++        if (c.sessions || c.assists)
++          append(id, day, c);
++      }
++    }
++  } else {
++    Totals merged;
++    for (auto &r : results)
++      r.merge_into(merged);
++    for (auto &[key, c] : merged)
++      append(key.first, key.second, c);
++  }
+   write_campaigns(output / "campaign_daily" / "part-0.parquet", campaigns);
+   timer.mark("merge and Parquet output");
+ #ifdef SHOPPING_DIAGNOSTICS
+--- a/cpp/output.hpp
++++ b/cpp/output.hpp
+@@ -3,7 +3,7 @@
+   Key user;
+   int32_t day;
+   int64_t sessions, events, revenue;
+-  std::optional<Str> category;
++  const Str *category{};
+ };
+ struct Counts {
+   int64_t sessions{}, purchases{}, revenue{}, assists{};

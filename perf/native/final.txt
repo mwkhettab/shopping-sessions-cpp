@@ -1,1 +1,1 @@
-base fin-slabkey-pgo shipreader-pgo reader12-pgo readercol-pgo @best
+base fin-slabkey-pgo shipreader-pgo colpagelines-pgo assistday64-pgo coalescelast-pgo @best

@@ -36,6 +36,20 @@ def verify_images(root,area,best,run,note,env,scales):
     note('Image binary '+best,f'sha256 {fingerprint}')
     fast=subprocess.run(['docker','run','--rm','--platform','linux/amd64','--entrypoint','sha256sum',tags[1],'/app/shopping.opt'],capture_output=True,text=True)
     if fast.returncode==0:note('Image optimized binary '+best,'sha256 '+fast.stdout.split()[0])
+    if any(scale=='practice' for scale,_ in scales):
+        with tempfile.TemporaryDirectory(dir=area) as tmp:
+            binary=Path(tmp)/'shopping'
+            container=subprocess.check_output(['docker','create',tags[1]],text=True).strip()
+            try:
+                run('docker','cp',container+':/app/shopping',binary)
+                if fast.returncode==0:run('docker','cp',container+':/app/shopping.opt',str(binary)+'.opt')
+            finally:run('docker','rm',container)
+            import hashlib
+            assert hashlib.sha256(binary.read_bytes()).hexdigest()==fingerprint
+            run(os.sys.executable,root/'verify.py',binary,area/'dev','--starter',area/'starter-pyspark','--answer',area/'dev-answer')
+            for suite in ('random_rules.py','interval_oracle.py','page_oracle.py'):
+                run(os.sys.executable,root/'perf/native'/suite,binary)
+            note('Docker fixture binary '+best,f'{fingerprint} passed 36 fixtures, published 1M tables and all three independent differential suites.')
     for scale,repeats in scales:
         data=area/scale
         totals={tag:[] for tag in tags}

@@ -35,6 +35,25 @@ int main() {
       compare_rows<7>(s);
     }
   }
+  // Put a malformed row in every position of a full batch, including rows
+  // whose last byte lies on either side of a vector boundary.
+  for (size_t width : {31, 32, 63, 64, 65, 95, 96, 127, 128, 129}) {
+    std::string row = "\"e\",u,1,view,,0,";
+    row.append(width - row.size(), 'v');
+    for (size_t special = 0; special < 16; ++special) {
+      for (char extra : {',', '"', '\0'}) {
+        std::string data;
+        for (size_t i = 0; i < 34; ++i) {
+          data += row;
+          if (i % 16 == special)
+            data.back() = extra;
+          if (i != 33)
+            data += '\n';
+        }
+        compare_rows<7>(data);
+      }
+    }
+  }
   std::string epoch = "1791071890000";
   for (size_t i = 0; i < epoch.size(); ++i) {
     auto s = epoch;

@@ -38,4 +38,5 @@ def race(root, area, name, note, run, env):
     wrapper.write_text('#!/bin/sh\nexec '+shlex.join([*prefix,str(area/'race-check')])+' "$@"\n')
     wrapper.chmod(0o755)
     run(os.sys.executable,root/'tests/catalog.py',wrapper,extra={'TSAN_OPTIONS':'halt_on_error=1','NCPU':'8'})
+    run(os.sys.executable,root/'perf/native/interval_oracle.py',wrapper,extra={'TSAN_OPTIONS':'halt_on_error=1','NCPU':'8'})
     note('ThreadSanitizer '+name,'All extended regressions passed at eight workers, including the linked-graph and interval-attribution cases.')
