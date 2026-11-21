@@ -95,20 +95,43 @@ def build_image(tag, folder, override, area, results, env, switches=()):
                  "hashes": {p.name: sha(p) for p in target.iterdir() if p.is_file()}}
 
 
-def provided_binary(tag, source, area):
+def comparison_elf(spec):
+    name, sep, path = spec.partition("=")
+    reserved = {"baseline", "candidate", "peer", "meter", "candidate-kernel", *RUNTIME_BUILDS}
+    if not (sep and path and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name)) or name in reserved:
+        raise argparse.ArgumentTypeError(f"expected a distinct non-reserved NAME=PATH, got {spec!r}")
+    source = Path(path).resolve()
+    try:
+        with source.open("rb") as stream:
+            header = stream.read(64)
+    except OSError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    if (len(header) != 64 or header[:7] != b"\x7fELF\x02\x01\x01"
+            or int.from_bytes(header[16:18], "little") not in (2, 3)
+            or int.from_bytes(header[18:20], "little") != 62
+            or not int.from_bytes(header[24:32], "little")
+            or not int.from_bytes(header[56:58], "little")):
+        raise argparse.ArgumentTypeError(f"{source}: expected an x86-64 ELF executable with an entry point")
+    return name, source
+
+
+def provided_binary(tag, source, area, standalone=False):
     source = source.resolve()
     target = area / "accept-binaries" / tag / source.name
     target.parent.mkdir(parents=True, exist_ok=True)
     binaries = [source]
     sidecar = source.with_name(source.name + ".opt")
-    if sidecar.is_file():
+    if standalone and target.with_name(target.name + ".opt").exists():
+        raise ValueError(f"standalone comparison has a stale .opt executable beside {target}")
+    if not standalone and sidecar.is_file():
         binaries.append(sidecar)
     for p in binaries:
         dest = target.with_name(p.name)
-        shutil.copy2(p, dest)
+        if not dest.exists() or not dest.samefile(p):
+            shutil.copy2(p, dest)
         dest.chmod(0o755)
     return target, {"source_commit": None, "executable": str(target), "supplied_file": str(source),
-                    "hashes": {p.name: sha(p) for p in binaries}}
+                    "hashes": {p.name: sha(target.with_name(p.name)) for p in binaries}}
 
 
 def verify_development(tag, exe, image, area, results, env, candidate_source):
@@ -253,6 +276,8 @@ def main():
     p.add_argument("--baseline-source", type=Path, default=ROOT / ".acceptance/baseline")
     p.add_argument("--baseline-binary", type=Path)
     p.add_argument("--candidate-binary", type=Path)
+    p.add_argument("--comparison-binary", metavar="NAME=PATH", action="append", type=comparison_elf, default=[],
+                   help="qualify and compare a standalone compiler ELF with the shipping candidate (repeat up to four times)")
     p.add_argument("--runtime-source", type=Path)
     p.add_argument("--runtime-builds", nargs="+", choices=RUNTIME_BUILDS, default=[])
     peer = p.add_mutually_exclusive_group()
@@ -281,6 +306,9 @@ def main():
     p.add_argument("--memory-mib", type=int, default=12288)
     p.add_argument("--skip-kernel-test", action="store_true", help="for exercising the harness with existing binaries")
     args = p.parse_args()
+    comparisons = dict(args.comparison_binary)
+    if len(comparisons) != len(args.comparison_binary) or len(comparisons) > 4:
+        p.error("supply up to four --comparison-binary entries with distinct names")
     if bool(args.runtime_source) != bool(args.runtime_builds) or len(set(args.runtime_builds)) != len(args.runtime_builds):
         p.error("supply --runtime-source and distinct --runtime-builds together")
     if min(args.cpus, args.warm_20, args.warm_60, args.cold_runs, args.memory_mib) < 1:
@@ -351,6 +379,10 @@ def main():
             bins[tag] = exe
             state["implementations"][tag] = item
             item["tested"] = False
+        for tag, source in comparisons.items():
+            exe, item = provided_binary(tag, source, area, standalone=True)
+            bins[tag] = exe
+            state["implementations"][tag] = dict(item, tested=False)
         if not args.skip_kernel_test:
             mark("kernel")
             tree = args.candidate_source.resolve()
@@ -387,7 +419,7 @@ def main():
             state["implementations"][tag]["tested"] = True
             state["verified"]["1M/" + tag] = "36 fixtures, additional edge cases, both published 1M tables"
         mark("patterned rules")
-        for tag in ("candidate", *args.runtime_builds):
+        for tag in ("candidate", *args.runtime_builds, *comparisons):
             if tag not in bins:
                 continue
             rules = results/(tag + "-patterned-rules.jsonl")
@@ -423,11 +455,18 @@ def main():
                 golden = [sys.executable, NATIVE/"acceptance_reference.py", ref, "--scale", scale,
                           "--expected", NATIVE/"acceptance-references.json"]
                 exec_logged(golden, log, env)
-                for tag, exe in bins.items():
+                for tag, exe in list(bins.items()):
                     if tag != "baseline":
-                        with tempfile.TemporaryDirectory(dir=area) as out:
-                            exec_logged([exe, data, out], log, env)
-                            exec_logged([sys.executable, NATIVE/"compare_large.py", ref, out], log, env)
+                        try:
+                            with tempfile.TemporaryDirectory(dir=area) as out:
+                                exec_logged([exe, data, out], log, env)
+                                exec_logged([sys.executable, NATIVE/"compare_large.py", ref, out], log, env)
+                        except subprocess.CalledProcessError as error:
+                            if tag not in comparisons:
+                                raise
+                            state["implementations"][tag].update(tested=False, excluded=scale + " comparison failure", error=str(error))
+                            del bins[tag]
+                            continue
                     if tag in images:
                         with tempfile.TemporaryDirectory(dir=area) as out:
                             mlog = results/(scale + "-" + tag + "-image.log")

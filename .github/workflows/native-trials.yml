@@ -26,6 +26,7 @@ on:
       - .github/workflows/native-report.yml
       - .github/workflows/native-trials.yml
       - .github/workflows/native-finalist.yml
+      - .github/workflows/native-compiler-comparison.yml
       - perf/native/finalist.json
       - perf/native/holdout_shipping.py
       - perf/native/port_input_settings.py
@@ -33,6 +34,7 @@ on:
       - perf/native/port_acceptance.py
       - perf/native/native_code_paths.py
       - perf/native/prepare-port-runner.sh
+      - perf/native/port_compiler_build.sh
       - perf/native/run.py
 permissions:
   contents: read

@@ -1,0 +1,66 @@
+name: Native x86-64 event parser compiler comparison
+on:
+  push:
+    branches: [bench/native-x64-trials]
+    paths:
+      - .github/workflows/native-compiler-comparison.yml
+      - perf/native/port_compiler_build.sh
+permissions:
+  contents: read
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 95
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check out the shipping C++ sources
+        uses: actions/checkout@v4
+        with:
+          ref: faf1047c6cb00cc8099572f5e067d18076375571
+          path: .acceptance/candidate
+          persist-credentials: false
+      - name: Check out the officially scored control
+        uses: actions/checkout@v4
+        with:
+          ref: 4db76beed31640ddf4b414ed19deba5ebc660b81
+          path: .acceptance/baseline
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Prepare generator, fixtures and independent tables
+        run: bash perf/native/prepare-port-runner.sh
+      - name: Build four standalone compiler alternatives
+        run: |
+          out="$RUNNER_TEMP/shopping-trials/compiler-binaries"
+          bash perf/native/port_compiler_build.sh "$GITHUB_WORKSPACE/.acceptance/candidate" "$out" \
+            gcc-stock portable-unpadded portable-aligned portable-inline
+          cat "$out/toolchain.txt"
+      - name: Verify all compiler outputs and compare native processes
+        env:
+          CXX: g++-12
+        run: |
+          out="$RUNNER_TEMP/shopping-trials/compiler-binaries"
+          "$RUNNER_TEMP/shopping-python/bin/python" perf/native/port_acceptance.py \
+            --candidate-source "$GITHUB_WORKSPACE/.acceptance/candidate" \
+            --comparison-binary "toolchain-gcc=$out/gcc-stock" \
+            --comparison-binary "llvm=$out/portable-unpadded" \
+            --comparison-binary "llvm-aligned=$out/portable-aligned" \
+            --comparison-binary "llvm-inline=$out/portable-inline" \
+            --release-generated-practice --warm-20 7 --warm-60 3 --cold-runs 1
+      - name: Publish measured stage and whole-process results
+        if: always()
+        run: |
+          results="$RUNNER_TEMP/shopping-trials/results"
+          if test -f "$results/port-acceptance/status.json"; then python3 perf/native/publish_profile.py "$results"; fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-compiler-measurements
+          path: |
+            ${{ runner.temp }}/shopping-trials/results/
+            ${{ runner.temp }}/shopping-trials/compiler-binaries/toolchain.txt
+            ${{ runner.temp }}/shopping-trials/compiler-binaries/build-metrics.jsonl
+          retention-days: 7
