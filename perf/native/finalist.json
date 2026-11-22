@@ -1,1 +1,9 @@
-{"commit":"24c3b7369cd62ab7a6b36cf3b8911a38ffa8816d","variant":"control"}
+{
+  "base": "f1e4c0c6bea3066cd5b03c7b0d6505444af35320",
+  "variant": "control",
+  "experiment": "populate-input",
+  "blobs": {
+    "cpp/pipeline/parse.hpp": "aa916fdd69bf9ec41f27835698534fa8f176d6f0",
+    "tests/pipeline/user_codecs.cpp": "53ade5b0e9c17336b67d10c79a776929be3d52e9"
+  }
+}

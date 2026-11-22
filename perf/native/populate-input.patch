@@ -1,0 +1,57 @@
+diff --git a/cpp/pipeline/parse.hpp b/cpp/pipeline/parse.hpp
+index d607aa8..aa916fd 100644
+--- a/cpp/pipeline/parse.hpp
++++ b/cpp/pipeline/parse.hpp
+@@ -99,6 +99,16 @@ template<class G> void stage1(G& g,std::size_t tid){
+         if(use_rd&&FDS[c.file]>=0){chunk_rd(g,t,*eb,*cb,*out,tb,tid,f,c,FDS[c.file],rb,d.rd);continue;}
+         std::string_view data(reinterpret_cast<const char*>(g.region+f.off),f.len);
+         const auto s=c.a==f.hdr?c.a:next_line_start(data,c.a-1),e=c.b>=f.len?f.len:next_line_start(data,c.b-1);if(s>=e)continue;
++#if defined(__linux__) && defined(MADV_POPULATE_READ)
++        // Fault complete file pages together before the decoder starts on this chunk.
++        static const long page_bytes = ::sysconf(_SC_PAGESIZE);
++        if (page_bytes > 0) {
++            const auto page = static_cast<std::size_t>(page_bytes);
++            const auto first = (s + page - 1) / page * page;
++            const auto end = e - e % page;
++            if (first < end) ::madvise(const_cast<u8*>(g.region + f.off + first), end - first, MADV_POPULATE_READ);
++        }
++#endif
+         parse_buf(g,t,*eb,*cb,*out,tb,tid,f,data.substr(s,e-s),s);
+         if(RELEASE)sys::release(g.region+f.off+s,e-s);
+     }
+diff --git a/tests/pipeline/user_codecs.cpp b/tests/pipeline/user_codecs.cpp
+index c74c9c7..53ade5b 100644
+--- a/tests/pipeline/user_codecs.cpp
++++ b/tests/pipeline/user_codecs.cpp
+@@ -9,7 +9,31 @@ static void check(bool ok,const char* reason) {
+     if(!ok) throw std::runtime_error(reason);
+ }
+ 
++static void check_known_word_pages() {
++    constexpr u32 base = 0x7ffffffc;
++    std::array<u32, 9> keys{0, 1, 2, 3, 4, 5, 6, 7, 7};
++    for (auto& key : keys) key += base;
++
++    pqw::Out page;
++    pqw::emit_user_words(page, keys, base, 3);
++    // Two eight-value groups. The second contains only 7 and its padding.
++    constexpr std::array<u8, 7> expected{0x05, 0x88, 0xc6, 0xfa, 0x07, 0, 0};
++    check(page.size() == expected.size(), "three-bit page length");
++    check(std::equal(expected.begin(), expected.end(), page.data()), "three-bit page layout");
++
++    // 505 values require 64 groups, the first count with a two-byte run header.
++    std::vector<u32> ones(505, base + 1);
++    pqw::Out wide_header;
++    pqw::emit_user_words(wide_header, ones, base, 1);
++    check(wide_header.size() == 66, "two-byte header page length");
++    const auto* bytes = wide_header.data();
++    check(bytes[0] == 0x81 && bytes[1] == 0x01, "64-group run header");
++    check(std::all_of(bytes + 2, bytes + 65, [](u8 b) { return b == 0xff; }), "full one-bit groups");
++    check(bytes[65] == 0x01, "final one-bit group padding");
++}
++
+ int main() {
++    check_known_word_pages();
+     u32 random=638291;
+     auto next=[&]{random=random*1664525+1013904223;return random;};
+     const std::array<unsigned,24> lengths{0,1,2,7,8,9,15,16,17,31,32,33,62,63,64,65,

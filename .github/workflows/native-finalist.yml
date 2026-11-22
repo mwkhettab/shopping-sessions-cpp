@@ -1,4 +1,4 @@
-name: Native compact click and event layout qualification
+name: Native input page population qualification
 on:
   push:
     branches: [bench/native-x64-trials]
@@ -13,43 +13,38 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Read selected revision
-        id: image
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          import json, os, re
-          data = json.load(open('perf/native/finalist.json'))
-          if not re.fullmatch(r'[0-9a-f]{40}', data['commit']) or not re.fullmatch(r'[a-z-]+', data['variant']):
-              raise ValueError('Expected a full release SHA and a build variant')
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              for key in ('commit', 'variant'):
-                  print(f'{key}={data[key]}', file=output)
-          PY
-      - name: Check out selected shipping sources
+      - name: Check out the published C++ release
         uses: actions/checkout@v4
         with:
-          ref: ${{ steps.image.outputs.commit }}
+          ref: f1e4c0c6bea3066cd5b03c7b0d6505444af35320
           path: .acceptance/candidate
           persist-credentials: false
-      - name: Check out the compact click index with ordinary event records
-        uses: actions/checkout@v4
-        with:
-          ref: d15e54c5dcf22e04a0cce213a8816e7471875cac
-          path: .acceptance/baseline
-          persist-credentials: false
-      - name: Check out the official 0.30 s release
+      - name: Check out the official 0.30 s control
         uses: actions/checkout@v4
         with:
           ref: 7f59c0b8c268d735ebc3e3ecbd68c7a17302e4b1
-          path: .acceptance/scored
+          path: .acceptance/baseline
           persist-credentials: false
-      - name: Check out the qualified writer and session port
-        uses: actions/checkout@v4
-        with:
-          ref: 665950e89ceefa8606400a2090f08964b9e16928
-          path: .acceptance/previous-port
-          persist-credentials: false
+      - name: Build the exact trial tree from the published sources
+        id: image
+        shell: bash
+        run: |
+          src=.acceptance/candidate
+          area="$RUNNER_TEMP/published"
+          docker buildx build --platform linux/amd64 --output "type=local,dest=$area" "$src"
+          git -C "$src" apply "$GITHUB_WORKSPACE/perf/native/populate-input.patch"
+          git -C "$src" add cpp/pipeline/parse.hpp tests/pipeline/user_codecs.cpp
+          python3 - <<'PYTHON'
+          import json, subprocess
+          config=json.load(open('perf/native/finalist.json'))
+          git=['git','-C','.acceptance/candidate']
+          assert subprocess.check_output(git+['rev-parse','HEAD'],text=True).strip()==config['base']
+          for path,value in config['blobs'].items():
+              assert subprocess.check_output(git+['rev-parse',':'+path],text=True).strip()==value
+          PYTHON
+          git -C "$src" -c user.name="Benchmark runner" -c user.email="benchmark@localhost" commit -m 'Test input page population'
+          echo "commit=$(git -C "$src" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "variant=control" >> "$GITHUB_OUTPUT"
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -67,20 +62,6 @@ jobs:
             c++ -std=c++20 -O3 "${flags[@]}" -I"$src/cpp/pipeline" "$src/tests/pipeline/sparse_user_groups.cpp" -o "$RUNNER_TEMP/user-groups"
             "$RUNNER_TEMP/shopping-python/bin/python" "$src/tests/pipeline/sparse_user_groups.py" "$RUNNER_TEMP/user-groups"
           done
-          for suite in click_words routing_part routing_event12 routing_input_release; do
-            g++-12 -std=c++20 -O3 -pthread -Wno-ignored-attributes -DSHOP_R12_SCATTER=1 -I"$src/cpp/pipeline" \
-              "$src/tests/pipeline/$suite.cpp" "$src/cpp/pipeline/sys_global_alloc.cpp" -o "$RUNNER_TEMP/layout-test"
-            "$RUNNER_TEMP/layout-test"
-          done
-      - name: Prepare comparison executables
-        shell: bash
-        run: |
-          area="$RUNNER_TEMP/shopping-trials"
-          for tag in scored previous-port; do
-            docker buildx build --platform linux/amd64 --output "type=local,dest=$area/$tag" ".acceptance/$tag"
-          done
-          gzip -dc perf/native/revision_trials/reference.elf.gz > "$area/reference"
-          chmod +x "$area/reference"
       - name: Compare full processes and shipping containers
         id: qualify
         env:
@@ -89,17 +70,15 @@ jobs:
           area="$RUNNER_TEMP/shopping-trials"
           "$RUNNER_TEMP/shopping-python/bin/python" perf/native/port_acceptance.py \
             --candidate-source "$GITHUB_WORKSPACE/.acceptance/candidate" \
-            --require-baseline-commit d15e54c5dcf22e04a0cce213a8816e7471875cac \
-            --comparison-binary "scored=$area/scored/app/shopping" \
-            --comparison-binary "previous-port=$area/previous-port/app/shopping" \
-            --peer-binary "$area/reference" --peer-binary-sha256 6f6779cb7ec58760b69325369b5ac6657405230b0c3c2231214c6680038a86ce \
+            --require-baseline-commit 7f59c0b8c268d735ebc3e3ecbd68c7a17302e4b1 \
+            --comparison-binary "published=$RUNNER_TEMP/published/app/shopping" \
             --release-generated-practice --release-generated-final \
-            --warm-20 9 --warm-60 5 --cold-runs 1 --container-lifetime-pairs 3
+            --warm-20 11 --warm-60 7 --cold-runs 2 --container-lifetime-pairs 9
           python3 - "$area/results/port-acceptance/status.json" <<'PYTHON'
           import json,sys
           state=json.load(open(sys.argv[1]))
           for size in ("1M","20M","60M"):
-              assert all(f"{size}/{tag}" in state["verified"] for tag in ("scored","previous-port","baseline","candidate")),size
+              assert all(f"{size}/{tag}" in state["verified"] for tag in ("published","baseline","candidate")),size
           PYTHON
       - name: Publish native measurements and qualification
         if: always()
@@ -111,7 +90,7 @@ jobs:
         env:
           SHIPPING_SHA: ${{ steps.image.outputs.commit }}
         run: |
-          "$RUNNER_TEMP/shopping-python/bin/python" perf/native/holdout_shipping.py --shipping-commit "$SHIPPING_SHA" --baseline-commit d15e54c5dcf22e04a0cce213a8816e7471875cac
+          "$RUNNER_TEMP/shopping-python/bin/python" perf/native/holdout_shipping.py --shipping-commit "$SHIPPING_SHA" --baseline-commit 7f59c0b8c268d735ebc3e3ecbd68c7a17302e4b1
           python3 - "$RUNNER_TEMP/shopping-trials/results" <<'PYTHON'
           from pathlib import Path
           import sys,json
