@@ -28,6 +28,33 @@ The entrant reported **0.88 s** for `BB-1F2F9464` at `25a940f0d0a8`. The entered
 
 The scorer entered `BB-3FCA75FD` in the final at **0.87 s**. Queue wait was 220 ms. This improved the prior official 0.99 s time by 12.1%. The entrant supplied these scores. The 0.99 s run reduced the previous best by 12.4%. The scorer marked the earlier `BB-BE7C95B8` as entered in the final with 3 ms queue wait. Its 1.13 s runtime was 32.7% lower than the previous 1.68 s best. Entries `BB-065C223B` and `BB-E8D93ABE` listed 41 ms and 105 ms of queue wait separately. Relative to `61e9ba6`, the 512-shard release decodes each field as its delimiter is encountered, raises the event and person shard count from 128 to 512, reserves identity storage from input size, and compares inline canonical IDs bytewise without a separate display-name vector. It also reserves Arrow builder capacity and uses unchecked numeric appends within that reservation. Its compiler flags, Dockerfile, global deduplication rules, session boundaries and attribution algorithm match the official baseline. Its official run was 0.03 s slower. Two submissions of the identical baseline pipeline differed by 0.02 s.
 
+## Opaque IDs in the updated public generator
+
+The November 21 downloads of the public generator and both development reference tables differ from the earlier archives. The rules now require opaque, variable-width user, event and click IDs. The updated generator ZIP has SHA-256 `78f973f75d14b48e792628284f19c75de71fa597d20952e16a9ced93c78bee4a`. The previous ZIP had SHA-256 `13724cadbac5a99d847e27cea911cd2e338ff972b46c2039da87452011bb101e`. The starter fixtures archive retained its earlier digest. The historical 0.30 s receipt predates this validation. [Current rules](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/rules.md) · [Generator](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip) · [Published answers](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/dev-answer.zip)
+
+The release builds the sharded C++ entry point. A short ID can be carried by its bytes inside one word. Longer and otherwise unrepresentable IDs retain the complete original string, and bytewise equality resolves hash collisions. Both table writers use the same opaque-ID semantics. A retry into populated output directories uses the replacement writer to clear stale Parquet parts. The key-recovery implementation from the earlier generator is outside the release build.
+
+The current published 1M answers contain 118,107 user-day rows and 27,449 campaign-day rows. The earlier answers contain 117,038 and 27,400. Both pairs matched in local checks, including a retry with populated output directories on the current input. The local Linux/amd64 image also matched the updated answers under a 2 GiB memory cap.
+
+On a Xeon 6975P-C, each build ran in turn on the same four pinned Linux vCPUs. The warm runs used fresh processes and output directories. Docker times run from the engine's start to exit with a 14 GiB container limit. The two earlier releases both selected their general string path on these inputs. [Native measurements, output comparisons and raw samples](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44975018089/job/137062854847)
+
+| Revised public input | Earlier scored release `7f59c0b8` | Previous release `f1e4c0c6` | Sharded release |
+| --- | ---: | ---: | ---: |
+| 20M warm process, 7 rounds | 5.3437 s | 5.3740 s | **1.5359 s** |
+| 60M warm process, 5 rounds | 16.6578 s | 16.8479 s | **4.6326 s** |
+| 20M warm Docker, 9 rounds | 5.4347 s | — | **1.5747 s** |
+| 60M warm Docker, 9 rounds | 16.8623 s | — | **4.7596 s** |
+| 20M peak process RSS, warm runs | 3,854.9 MiB | 3,856.8 MiB | **3,166.7 MiB** |
+| 60M peak process RSS, warm runs | 11,480.8 MiB | 11,480.3 MiB | **9,341.5 MiB** |
+
+The sharded image won all nine Docker pairs at each size. With verified input-cache eviction, one process per size took 3.603 s at 20M and 15.049 s at 60M, versus 7.047 s and 24.490 s for the earlier scored release. In a separate warm 60M profile, reading and partitioning the input took 1.922 s. Grouping by raw user, resolving link endpoints and processing singleton sessions took another 1.521 s. A second 60M input (seed 733, 15M clicks) matched all 6,676,259 user-day rows and 28,014 campaign-day rows. It ran in 4.777 s with eight application workers sharing the four CPUs and peaked at 9,434.4 MiB RSS.
+
+The native release passed all 36 fixtures and 54 additional comparisons. The full logical tables matched at 20M and both 60M seeds. The local and Linux builds of the shipping ELF have SHA-256 `23f056eca4b6e48a81c6ef5f3ee1675f4f6534a458109350e585745a815eae73`. Its automatic and explicit generic modes also reproduced the current 1M answers under QEMU's Nehalem CPU model.
+
+The optional original-layout Docker timer stopped before collecting native samples because its harness passed a CPU list to a function expecting a comma-separated string. A separate local run reproduced the archived fingerprints for both tables on the original 20M and 60M inputs (2,226,509 and 6,684,549 user-day rows respectively). With the timer corrected, the two amd64 shipping images took 9.721 s (`7f59c0b8`) and 6.572 s (sharded) on the original 20M input in Docker Desktop on Apple silicon, across three paired runs.
+
+Native Apple builds on the original data took 0.961 s (`f1e4c0c6`) and 0.763 s (sharded) at 20M. At 60M they took 17.125 s and 17.427 s, respectively. These are medians of three alternating runs with four workers. The hidden scorer's input revision and the sharded release's official time are unconfirmed.
+
 ## C++ output, session traversal and compact click storage
 
 The official 0.30 s release and three comparison executables ran on four pinned vCPUs of a Xeon 6975P-C. Each timed process read the input and wrote both output tables in a fresh directory. The warm-file measurements used nine alternating 20M rounds and five 60M rounds. Paired changes use per-round ratios. The two C++ changes were committed separately so each could be compared to the scored release. [Native output and session checks](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44960982671/job/137019501668)

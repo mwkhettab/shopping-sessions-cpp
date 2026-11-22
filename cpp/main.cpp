@@ -1,6 +1,8 @@
 #include "input.hpp"
 #include "metrics.hpp"
 #include "output.hpp"
+#include "pipeline/generic/mod.hpp"
+#include <charconv>
 #include <climits>
 #include <map>
 #include <regex>
@@ -12,6 +14,8 @@ template <class Generic, class Common, class Rich> struct EventCallbacks {
   Rich rich;
   template <class Row> void operator()(const Row &row) { generic(row); }
 };
+template <class Generic, class Common, class Rich>
+EventCallbacks(Generic, Common, Rich) -> EventCallbacks<Generic, Common, Rich>;
 size_t bucket(Key k) { return k.hash() % shards; }
 #include "event_layout.hpp"
 struct RevisionIndex {
@@ -961,9 +965,32 @@ int main(int argc, char **argv) {
     return s ? s : fallback;
   };
   try {
-    run(argc > 1 ? argv[1] : env("DATA_DIR", "/data"),
-        argc > 2 ? argv[2] : env("OUTPUT_DIR", "/output"),
-        std::clamp(std::stoi(env("NCPU", "8")), 1, 64));
+    const bool generic = argc > 1 && Str(argv[1]) == "--generic";
+    const bool paths = argc >= (generic ? 4 : 3);
+    const fs::path data = paths ? argv[argc-2] : env("DATA_DIR", "/data");
+    const fs::path output = paths ? argv[argc-1] : env("OUTPUT_DIR", "/output");
+    const Str setting = env("NCPU", "8");
+    unsigned count = 0;
+    const auto [end, error] = std::from_chars(setting.data(), setting.data()+setting.size(), count);
+    const unsigned threads = error == std::errc{} && end == setting.data()+setting.size() && count
+                                 ? std::min(count, 64u) : 8u;
+
+    // A retry can leave more output parts than this run will create. The
+    // replacement writer already handles those parts and ignores sidecar files.
+    auto fresh = [](const fs::path &dir) {
+      const auto status = fs::symlink_status(dir);
+      return !fs::exists(status) || (fs::is_directory(status) && fs::is_empty(dir));
+    };
+    if (!generic && fresh(output/"user_daily") && fresh(output/"campaign_daily")) {
+      try {
+        run(data, output, threads);
+        if (std::getenv("V1ND_LOG")) std::fputs("[sharded] completed\n", stderr);
+        return 0;
+      } catch (const std::exception &e) {
+        std::fprintf(stderr, "[sharded] retry: %s\n", e.what());
+      }
+    }
+    pipeline::generic::run(data, output, threads);
   } catch (const std::exception &e) {
     std::cerr << e.what() << '\n';
     return 1;

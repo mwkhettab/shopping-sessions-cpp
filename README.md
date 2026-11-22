@@ -6,7 +6,7 @@ The complete challenge contract is in [`rules.md`](rules.md).
 
 ## Build the submission image
 
-The scorer runs `linux/amd64`. Build the same image locally with Docker Buildx. The build trains GCC on two small synthetic workloads, then copies the optimized executable into the runtime image.
+The scorer runs `linux/amd64`. Docker Buildx compiles the C++20 pipeline with Clang 16 and link-time optimization, then copies the static executable into the runtime image.
 
 ```sh
 docker buildx build --platform linux/amd64 --load \
