@@ -1,9 +1,12 @@
 {
   "base": "f1e4c0c6bea3066cd5b03c7b0d6505444af35320",
   "variant": "control",
-  "experiment": "populate-input",
+  "experiment": "opaque-identifiers",
   "blobs": {
-    "cpp/pipeline/parse.hpp": "aa916fdd69bf9ec41f27835698534fa8f176d6f0",
-    "tests/pipeline/user_codecs.cpp": "53ade5b0e9c17336b67d10c79a776929be3d52e9"
+    "Dockerfile": "b0a36b480a80d1b75e9348a10ca03db5c59970c4",
+    "build.sh": "f141f8fc60e266d8a36fc6c8b85cb11dad2afae8",
+    "cpp/main.cpp": "7602a2f822fb758c542f0d895f8150ca2abaf93d",
+    "rules.md": "32a8b8346a49ab985d6864bce079831f2429c6a1",
+    "tests/pipeline/sharded_retry.py": "29e34f466645923b27df5d6e9ef1e1022f6e7ab1"
   }
 }

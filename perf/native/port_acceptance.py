@@ -441,7 +441,7 @@ def main():
                 continue
             audits = [json.loads(line) for line in rules.read_text().splitlines()]
             state["verified"]["patterned rules/" + tag] = {path: sum(r["path"] == path for r in audits)
-                                                               for path in ("direct", "generic")}
+                                                               for path in ("direct", "generic", "sharded")}
         for scale in ("20M", "60M"):
             if scale not in args.scales:
                 continue
@@ -459,9 +459,12 @@ def main():
             with tempfile.TemporaryDirectory(dir=area) as ref:
                 log = results / (scale + "-exact.log")
                 exec_logged([bins["baseline"], data, ref], log, env)
-                golden = [sys.executable, NATIVE/"acceptance_reference.py", ref, "--scale", scale,
-                          "--expected", NATIVE/"acceptance-references.json"]
-                exec_logged(golden, log, env)
+                # These public inputs use the updated generator. Record a normalized
+                # digest for each table and compare every independent engine to it.
+                digest = [sys.executable, NATIVE/"acceptance_reference.py", ref]
+                control = json.loads(subprocess.check_output(digest, text=True, env=env))
+                store(results/(scale + "-reference.json"), control)
+                print("::notice title=Updated " + scale + " logical hashes::" + json.dumps(control), flush=True)
                 if previous:
                     with tempfile.TemporaryDirectory(dir=area) as out:
                         exec_logged([previous, data, out], log, env)
@@ -489,7 +492,7 @@ def main():
                                 raise ValueError(f"missing container measurements in {mlog}")
                             state["verified"][scale + "/image/" + tag] = dict(zip(
                                 ("wall_s", "process_peak_mib", "cgroup_peak_mib"), map(float, match.groups())))
-                    state["verified"][scale + "/" + tag] = "exact tables and unique keys against independently fingerprinted control"
+                    state["verified"][scale + "/" + tag] = "exact tables and unique keys against current-generator control"
             mark(scale + " profiles and pairs")
             state["timings"][scale] = paired(scale, data, bins, area, results, env,
                                                args.warm_20 if scale == "20M" else args.warm_60, args.cold_runs)

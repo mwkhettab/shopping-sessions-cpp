@@ -1,0 +1,131 @@
+diff --git a/Dockerfile b/Dockerfile
+index 1910b07..b0a36b4 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -5 +5 @@ WORKDIR /src
+-COPY cpp/pipeline cpp/pipeline
++COPY cpp cpp
+diff --git a/build.sh b/build.sh
+index 07d05d0..f141f8f 100644
+--- a/build.sh
++++ b/build.sh
+@@ -5,31 +5,4 @@ compiler=${CXX:-c++}
+-platform=$(uname -s)-$(uname -m)
+-set -- -std=c++20 -O3 -DSHOP_SPARSE_USER_OUTPUT=1 -DNDEBUG -pthread
+-paired_events=0
+-if [ "${PAIRED_EVENT_KERNEL:-1}" = 1 ] && [ "$platform" = Linux-x86_64 ]; then
+-    paired_events=1
+-    set -- "$@" -DSHOP_PAIRED_EVENT_KERNEL
+-fi
+-
+-if [ "$platform" = Linux-x86_64 ] && [ "${compiler##*/}" = clang++-16 ]; then
+-    set -- "$@" -fno-pic -fno-pie -march=x86-64 -mtune=cascadelake \
+-        -fconstexpr-steps=100000000 -DSHOP_KERNEL_ABSOLUTE_TABLES -flto=full
+-    for unit in main k_free k_free_x86 sys_global_alloc; do
+-        "$compiler" "$@" -c "cpp/pipeline/$unit.cpp" -o "build/$unit.bc"
+-    done
+-    "$compiler" -fno-pie -DSHOP_KERNEL_ABSOLUTE_TABLES -c cpp/pipeline/k_free_clicks.S -o build/clicks.o
+-    if [ "$paired_events" = 1 ]; then
+-        "$compiler" -fno-pie -DSHOP_KERNEL_ABSOLUTE_TABLES -DSHOP_PAIRED_EVENT_KERNEL \
+-            -c cpp/pipeline/k_free_events.S -o build/event_pair.o
+-        set -- "$@" build/event_pair.o
+-    fi
+-    set -- "$@" -no-pie -fuse-ld=lld-16 -Wl,--lto-O3 -Wl,--threads=1 \
+-        build/main.bc build/k_free.bc build/k_free_x86.bc build/sys_global_alloc.bc build/clicks.o
+-else
+-    if [ "$platform" = Linux-x86_64 ]; then
+-        set -- "$@" -fno-pie -no-pie -DSHOP_KERNEL_ABSOLUTE_TABLES cpp/pipeline/k_free_clicks.S
+-    fi
+-    if [ "$paired_events" = 1 ]; then
+-        set -- "$@" cpp/pipeline/k_free_events.S
+-    fi
+-    set -- "$@" cpp/pipeline/main.cpp cpp/pipeline/k_free.cpp cpp/pipeline/k_free_x86.cpp \
+-        cpp/pipeline/sys_global_alloc.cpp
++set -- -std=c++20 -O3 -DNDEBUG -DSHOP_SPARSE_USER_OUTPUT=1 -pthread
++if [ "$(uname -s)-$(uname -m)" = Linux-x86_64 ] && [ "${compiler##*/}" = clang++-16 ]; then
++    set -- "$@" -march=x86-64 -mtune=cascadelake -fno-pic -fno-pie -no-pie \
++        -fconstexpr-steps=100000000 -flto=full -fuse-ld=lld-16 -Wl,--lto-O3 -Wl,--threads=1
+@@ -40 +13 @@ fi
+-exec "$compiler" "$@" -o build/shopping
++exec "$compiler" "$@" cpp/main.cpp -o build/shopping
+diff --git a/cpp/main.cpp b/cpp/main.cpp
+index e77135f..7602a2f 100644
+--- a/cpp/main.cpp
++++ b/cpp/main.cpp
+@@ -3,0 +4,2 @@
++#include "pipeline/generic/mod.hpp"
++#include <charconv>
+@@ -14,0 +17,2 @@ template <class Generic, class Common, class Rich> struct EventCallbacks {
++template <class Generic, class Common, class Rich>
++EventCallbacks(Generic, Common, Rich) -> EventCallbacks<Generic, Common, Rich>;
+@@ -964,3 +968,26 @@ int main(int argc, char **argv) {
+-    run(argc > 1 ? argv[1] : env("DATA_DIR", "/data"),
+-        argc > 2 ? argv[2] : env("OUTPUT_DIR", "/output"),
+-        std::clamp(std::stoi(env("NCPU", "8")), 1, 64));
++    const bool generic = argc > 1 && Str(argv[1]) == "--generic";
++    const bool paths = argc >= (generic ? 4 : 3);
++    const fs::path data = paths ? argv[argc-2] : env("DATA_DIR", "/data");
++    const fs::path output = paths ? argv[argc-1] : env("OUTPUT_DIR", "/output");
++    const Str setting = env("NCPU", "8");
++    unsigned count = 0;
++    const auto [end, error] = std::from_chars(setting.data(), setting.data()+setting.size(), count);
++    const unsigned threads = error == std::errc{} && end == setting.data()+setting.size() && count
++                                 ? std::min(count, 64u) : 8u;
++
++    // A retry can leave more output parts than this run will create. The
++    // replacement writer already handles those parts and ignores sidecar files.
++    auto fresh = [](const fs::path &dir) {
++      const auto status = fs::symlink_status(dir);
++      return !fs::exists(status) || (fs::is_directory(status) && fs::is_empty(dir));
++    };
++    if (!generic && fresh(output/"user_daily") && fresh(output/"campaign_daily")) {
++      try {
++        run(data, output, threads);
++        if (std::getenv("V1ND_LOG")) std::fputs("[sharded] completed\n", stderr);
++        return 0;
++      } catch (const std::exception &e) {
++        std::fprintf(stderr, "[sharded] retry: %s\n", e.what());
++      }
++    }
++    pipeline::generic::run(data, output, threads);
+diff --git a/rules.md b/rules.md
+index b4b713e..32a8b83 100644
+--- a/rules.md
++++ b/rules.md
+@@ -101 +101 @@ A quick self-check: summed over all rows, `sessions` and `revenue_cents` are equ
+-`generate --seed N --events E --clicks C --output DIR` writes every input file above. The whale users, whale campaigns, window and dirt rates all change with the seed, so nothing about a dataset can be hard-coded.
++`generate --seed N --events E --clicks C --output DIR` writes every input file above. The whale users, whale campaigns, window, ID keys and dirt rates all change with the seed, so nothing about a dataset can be hard-coded. One in eight distinct `user_id`, `event_id` and `click_id` values carries a 32-character hexadecimal suffix (the rest use short lowercase base 36), and every ID passes through a per-seed keyed bijection, so pipelines must treat IDs as opaque variable-width strings rather than fixed-width or invertible generator numbers.
+diff --git a/tests/pipeline/sharded_retry.py b/tests/pipeline/sharded_retry.py
+new file mode 100644
+index 0000000..29e34f4
+--- /dev/null
++++ b/tests/pipeline/sharded_retry.py
+@@ -0,0 +1,28 @@
++"""Exercise automatic routing with fresh and already populated output directories."""
++import os
++from pathlib import Path
++import subprocess
++import sys
++from tempfile import TemporaryDirectory
++
++
++def check(binary, starter):
++    fixture = starter / "fixtures" / "A1"
++    compare = starter / "scripts" / "compare.py"
++    env = dict(os.environ, NCPU="2", V1ND_LOG="1")
++    with TemporaryDirectory() as temp:
++        output = Path(temp)
++        for trace in ("[sharded] completed", "[v1nd]"):
++            proc = subprocess.run([binary, fixture / "input", output], env=env,
++                                  check=True, text=True, capture_output=True)
++            assert trace in proc.stderr, proc.stderr
++            subprocess.run([sys.executable, compare, output, fixture / "expected"], check=True)
++            if trace.startswith("[sharded]"):
++                (output / "user_daily" / "stale.parquet").write_bytes(b"stale")
++                (output / "user_daily" / "_SUCCESS").touch()
++        assert not (output / "user_daily" / "stale.parquet").exists()
++        assert (output / "user_daily" / "_SUCCESS").is_file()
++
++
++if __name__ == "__main__":
++    check(Path(sys.argv[1]).resolve(), Path(sys.argv[2]).resolve())

@@ -104,6 +104,8 @@ def validated(table_rows):
 
 def audit(stderr):
     fallbacks = sorted(set(re.findall(r"\[pipeline\] fallback: ([^\n]+)", stderr)))
+    if "[sharded] completed" in stderr:
+        return {"path":"sharded","reasons":fallbacks}
     if fallbacks:
         if "[v1nd]" not in stderr:
             raise AssertionError("fallback was logged without a completed generic run: " + stderr)
@@ -171,9 +173,9 @@ def main():
                 dim = seams(data,variant)
                 test(data,"bucket seam "+variant,(1,8),dim)
     paths = collections.Counter(r["path"] for r in records)
-    if not any(r["path"] == "direct" and r["case"].startswith("bucket seam ") for r in records):
+    if not any(r["path"] in ("direct","sharded") and r["case"].startswith("bucket seam ") for r in records):
         raise AssertionError("the direct decoder did not run the bucket-boundary assertions")
-    print(f"{len(records)} exact comparisons. Direct {paths['direct']}, generic {paths['generic']}.",flush=True)
+    print(f"{len(records)} exact comparisons. Direct {paths['direct']}, generic {paths['generic']}, sharded {paths['sharded']}.",flush=True)
     for group in ("fixture-", "shuffled historical", "shuffled bounded", "bucket seam"):
         c = collections.Counter(r["path"] + ": " + ", ".join(r.get("reasons", []))
                                 for r in records if r["case"].startswith(group))

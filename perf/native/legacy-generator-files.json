@@ -1,0 +1,10 @@
+{
+  "Cargo.lock": "ba37d7ec36676dadea29be72984f983d10f042c38cf7d6ba36b1e5a8895eea4b",
+  "Cargo.toml": "5c44bb27ae192f67bdd8cfa0e4dde659eb00a268af8928b2980b7fa1d0159b78",
+  "README.md": "e68cb48cbdd6c1b774c0cb320e03ebe567ffc0c27ae8c703eee733dfc1577033",
+  "src/main.rs": "131b37c13fe434aee9cec7f7c29b9d4ecd31c449d3d9e481f4de96fa211a1841",
+  "src/plan.rs": "35bf93f9ca13498be7433289ea67dcf879015f175838d8c24d96833816d59ed7",
+  "src/random.rs": "85a1084537807b2f79b38e29c0dc7399823f5a1bca669adf8f91c9d4daab7ede",
+  "src/text.rs": "d895c9e1a8a860ea19057a80be06393e91cc8496bb1b5bdbb4a5eddde296789d",
+  "src/user.rs": "41cd1861f29574f8da82bcf98c0a4c789c6e237d5496ba00e71c8f15d1f2d6af"
+}

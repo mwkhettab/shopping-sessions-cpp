@@ -321,13 +321,13 @@ def main():
                     if q.returncode: trace=None
                 runner=[trace,"-qq","-f","-e","trace=execve","-o",tracefile] if trace else []
                 s=run("release-retry",[*runner,exe,dat,out],env,timeout=45)
-                if "[pipeline] fallback:" not in s or "[v1nd]" not in s: raise ValueError("release did not report the actual generic retry")
+                if "[pipeline] fallback:" not in s or not any(marker in s for marker in ("[v1nd]","[sharded] completed")): raise ValueError("release did not report the actual generic retry")
                 table_check(out);mark("release-retry","passed","8 workers, automatic retry, both hand-calculated tables exact")
                 direct=tmp/"generic";run("release-generic",[exe,"--generic",dat,direct],env,timeout=45)
                 table_check(direct);mark("release-generic","passed","both hand-calculated tables exact")
                 if trace:
                     calls=tracefile.read_text()
-                    if not re.search(r'execve\("/proc/self/exe", \[[^\n]*"--generic"',calls): raise ValueError("missing process re-exec")
+                    if not re.search(r'execve\("/proc/self/exe", \[[^\n]*"--(?:generic|sharded)"',calls): raise ValueError("missing process re-exec")
                     opted=bool(re.search(r'execve\("[^"]+\.opt", [^\n]+ = 0',calls))
                     if want_v4 and opted!=feat["v4"]: raise ValueError("observed v4 sidecar disagrees with CPU/OS support")
                     mark("release-exec","passed","recorded generic exec"+(" and v4 sidecar" if want_v4 and feat["v4"] else ""))

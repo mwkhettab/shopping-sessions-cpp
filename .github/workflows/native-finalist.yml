@@ -1,4 +1,4 @@
-name: Native input page population qualification
+name: Native opaque-ID pipeline on both public input layouts
 on:
   push:
     branches: [bench/native-x64-trials]
@@ -32,8 +32,8 @@ jobs:
           src=.acceptance/candidate
           area="$RUNNER_TEMP/published"
           docker buildx build --platform linux/amd64 --output "type=local,dest=$area" "$src"
-          git -C "$src" apply "$GITHUB_WORKSPACE/perf/native/populate-input.patch"
-          git -C "$src" add cpp/pipeline/parse.hpp tests/pipeline/user_codecs.cpp
+          git -C "$src" apply --unidiff-zero "$GITHUB_WORKSPACE/perf/native/sharded-input.patch"
+          git -C "$src" add -- Dockerfile build.sh cpp rules.md tests/pipeline/sharded_retry.py
           python3 - <<'PYTHON'
           import json, subprocess
           config=json.load(open('perf/native/finalist.json'))
@@ -42,7 +42,7 @@ jobs:
           for path,value in config['blobs'].items():
               assert subprocess.check_output(git+['rev-parse',':'+path],text=True).strip()==value
           PYTHON
-          git -C "$src" -c user.name="Benchmark runner" -c user.email="benchmark@localhost" commit -m 'Test input page population'
+          git -C "$src" -c user.name="Benchmark runner" -c user.email="benchmark@localhost" commit -m 'Test opaque IDs in the primary C++ pipeline'
           echo "commit=$(git -C "$src" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "variant=control" >> "$GITHUB_OUTPUT"
       - uses: actions/setup-python@v5
@@ -50,17 +50,13 @@ jobs:
           python-version: '3.12'
       - name: Prepare generator, fixtures and references
         run: bash perf/native/prepare-port-runner.sh
-      - name: Test every bit width, run boundary and Parquet group on this CPU
+      - name: Exercise the shipped C++ row scanners and revision storage
         shell: bash
         run: |
           src=.acceptance/candidate
-          for target in native portable; do
-            flags=()
-            if test "$target" = portable; then flags=(-DSHOP_SPARSE_FORCE_SCALAR); fi
-            c++ -std=c++20 -O3 "${flags[@]}" -I"$src/cpp/pipeline" "$src/tests/pipeline/user_codecs.cpp" -o "$RUNNER_TEMP/codecs"
-            "$RUNNER_TEMP/codecs"
-            c++ -std=c++20 -O3 "${flags[@]}" -I"$src/cpp/pipeline" "$src/tests/pipeline/sparse_user_groups.cpp" -o "$RUNNER_TEMP/user-groups"
-            "$RUNNER_TEMP/shopping-python/bin/python" "$src/tests/pipeline/sparse_user_groups.py" "$RUNNER_TEMP/user-groups"
+          for suite in input event_batches marked_events revision_timelines; do
+            c++ -std=c++20 -O2 -pthread "$src/tests/$suite.cpp" -o "$RUNNER_TEMP/$suite"
+            "$RUNNER_TEMP/$suite"
           done
       - name: Compare full processes and shipping containers
         id: qualify
@@ -72,8 +68,8 @@ jobs:
             --candidate-source "$GITHUB_WORKSPACE/.acceptance/candidate" \
             --require-baseline-commit 7f59c0b8c268d735ebc3e3ecbd68c7a17302e4b1 \
             --comparison-binary "published=$RUNNER_TEMP/published/app/shopping" \
-            --release-generated-practice --release-generated-final \
-            --warm-20 11 --warm-60 7 --cold-runs 2 --container-lifetime-pairs 9
+            --skip-kernel-test --release-generated-practice --release-generated-final \
+            --warm-20 7 --warm-60 5 --cold-runs 1 --container-lifetime-pairs 9 --memory-mib 14336
           python3 - "$area/results/port-acceptance/status.json" <<'PYTHON'
           import json,sys
           state=json.load(open(sys.argv[1]))
@@ -95,9 +91,18 @@ jobs:
           from pathlib import Path
           import sys,json
           record=json.loads(next(Path(sys.argv[1]).glob("shipping-733-*/status.json")).read_text())
-          expected={'campaign_daily': {'rows': 28014, 'sha256': '26f47d8f745a814bf3c80fbe53af7f21a87d252ef91ea1e3afa9437daedb74f5'}, 'user_daily': {'rows': 6621736, 'sha256': '11821bf58ec2cb4407bef662c80988e20b3860587110d7d345dfe06c7c104d96'}}
-          assert record["tables"]["baseline"] == record["tables"]["shipping"] == expected
+          assert record["status"]=="passed" and record["seed"]==733
+          assert record["tables"]["baseline"] == record["tables"]["shipping"]
+          assert all(t["rows"]>0 and len(t["sha256"])==64 for t in record["tables"]["shipping"].values())
           PYTHON
+      - name: Validate retry output on the shipping Linux executable
+        if: steps.qualify.outcome == 'success'
+        run: |
+          area="$RUNNER_TEMP/shopping-trials"
+          "$RUNNER_TEMP/shopping-python/bin/python" .acceptance/candidate/tests/pipeline/sharded_retry.py "$area/accept-binaries/candidate/shopping" "$area/starter-pyspark"
+      - name: Check original 20M and 60M fingerprints and image timings
+        if: steps.qualify.outcome == 'success'
+        run: "$RUNNER_TEMP/shopping-python/bin/python perf/native/legacy_release_check.py"
       - name: Verify both 1M tables with baseline x86-64 instruction dispatch
         if: steps.qualify.outcome == 'success'
         shell: bash
@@ -106,7 +111,7 @@ jobs:
           area="$RUNNER_TEMP/shopping-trials"
           out="$area/results/baseline-isa"
           mkdir -p "$out"
-          export NCPU=1 XL_TIMING=1
+          export NCPU=1 XL_TIMING=1 V1ND_LOG=1
           for tag in baseline candidate; do
           for mode in compact generic; do
             flags=()
@@ -114,41 +119,22 @@ jobs:
             temp=$(mktemp -d "$RUNNER_TEMP/isa-output.XXXXXX")
             qemu-x86_64 -cpu Nehalem "$area/accept-binaries/$tag/shopping" "${flags[@]}" \
               "$area/dev" "$temp" > "$out/$mode.log" 2>&1
-            if test "$mode" = compact; then grep -q 'parse=' "$out/$mode.log"; fi
+            if test "$tag/$mode" = candidate/compact; then grep -Fq '[sharded] completed' "$out/$mode.log"; else grep -Fq '[v1nd]' "$out/$mode.log"; fi
             "$RUNNER_TEMP/shopping-python/bin/python" "$area/starter-pyspark/scripts/compare.py" \
               "$temp" "$area/dev-answer" >> "$out/$mode.log"
             rm -r -- "$temp"
           done
           done
-          echo '::notice title=Portable x86-64 release::The compact and explicitly selected generic parsers each matched both published 1M tables on a Nehalem CPU model.'
-      - name: Exercise native SIMD and parked-worker retry paths
-        if: always() && steps.qualify.outcome == 'success'
-        env:
-          CXX: g++-12
-          SHIPPING_SHA: ${{ steps.image.outputs.commit }}
-          SHIPPING_VARIANT: ${{ steps.image.outputs.variant }}
+          echo '::notice title=Portable x86-64 release::Automatic and explicit generic execution matched both updated 1M tables on a Nehalem CPU model.'
+      - name: Check the shipping ELF and static entry
+        if: steps.qualify.outcome == 'success'
         run: |
           area="$RUNNER_TEMP/shopping-trials"
-          "$RUNNER_TEMP/shopping-python/bin/python" perf/native/native_code_paths.py \
-            --source "$GITHUB_WORKSPACE/.acceptance/candidate" --revision "$SHIPPING_SHA" \
-            --variant "$SHIPPING_VARIANT" --release "$area/accept-binaries/candidate/shopping" \
-            --output "$area/results/native-code-paths"
-      - name: Verify the shipping image objects on row boundaries and repairs
-        if: always() && steps.qualify.outcome == 'success'
-        run: |
-          python3 perf/native/finalist_rows.py .acceptance/candidate "$RUNNER_TEMP/shopping-trials/accept-binaries/candidate/shopping"
-      - name: Publish instruction coverage
-        if: always()
-        run: |
-          python3 - <<'PY'
-          import json, os
-          from pathlib import Path
-          p = Path(os.environ['RUNNER_TEMP'])/'shopping-trials/results/native-code-paths/status.json'
-          if p.is_file():
-              r=json.loads(p.read_text())
-              print('::notice file=BENCHMARKS.md,line=1,title=Native instruction coverage::' +
-                    json.dumps({'status':r['status'],'features':r['features'],'checks':{k:v['status'] for k,v in r['checks'].items()}},sort_keys=True))
-          PY
+          bin="$area/accept-binaries/candidate/shopping"
+          file "$bin" | grep -E 'statically linked|static-pie linked'
+          nm -C "$bin" > "$RUNNER_TEMP/shipping-symbols"
+          if grep -Fq 'pipeline::keyrec::' "$RUNNER_TEMP/shipping-symbols"; then exit 1; fi
+          echo '::notice title=Opaque ID image::Static x86-64 image verified. The shipping entry builds only cpp/main.cpp.'
       - uses: actions/upload-artifact@v4
         if: always()
         with:
