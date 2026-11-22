@@ -1,6 +1,7 @@
 """Rotate fresh processes, report wall time and resource use, keep raw observations."""
 import argparse
 import ctypes
+import hashlib
 import json
 import mmap
 import os
@@ -44,6 +45,13 @@ def resident_fraction():
         total += pages
     return present / total if total else 1
 
+def binary_sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
 env = dict(os.environ, NCPU=os.environ.get("NCPU", "8"))
 if args.profile:
     env["PROFILE"] = "1"
@@ -51,6 +59,7 @@ else:
     env.pop("PROFILE", None)
 binaries = [b.resolve() for b in args.binaries]
 times = {b: [] for b in binaries}
+fingerprints = {binary: binary_sha256(binary) for binary in times}
 with args.log.open("x") as log:
     for i in range(-args.warmup, args.runs):
         offset = i % len(binaries)
@@ -73,7 +82,8 @@ with args.log.open("x") as log:
                     detail = err.read()
                     if child.returncode:
                         raise SystemExit(f"{binary} exited {child.returncode}: {detail}")
-                record = dict(binary=str(binary), input=str(args.input), round=i, wall_s=wall,
+                record = dict(binary=str(binary), binary_sha256=fingerprints[binary],
+                              input=str(args.input), round=i, wall_s=wall,
                               user_s=u.ru_utime, sys_s=u.ru_stime, minor=u.ru_minflt,
                               major=u.ru_majflt, inblock=u.ru_inblock, outblock=u.ru_oublock,
                               peak_mib=u.ru_maxrss / (1048576 if platform.system() == "Darwin" else 1024),

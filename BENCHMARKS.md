@@ -18,6 +18,8 @@
 
 The entrant reported **0.30 s** for `7f59c0b8c268`. Its production files match the qualified `a983782f7be8` image. This reduced the official time by 0.02 s (6.25%) from 0.32 s.
 
+After the publication of `f1e4c0c6bea3`, the entrant reported **0.3043 s** for the next submission. The receipt SHA and the earlier result beyond two decimal places are unconfirmed. Both times round to 0.30 s.
+
 The entrant reported **0.32 s** for the published Clang release. The executable is identical to the qualified `29ee0cc5c26291c511cad44aec18c6531f050f79` build. The official practice improvement was 0.01 s, or about 3.0% of the prior 0.33 s score. A 0.28 s run would require another 0.04 s reduction.
 
 The entrant reported **0.33 s** after submitting the `dc216ac44dca` release from `origin/main`. This cuts 0.54 s (62.1%) from the previous 0.87 s best. The production sources and Docker build at this revision match `faf1047c6cb0` exactly.
